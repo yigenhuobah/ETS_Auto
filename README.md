@@ -4,7 +4,7 @@
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/)
 [![Version 0.1.0](https://img.shields.io/badge/version-0.1.0-green.svg)](.)
 
-> e听说(ETS) PC端自动答题工具 — 听后选择、听后记录一键完成
+> e听说(ETS) PC端自动答题工具 — 听后选择、听后记录等选填题一键完成
 
 ---
 
@@ -160,7 +160,7 @@ ETS_Auto/
 - [ ] **打包为 .exe** — PyInstaller 一键生成可执行文件，无需 Python 环境
 - [ ] **GUI 界面** — 可视化操作窗口，点点鼠标就能跑
 - [ ] **作业模式实战验证** — 在真实作业卷上端到端测试
-
+- 注：由于安卓和iOS的权限管控，本脚本长期不会兼容安卓端，也永远不会兼容iOS端，如果确有需要，尝试Fuck_ets100库吧！这是一个适用于安卓系统的答案查找工具
 ---
 
 ## ⚠️ 注意事项
