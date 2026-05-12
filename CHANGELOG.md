@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 ### Added
+- 🎤 **录音题辅助** — 听后转述/回答问题自动弹窗显示参考答案（Catppuccin 深色风格）
+- `--log FILE` CLI 参数 — 将所有输出保存到日志文件
+- GitHub Actions 自动构建 `.exe` — push tag 时触发 PyInstaller 打包
+- `is_recording_page()` 检测 + `show_recording_popup()` tkinter 弹窗
+- `collector.picture` / `collector.dialogue` 题型答案加载
 - 回调钩子：`on_connect` / `on_question_answered` / `on_complete` / `on_error`（GUI 可用）
 - `get_all_answers()` 公开方法 — 返回所有答案字典
 - `show_answers()` 方法 — 打印答案清单
@@ -10,8 +15,9 @@
 - `run()` 返回结果字典，方便 GUI 程序化调用
 - 模块可 import：`from ets_auto import ETSAutoAnswer`
 ### Changed
+- 录音题不再自动跳过 — 识别后弹窗展示答案，等待用户录音完成后继续
+- README 指令更新（新 CLI 参数 + 录音题 FAQ）
 - README SEO 优化（加入 e听说自动答题 / ETS答案提取 搜索高频词）
-- README 题型名称具体化（听后选择1/2、听后记录、听后转述等）
 - 文件结构：`src/auto/ets_auto.py`
 ### Removed
 - HANDOVER.md

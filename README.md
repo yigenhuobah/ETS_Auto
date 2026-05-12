@@ -78,7 +78,7 @@ A: 你还没有打开过这套题。ETS 需要先加载一次题目页面，答�
 A: 在终端里按 `Ctrl + C` 强制终止，然后加上 `--debug` 参数重新运行，查看详细报错信息：
 `python src/auto/ets_auto.py --debug`
 * **Q: 语音录音题怎么处理？**
-A: 本脚本不支持代录音。遇到语音题脚本会自动终止，你需要拿起麦克风自己开口读，我们正在计划为录音题目提供辅助。
+A: 遇到听后转述或回答问题时，脚本会自动弹出参考答案窗口，你可以边看答案边录音。录音完成后关闭窗口，脚本会自动继续下一题。
 
 ---
 
@@ -102,6 +102,9 @@ pip install -r requirements.txt
 python src/auto/ets_auto.py              # 默认模式（静默极简输出）
 python src/auto/ets_auto.py --debug      # 调试模式（输出 CDP 交互日志）
 python src/auto/ets_auto.py --max 200    # 设定安全步数上限为200（默认 999，通常无需手动干预）
+python src/auto/ets_auto.py --log run.log  # 将所有输出保存到 run.log
+python src/auto/ets_auto.py --show-answers  # 仅查看答案，不自动答题
+python src/auto/ets_auto.py --json       # 以 JSON 格式输出结果
 
 ```
 

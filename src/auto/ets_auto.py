@@ -27,6 +27,7 @@ class ETSAutoAnswer:
         self.homework_id = None
         self.answered_questions = []
         self.total_questions = 0
+        self.recording_answers = []   # list of dicts for picture/dialogue
         # Callback hooks (set via on_* methods or direct assignment)
         self._on_connect = None           # fn(ets_base, set_id, mode, total_questions)
         self._on_question_answered = None # fn(qid, answer, qtype) where qtype='choose'|'fill'
@@ -256,6 +257,29 @@ class ETSAutoAnswer:
                                 self.debug("Fill '%s' split -> '%s'" % (ans, ans.split('/')[0].strip()))
                                 ans = ans.split('/')[0].strip()
                             self.answers[key] = {'type': 'fill', 'answer': ans}
+                elif stype == 'collector.picture':
+                    key = stid
+                    ref_text = info.get('value', '')
+                    topic = info.get('topic', '')
+                    if ref_text:
+                        self.answers[key] = {'type': 'picture', 'answer': ref_text, 'topic': topic}
+                        self.recording_answers.append({'stid': stid, 'type': 'picture', 'topic': topic, 'answer': ref_text})
+                elif stype == 'collector.dialogue':
+                    key = stid
+                    ref_text = info.get('value', '')
+                    questions = info.get('question', [])
+                    if ref_text:
+                        q_texts = [q.get('ask', '') for q in questions]
+                        self.answers[key] = {'type': 'dialogue', 'answer': ref_text, 'questions': q_texts}
+                        self.recording_answers.append({'stid': stid, 'type': 'dialogue', 'questions': q_texts, 'answer': ref_text})
+                    for std in info.get('std', []):
+                        key = stid + '_' + std['xth']
+                        ans = std.get('value', '')
+                        if ans:
+                            if '/' in ans:
+                                self.debug("Fill '%s' split -> '%s'" % (ans, ans.split('/')[0].strip()))
+                                ans = ans.split('/')[0].strip()
+                            self.answers[key] = {'type': 'fill', 'answer': ans}
             except Exception as e:
                 self.debug("Error loading %s: %s" % (d, e))
 
@@ -468,6 +492,111 @@ class ETSAutoAnswer:
 
         return any_new, fill_count > 0
 
+    # ── Recording Helper ────────────────────────────────────
+
+    def is_recording_page(self):
+        """Detect if current iframe is a recording question page.
+        These have text content but no choices (.choose2) or inputs."""
+        js = r'''(function(){
+        var doc = document.querySelector("iframe").contentDocument || document.querySelector("iframe").contentWindow.document;
+        if (!doc) return JSON.stringify({recording: false});
+        if (doc.querySelectorAll(".choose2").length > 0) return JSON.stringify({recording: false});
+        if (doc.querySelectorAll("input[type='text'], textarea").length > 0) return JSON.stringify({recording: false});
+        var text = (doc.body || doc.documentElement).innerText || "";
+        return JSON.stringify({recording: text.trim().length > 20, textLen: text.trim().length});
+        })()'''
+        result = self.eval_js(js)
+        try:
+            info = json.loads(result) if result else {}
+            return info.get('recording', False)
+        except:
+            return False
+
+    def show_recording_popup(self):
+        """Show tkinter popup with answer text for current recording question.
+        Pops the first unattempted recording answer.
+        Returns True if a popup was shown."""
+        if not self.recording_answers:
+            return False
+        import tkinter as tk
+        from tkinter import scrolledtext
+        
+        rec = self.recording_answers.pop(0)
+        is_picture = rec['type'] == 'picture'
+        title_text = '📖 %s — 参考答案' % ('听后转述' if is_picture else '回答问题')
+        
+        root = tk.Tk()
+        root.title(title_text)
+        root.configure(bg='#1e1e2e')
+        
+        width, height = 700, 520
+        x = (root.winfo_screenwidth() - width) // 2
+        y = (root.winfo_screenheight() - height) // 3
+        root.geometry('%dx%d+%d+%d' % (width, height, x, y))
+        root.minsize(500, 350)
+        root.resizable(True, True)
+        
+        # Header
+        header = tk.Frame(root, bg='#2d2d3f', height=48)
+        header.pack(fill='x')
+        header.pack_propagate(False)
+        icon = '📖' if is_picture else '💬'
+        if is_picture:
+            topic = rec.get('topic', '')
+            hlbl = tk.Label(header, text='%s 听后转述' % icon, bg='#2d2d3f', fg='#cdd6f4', font=('Microsoft YaHei UI', 13, 'bold'))
+            hlbl.pack(side='left', padx=(16, 0), pady=10)
+            if topic:
+                tlbl = tk.Label(header, text=topic, bg='#2d2d3f', fg='#a6adc8', font=('Microsoft YaHei UI', 11))
+                tlbl.pack(side='left', padx=(12, 0), pady=10)
+        else:
+            hlbl = tk.Label(header, text='%s 回答问题' % icon, bg='#2d2d3f', fg='#cdd6f4', font=('Microsoft YaHei UI', 13, 'bold'))
+            hlbl.pack(side='left', padx=(16, 0), pady=10)
+        
+        # Content
+        main = tk.Frame(root, bg='#1e1e2e')
+        main.pack(fill='both', expand=True, padx=16, pady=(12, 8))
+        
+        st = scrolledtext.ScrolledText(
+            main, wrap='word', bg='#313244', fg='#cdd6f4',
+            insertbackground='#f5c2e7', borderwidth=0, relief='flat',
+            font=('Microsoft YaHei UI', 11), padx=14, pady=12
+        )
+        st.pack(fill='both', expand=True)
+        
+        answer_text = rec['answer']
+        # Strip HTML tags for cleaner display
+        import re
+        answer_text = re.sub(r'<[^>]+>', '', answer_text)
+        answer_text = answer_text.replace('\u0027', "'").replace('\u003c', '<').replace('\u003e', '>')
+        st.insert('1.0', answer_text)
+        st.configure(state='disabled')
+        
+        # Bottom bar
+        bar = tk.Frame(root, bg='#2d2d3f', height=52)
+        bar.pack(fill='x')
+        bar.pack_propagate(False)
+        
+        hint = tk.Label(bar, text='💡 阅读参考答案后关闭此窗口即可继续', bg='#2d2d3f', fg='#a6adc8', font=('Microsoft YaHei UI', 10))
+        hint.pack(side='left', padx=(16, 0), pady=14)
+        
+        def on_close():
+            root.destroy()
+        
+        btn = tk.Button(bar, text='✅ 知道了', command=on_close, bg='#a6e3a1', fg='#1e1e2e',
+                       activebackground='#94e2d5', activeforeground='#1e1e2e',
+                       font=('Microsoft YaHei UI', 11, 'bold'), relief='flat', padx=20, pady=4,
+                       cursor='hand2')
+        btn.pack(side='right', padx=(0, 16), pady=10)
+        root.protocol('WM_DELETE_WINDOW', on_close)
+        root.bind('<Escape>', lambda e: on_close())
+        
+        print('  🎤 Recording question: %s' % ('听后转述' if is_picture else '回答问题'))
+        print('    Answer popup opened — close it when done recording')
+        
+        root.focus_force()
+        root.mainloop()
+        return True
+
     # ── Navigation ────────────────────────────────────────────
 
     def click_next(self):
@@ -628,6 +757,20 @@ class ETSAutoAnswer:
                         print("Exam completed")
                         break
             else:
+                # No choices AND no inputs — could be recording page OR section transition
+                if self.is_recording_page() and self.recording_answers:
+                    # Recording question: show popup with answer, then continue
+                    if self.show_recording_popup():
+                        time.sleep(0.5)
+                        nr = self.click_next()
+                        if nr.get('success'):
+                            time.sleep(0.6)
+                            continue
+                        elif nr.get('reason') == 'disabled':
+                            print("Exam completed (next disabled)")
+                            break
+                    consecutive_empty = 0
+                    continue
                 consecutive_empty += 1
                 self.debug("Step %d: section transition" % step)
                 for retry in range(3):
@@ -690,6 +833,21 @@ class ETSAutoAnswer:
         return result
 
 
+class TeeOutput:
+    """Duplicate stdout to both console and a log file."""
+    def __init__(self, file_path):
+        self.terminal = sys.stdout
+        self.log = open(file_path, 'w', encoding='utf-8')
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+    def close(self):
+        self.log.close()
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="ETS Auto — e听说PC端自动答题工具")
@@ -697,7 +855,14 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Verbose output for troubleshooting")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
     parser.add_argument("--show-answers", action="store_true", help="Show all answers without auto-answering")
+    parser.add_argument("--log", type=str, default=None, metavar="FILE", help="Save all output to a log file")
     args = parser.parse_args()
+    
+    # Setup log file (tee stdout to file)
+    tee = None
+    if args.log:
+        tee = TeeOutput(args.log)
+        sys.stdout = tee
     auto = ETSAutoAnswer(debug_mode=args.debug)
     if args.show_answers:
         auto.connect()
@@ -709,3 +874,9 @@ if __name__ == "__main__":
         result = auto.run(max_steps=args.max)
         if args.json and result:
             print(json.dumps(result, ensure_ascii=False))
+    
+    # Cleanup: restore stdout and close log file
+    if tee:
+        sys.stdout = tee.terminal
+        tee.close()
+        print("Log saved to: " + args.log)
