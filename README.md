@@ -170,10 +170,8 @@ ETS_Auto/
 ├── requirements.txt
 ├── CHANGELOG.md
 ├── src/
-│   └── auto/
-│       └── ets_v8.py         # ★ 核心驱动脚本
-└── docs/
-    └── competitive_analysis.md  # ETS 逆向生态竞品深度分析
+    └── auto/
+        └── ets_v8.py         # ★ 核心驱动脚本
 
 ```
 
