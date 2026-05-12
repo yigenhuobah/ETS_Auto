@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """
-ETS Auto Answer v8 - Enhanced with Pinia introspection + setPCChoose2 + iframe next
-
-Improvements over v7:
-  1. Pinia appConfig.appDataPath  - dynamic base path (no hardcoded path)
-  2. Pinia homeworkStore           - reliable mode detection (doHomework flag)
-  3. setPCChoose2()                - ETS-native choice selection (cleaner than raw jQuery)
-  4. iframe next()                 - iframe-native navigation (fallback to DOM button)
-  5. Shadow DOM fallback           - fill input robustness (some ETS versions use shadow DOM)
+ETS Auto — e听说PC端自动答题工具
+CDP + JS注入DOM，支持听后选择和听后记录题型。
 
 Usage:
-  python ets_v8.py              # Run auto-answer (default 80 steps)
-  python ets_v8.py --max 50     # Limit steps
-  python ets_v8.py --debug      # Verbose output for troubleshooting
+  python ets_auto.py              # 自动答题（默认安全上限 999 步）
+  python ets_auto.py --max 50     # 限制步数
+  python ets_auto.py --debug      # 调试模式
+  python ets_auto.py --show-answers  # 仅查看答案
+  python ets_auto.py --json       # JSON 输出
 """
 import json, urllib.request, websocket, os, time, sys
 from urllib.parse import urlparse, parse_qs
@@ -534,7 +530,7 @@ class ETSAutoAnswer:
     def run(self, max_steps=999):
         """Run auto-answer loop. Stops naturally when exam is done (next button disabled).
         max_steps is a safety limit only — you should never need to set it."""
-        print("\nETS Auto Answer v8")
+        print("\nETS Auto")
         print("=" * 40)
 
         self.connect()
@@ -696,7 +692,7 @@ class ETSAutoAnswer:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="ETS Auto Answer v8 - auto-answer ETS exams via CDP")
+    parser = argparse.ArgumentParser(description="ETS Auto — e听说PC端自动答题工具")
     parser.add_argument("--max", type=int, default=999, help="Safety limit (default: 999, exam auto-stops when done)")
     parser.add_argument("--debug", action="store_true", help="Verbose output for troubleshooting")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")

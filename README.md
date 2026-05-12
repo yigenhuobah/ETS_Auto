@@ -62,7 +62,7 @@ pip install -r requirements.txt
 3. **运行脚本** → 在刚才的命令行终端中输入：
 
 ```bash
-python src/auto/ets_v8.py
+python src/auto/ets_auto.py
 
 ```
 
@@ -76,7 +76,7 @@ A: ETS 客户端未运行，或尚未进入答题页面。请先在 ETS 中点�
 A: 你还没有打开过这套题。ETS 需要先加载一次题目页面，答案才会缓存到本地。去客户端里看一眼题目再回来运行即可。
 * **Q: 脚本一直卡住不动了**
 A: 在终端里按 `Ctrl + C` 强制终止，然后加上 `--debug` 参数重新运行，查看详细报错信息：
-`python src/auto/ets_v8.py --debug`
+`python src/auto/ets_auto.py --debug`
 * **Q: 语音录音题怎么处理？**
 A: 本脚本不支持代录音。遇到语音题脚本会自动终止，你需要拿起麦克风自己开口读，我们正在计划为录音题目提供辅助。
 
@@ -99,9 +99,9 @@ cd ETS_Auto
 pip install -r requirements.txt
 
 # 2. 运行脚本 (请确保已在客户端进入答题页)
-python src/auto/ets_v8.py              # 默认模式（静默极简输出）
-python src/auto/ets_v8.py --debug      # 调试模式（输出 CDP 交互日志）
-python src/auto/ets_v8.py --max 200    # 设定安全步数上限为200（默认 999，通常无需手动干预）
+python src/auto/ets_auto.py              # 默认模式（静默极简输出）
+python src/auto/ets_auto.py --debug      # 调试模式（输出 CDP 交互日志）
+python src/auto/ets_auto.py --max 200    # 设定安全步数上限为200（默认 999，通常无需手动干预）
 
 ```
 
@@ -148,7 +148,7 @@ All questions answered. Exam complete!
            │ Chrome DevTools Protocol (WebSocket)
            ▼
 ┌──────────────────────────────────┐
-│          ets_v8.py               │
+│          ets_auto.py               │
 │  - Runtime.evaluate: JS 操作 DOM │
 │  - setPCChoose2(): ETS 内部选择题 API│
 │  - 原生 Setter: 劫持填空题双向绑定 │
@@ -171,7 +171,7 @@ ETS_Auto/
 ├── CHANGELOG.md
 ├── src/
     └── auto/
-        └── ets_v8.py         # ★ 核心驱动脚本
+        └── ets_auto.py         # ★ 核心驱动脚本
 
 ```
 
@@ -196,7 +196,7 @@ ETS_Auto/
 ### 🐛 遇到问题？
 如果你遇到了无法解决的 Bug，欢迎来提 Issue，但为了能更快帮你定位问题，提问前请务必走一遍这个流程：
 1. **先查 FAQ**：请先仔细阅读上方的【小白指南】和【常见问题】，90% 的问题（如环境没装好、忘了先进题目页）已经在那里有了解答。
-2. **带上日志**：请在命令行后面加上 `--debug` 重新运行脚本（`python src/auto/ets_v8.py --debug`）。
+2. **带上日志**：请在命令行后面加上 `--debug` 重新运行脚本（`python src/auto/ets_auto.py --debug`）。
 3. **提交 Issue**：前往 [Issues 页面](https://github.com/Yigenhuobah/ETS_Auto/issues)，点击 `New issue`。
 4. **提供关键信息**：在内容中务必包含：
    - 你的系统版本 和 ETS 客户端的版本号。
@@ -218,3 +218,4 @@ ETS_Auto/
 1. **限制**：脚本不会也无法替你发声，遇到语音录入题目请自觉拿起麦克风。
 2. **测试环境覆盖**：当前脚本主要针对 ETS v5.7.8 版本开发测试，若官方大更新可能失效。
 3. **免责声明**：本项目仅供 Python 自动化学习与前端 Web 安全防护研究使用，旨在揭示 Electron/CEF 架构在本地数据明文存储上的设计缺陷。请勿用于任何违反校规或平台协议的违规操作。
+
