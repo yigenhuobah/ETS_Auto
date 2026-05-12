@@ -31,6 +31,11 @@ class ETSAutoAnswer:
         self.homework_id = None
         self.answered_questions = []
         self.total_questions = 0
+        # Callback hooks (set via on_* methods or direct assignment)
+        self._on_connect = None           # fn(ets_base, set_id, mode, total_questions)
+        self._on_question_answered = None # fn(qid, answer, qtype) where qtype='choose'|'fill'
+        self._on_complete = None          # fn(stats_dict)
+        self._on_error = None             # fn(error_msg)
         self.stats = {
             'choose_answered': 0, 'choose_skip': 0,
             'fill_answered': 0, 'fill_skip': 0,
@@ -40,6 +45,40 @@ class ETSAutoAnswer:
     def debug(self, msg):
         if self.debug_mode:
             print("  [D] " + msg)
+
+    # ── Public API (CLI + GUI) ─────────────────────────────
+
+    def get_all_answers(self):
+        """Return all loaded answers. Usable before or after run().
+        Returns: dict like {'82750_1': {'type': 'choose', 'answer': 'C'}, ...}"""
+        return dict(self.answers)
+
+    def show_answers(self):
+        """Print all answers for current exam."""
+        if not self.answers:
+            print("No answers loaded")
+            return
+        print("\nAnswers for set_id=%s:\n" % (self.set_id or "?"))
+        for key, val in sorted(self.answers.items()):
+            tag = "[CHS]" if val['type'] == 'choose' else "[FIL]"
+            print("  %s %s → %s" % (tag, key, val['answer']))
+        print("\n%d total answers" % len(self.answers))
+
+    def on_connect(self, fn):
+        """Register callback: fn(ets_base, set_id, mode, total_questions)."""
+        self._on_connect = fn
+
+    def on_question_answered(self, fn):
+        """Register callback: fn(qid, answer, qtype). Called per question."""
+        self._on_question_answered = fn
+
+    def on_complete(self, fn):
+        """Register callback: fn(stats_dict). Called when exam ends."""
+        self._on_complete = fn
+
+    def on_error(self, fn):
+        """Register callback: fn(error_msg). Called on non-fatal errors."""
+        self._on_error = fn
 
     # ── Connection ────────────────────────────────────────────
 
@@ -340,6 +379,11 @@ class ETSAutoAnswer:
                 self.debug("kttb recorded: %d" % total)
                 self.stats['choose_answered'] += 1
                 self.answered_questions.append(qid)
+                if self._on_question_answered:
+                    try:
+                        self._on_question_answered(qid, answer_letter, 'choose')
+                    except Exception as e:
+                        self.debug("on_question_answered error: " + str(e))
                 any_new = True
             else:
                 self.debug("Q:%s polling failed" % qid)
@@ -408,6 +452,11 @@ class ETSAutoAnswer:
             self.debug("Fill result: " + str(r1))
 
             self.stats['fill_answered'] += 1
+            if self._on_question_answered:
+                try:
+                    self._on_question_answered(inp_id, value, 'fill')
+                except Exception as e:
+                    self.debug("on_question_answered error: " + str(e))
             any_new = True
 
         if any_new:
@@ -489,6 +538,13 @@ class ETSAutoAnswer:
         print("=" * 40)
 
         self.connect()
+
+        # Fire on_connect callback (used by GUI to get exam info)
+        if self._on_connect:
+            try:
+                self._on_connect(self.ets_base, self.set_id, self.homework_mode, self.total_questions)
+            except Exception as e:
+                self.debug("on_connect callback error: " + str(e))
 
         if 'Result' in self.tab.get('url', ''):
             print("Already on a result page — open a mock exam to auto-answer")
@@ -604,6 +660,13 @@ class ETSAutoAnswer:
         fill_count = self.stats['fill_answered']
         total_done = choose_count + fill_count
         pct = total_done / self.total_questions * 100 if self.total_questions else 0
+        result = {
+            'set_id': self.set_id, 'mode': 'HOMEWORK' if self.homework_mode else 'PRACTICE',
+            'total_questions': self.total_questions,
+            'choose_answered': choose_count, 'fill_answered': fill_count,
+            'total_answered': total_done, 'coverage_pct': round(pct, 1),
+            'errors': self.stats['errors'], 'next_clicks': self.stats['next_click']
+        }
         print("\n" + "=" * 40)
         if total_done > 0:
             print("Done: %d choose + %d fill = %d answered" % (choose_count, fill_count, total_done))
@@ -619,8 +682,16 @@ class ETSAutoAnswer:
         if self.stats['errors']:
             print("Errors: %d" % self.stats['errors'])
 
+        # Fire on_complete callback
+        if self._on_complete:
+            try:
+                self._on_complete(result)
+            except Exception as e:
+                self.debug("on_complete callback error: " + str(e))
+
         if self.ws:
             self.ws.close()
+        return result
 
 
 if __name__ == "__main__":
@@ -628,6 +699,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ETS Auto Answer v8 - auto-answer ETS exams via CDP")
     parser.add_argument("--max", type=int, default=999, help="Safety limit (default: 999, exam auto-stops when done)")
     parser.add_argument("--debug", action="store_true", help="Verbose output for troubleshooting")
+    parser.add_argument("--json", action="store_true", help="Output results as JSON")
+    parser.add_argument("--show-answers", action="store_true", help="Show all answers without auto-answering")
     args = parser.parse_args()
     auto = ETSAutoAnswer(debug_mode=args.debug)
-    auto.run(max_steps=args.max)
+    if args.show_answers:
+        auto.connect()
+        auto.load_answers()
+        auto.show_answers()
+        if args.json:
+            print(json.dumps(auto.get_all_answers(), ensure_ascii=False, indent=2))
+    else:
+        result = auto.run(max_steps=args.max)
+        if args.json and result:
+            print(json.dumps(result, ensure_ascii=False))
