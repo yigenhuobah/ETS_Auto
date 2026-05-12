@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+### Added
+- 深度竞品分析文档（docs/competitive_analysis.md，覆盖 8 个 PC + 1 个 Android 项目）
+### Changed
+- README SEO 优化（加入 e听说自动答题 / ETS答案提取 搜索高频词）
+- README 题型名称具体化（听后选择1/2、听后记录、听后转述等）
+### Removed
+- HANDOVER.md（技术实现细节已移入竞品分析文档）
+
 ## [0.1.0] - 2026-05-10
 
 ### Added

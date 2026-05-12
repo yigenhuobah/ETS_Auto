@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/)
 [![Windows](https://img.shields.io/badge/Platform-Windows-0078D6.svg)]()
-[![ETS v5.7.8](https://img.shields.io/badge/ETS-v5.7.8-success.svg)]()
+[![ETS v5.7.8](https://img.shields.io/badge/ETS-v5.7.8-success.svg)](https://www.ets100.com/home/index.html)
 
 > 🚀 **e听说自动答题 / ETS答案提取** · 听后选择零秒作答 · 听后记录自动填词 · 无需管理员权限 · 不篡改客户端 · 纯本地零网络
 
@@ -173,7 +173,7 @@ ETS_Auto/
 │   └── auto/
 │       └── ets_v8.py         # ★ 核心驱动脚本
 └── docs/
-    └── HANDOVER.md           # 逆向技术细节与移交文档
+    └── competitive_analysis.md  # ETS 逆向生态竞品深度分析
 
 ```
 
