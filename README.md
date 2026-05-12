@@ -1,22 +1,25 @@
 
-# ETS Auto - e听说 PC 端自动答题
+# 🎯 ETS Auto — e听说 PC 端自动答题工具
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/)
+[![Windows](https://img.shields.io/badge/Platform-Windows-0078D6.svg)]()
+[![ETS v5.7.8](https://img.shields.io/badge/ETS-v5.7.8-success.svg)](https://www.ets100.com/home/index.html)
 
-> e听说 (ETS) PC 端自动答题工具 —— 听后选择、听后记录一键完成。
+> 🚀 **e听说自动答题 / ETS答案提取** · 听后选择零秒作答 · 听后记录自动填词 · 无需管理员权限 · 不篡改客户端 · 纯本地零网络
+
+**每天被 e 听说作业折磨？** 这个工具能自动完成 PC 端的听说选择题和填空题，遇到语音题自动停住等你开口读。不修改客户端、不篡改分数、不依赖网络，是目前 ETS 环境下最**合规安全**的自动答题方案。
 
 ---
 
 ## ✨ 功能特性
 
-- ✅ **选择题自动作答** — 自动点击正确选项，精准无误
-- ✅ **填空题自动填值** — 自动填入答案文本，穿透框架拦截
-- ✅ **语音题自动跳过** — 检测后安全跳过，留给用户手动录音
-- ✅ **零网络依赖** — 答案直接从本地缓存读取，无需额外抓包联网
-- ✅ **双模式兼容** — 自动检测“模拟练习”与“作业模式”并无缝适配
-- ✅ **跨题型自动导航** — Section 过渡自动等待重试，如丝般顺滑
-- ✅ **自动结束检测** — 试卷做完自动停止，无需繁琐设定安全步数
+- ✅ **选择题自动作答** — 自动点击正确选项，听后选择1/听后选择2 通杀
+- ✅ **填空题自动填值** — 自动填入答案，听后记录/单词填空无缝支持
+- ✅ **语音题自动跳过** — 听后转述/回答问题/短文朗读检测后自动跳过
+- ✅ **零网络依赖** — e听说答案从本地缓存直接提取，无需抓包联网
+- ✅ **双模式兼容** — 模拟练习 & 作业模式自动检测，无缝切换
+- ✅ **跨题型自动导航** — 选择→填空 Section 过渡自动等待重试
 
 ---
 
@@ -30,7 +33,7 @@
 ### 第二步：下载本项目
 **方式 A：使用 Git（推荐）**
 ```bash
-git clone [https://github.com/your-username/ETS_Auto.git](https://github.com/your-username/ETS_Auto.git)
+git clone https://github.com/yigenhuobah/ETS_Auto.git
 cd ETS_Auto
 
 ```
@@ -91,7 +94,7 @@ A: 本脚本不支持代录音。遇到语音题脚本会自动终止，你需�
 
 ```bash
 # 1. 克隆并安装依赖
-git clone [https://github.com/your-username/ETS_Auto.git](https://github.com/your-username/ETS_Auto.git)
+git clone https://github.com/yigenhuobah/ETS_Auto.git
 cd ETS_Auto
 pip install -r requirements.txt
 
@@ -170,7 +173,7 @@ ETS_Auto/
 │   └── auto/
 │       └── ets_v8.py         # ★ 核心驱动脚本
 └── docs/
-    └── HANDOVER.md           # 逆向技术细节与移交文档
+    └── competitive_analysis.md  # ETS 逆向生态竞品深度分析
 
 ```
 
@@ -183,14 +186,14 @@ ETS_Auto/
 * [ ] **一键执行程序** —— 使用 PyInstaller 打包为 `.exe`，彻底免除 Python 环境配置。
 * [ ] **傻瓜式 GUI 界面** —— 加入可视化窗口，点点鼠标即可完成。
 
-> **注**：由于移动端系统级权限管控，本脚本目前及未来均**不计划**兼容 Android 或 iOS 平台。如果有移动端需求，请尝试开源社区的其他相关库吧（如 `Fuck_ets100`，适用于安卓设备的答案检索工具）。
+> **注**：由于移动端系统级权限管控，本脚本目前及未来均**不计划**兼容 Android 或 iOS 平台。如果有移动端抓包或改分需求，请尝试开源社区的其他相关库吧（如 `Fuck_ets100`，适用于安卓设备的答案检索工具）。
 
 ---
 ## 🤝 参与贡献 & 获取帮助
 
 ### ⭐ 求个 Star
-如果这个小工具帮你节省了宝贵的时间，让你免受了无意义的机械重复之苦，请在页面右上角点亮那个 **Star** ⭐️！
-这是对本项目最大的鼓励，也能让更多受苦受难的同学们看到它，一起脱离苦海。
+如果这个小工具帮你节省了宝贵的时间，让你免受无意义的机械重复之苦，请在页面右上角点亮那个 **Star** ⭐️！
+这是对本项目最大的鼓励，也能让更多受折磨的同学看到它。
 
 ### 🐛 遇到问题？
 如果你遇到了无法解决的 Bug，欢迎来提 Issue，但为了能更快帮你定位问题，提问前请务必走一遍这个流程：
