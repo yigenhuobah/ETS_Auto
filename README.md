@@ -16,7 +16,7 @@
 
 - ✅ **选择题自动作答** — 自动点击正确选项，听后选择1/听后选择2 通杀
 - ✅ **填空题自动填值** — 自动填入答案，听后记录/单词填空无缝支持
-- ✅ **语音题自动跳过** — 听后转述/回答问题/短文朗读检测后自动跳过
+- ✅ **录音题答案展示** — 听后转述/回答问题/短文朗读自动弹出参考答案窗口
 - ✅ **零网络依赖** — e听说答案从本地缓存直接提取，无需抓包联网
 - ✅ **双模式兼容** — 模拟练习 & 作业模式自动检测，无缝切换
 - ✅ **跨题型自动导航** — 选择→填空 Section 过渡自动等待重试
@@ -78,7 +78,7 @@ A: 你还没有打开过这套题。ETS 需要先加载一次题目页面，答�
 A: 在终端里按 `Ctrl + C` 强制终止，然后加上 `--debug` 参数重新运行，查看详细报错信息：
 `python src/auto/ets_auto.py --debug`
 * **Q: 语音录音题怎么处理？**
-A: 遇到听后转述或回答问题时，脚本会自动弹出参考答案窗口，你可以边看答案边录音。录音完成后关闭窗口，脚本会自动继续下一题。
+A: 脚本启动时会自动弹出参考答案窗口（听后转述/回答问题/短文朗读），你可以边看答案边录音。选择题和填空题做完后，关闭答案窗口即可停止脚本。
 
 ---
 
@@ -113,25 +113,24 @@ python src/auto/ets_auto.py --json       # 以 JSON 格式输出结果
 ## 📊 运行效果展示
 
 ```text
-ETS Auto Answer v8
+ETS Auto
 ========================================
 ETS connected
-Loaded 20 answers (set_id=20409)
-Mode: PRACTICE | Questions: 20
+Loaded 21 answers (set_id=543576)
+Mode: PRACTICE | Questions: 21
+Recording answers: 3 types available
 ----------------------------------------
-  Choose Q:82750_1 -> C
-  Choose Q:82751_1 -> B
+  Choose Q:584722_1 -> B
+  Choose Q:584723_1 -> C
   ...
-  Fill 82774_1 = parents
-  Fill 82774_2 = March
-  Fill 82774_3 = 36000
-  Fill 82774_4 = plane
-  Fill 82774_5 = Venice
+  Fill 584731_1 = Organise
+  Fill 584731_2 = trust
+  Fill 584731_3 = patient
+  Fill 584731_4 = review
 ========================================
-Done: 15 choose + 5 fill = 20 answered
-Coverage: 20/20 (100%)
-
-All questions answered. Exam complete!
+Done: 14 choose + 4 fill = 18 answered
+Coverage: 18/21 (86%)
+3 recording questions shown in answer window
 
 ```
 
@@ -168,13 +167,13 @@ ETS 的交互选项为原生 DOM 节点 (`.choose2`) 而非 Canvas 渲染，可�
 
 ```text
 ETS_Auto/
+├── .github/workflows/build-exe.yml  # CI: 自动打包 exe
 ├── LICENSE
 ├── README.md
 ├── requirements.txt
 ├── CHANGELOG.md
-├── src/
-    └── auto/
-        └── ets_auto.py         # ★ 核心驱动脚本
+└── src/auto/
+    └── ets_auto.py              # ★ 核心驱动脚本
 
 ```
 
@@ -183,7 +182,7 @@ ETS_Auto/
 ## 🗺️ 演进路线 (Roadmap)
 
 * [ ] **完善 Issue 规范** —— 等这个项目火了再说吧（
-* [ ] **录音题辅助视窗** —— 语音题弹出悬浮参考答案，边看边读告别卡壳。
+* [x] **录音题辅助视窗** ~~—— 语音题弹出悬浮参考答案，边看边读告别卡壳。~~ ✅ v0.2.0 已实现
 * [ ] **一键执行程序** —— 使用 PyInstaller 打包为 `.exe`，彻底免除 Python 环境配置。
 * [ ] **傻瓜式 GUI 界面** —— 加入可视化窗口，点点鼠标即可完成。
 
