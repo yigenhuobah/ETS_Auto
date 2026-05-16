@@ -25,48 +25,14 @@
 
 ## 🐣 小白指南（完全不懂代码也能用）
 
-### 第一步：安装 Python
-1. 前往 [Python 官网](https://www.python.org/downloads/) 下载 Python 3.12 或更高版本。
-2. 安装时 **务必勾选** 底部的 `Add Python to PATH`（非常重要！）。
-3. 安装完成后，按 `Win + R` 输入 `cmd` 回车，在黑框中输入 `python --version`，看到版本号即说明安装成功。
+### 推荐方式：直接使用打包版 (免安装任何环境)
+1. 前往本仓库的 [Releases 页面](https://github.com/yigenhuobah/ETS_Auto/releases/latest)。
+2. 在 `Assets` 列表中下载最新的 `ets_auto.exe`。
+3. 打开 ETS PC 客户端，登录并进入具体的题目答题页面。
+4. 双击运行下载好的 `ets_auto.exe`，享受喝茶的时光。
 
-### 第二步：下载本项目
-**方式 A：使用 Git（推荐）**
-```bash
-git clone https://github.com/yigenhuobah/ETS_Auto.git
-cd ETS_Auto
+---
 
-```
-
-**方式 B：直接下载 ZIP**
-
-1. 点击本页面右上角的绿色 `Code` 按钮。
-2. 选择 `Download ZIP`。
-3. 将下载的压缩包解压到一个好找的目录（例如 `E:\download\ETS_Project`）。
-
-### 第三步：安装依赖
-
-打开命令行（在项目目录的空白处右键 → 选择“在终端中打开”），输入以下命令：
-
-```bash
-pip install -r requirements.txt
-
-```
-
-看到 `Successfully installed websocket-client psutil` 字样即表示依赖安装完毕。
-
-### 第四步：运行起飞 🚀
-
-1. **启动客户端** → 打开 ETS PC 客户端并登录你的账号。
-2. **加载题目** → 点开一个模拟练习或作业（必须进入答题界面）。
-3. **运行脚本** → 在刚才的命令行终端中输入：
-
-```bash
-python src/auto/ets_auto.py
-
-```
-
-4. 喝口水，看到终端输出 `All questions answered. Exam complete!` 就大功告成了 🎉
 
 ### ❓ 常见问题 (FAQ)
 
@@ -182,11 +148,11 @@ ETS_Auto/
 ## 🗺️ 演进路线 (Roadmap)
 
 * [ ] **完善 Issue 规范** —— 等这个项目火了再说吧（
-* [x] **录音题辅助视窗** ~~—— 语音题弹出悬浮参考答案，边看边读告别卡壳。~~ ✅ v0.2.0 已实现
-* [ ] **一键执行程序** —— 使用 PyInstaller 打包为 `.exe`，彻底免除 Python 环境配置。
+* [x] **录音题辅助视窗** —— 语音题弹出悬浮参考答案，边看边读告别卡壳。 ✅ v0.2.0 已实现
+* [x] **一键执行程序** —— GitHub Actions 云端构建 `.exe`，双击即用，彻底免除 Python 环境配置。 ✅ v0.2.0 已实现
 * [ ] **傻瓜式 GUI 界面** —— 加入可视化窗口，点点鼠标即可完成。
 
-> **注**：由于移动端系统级权限管控，本脚本目前及未来均**不计划**兼容 Android 或 iOS 平台。如果有移动端抓包或改分需求，请尝试开源社区的其他相关库吧（如 `Fuck_ets100`，适用于安卓设备的答案检索工具）。
+> **注**：由于移动端系统级权限管控，本脚本目前及未来均**不计划**兼容 Android 或 iOS 平台。如果有移动端相关需求，请尝试开源社区的其他相关库吧（如 `Fuck_ets100`，适用于安卓设备的答案检索工具）。
 
 ---
 ## 🤝 参与贡献 & 获取帮助
