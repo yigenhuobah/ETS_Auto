@@ -1,12 +1,16 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] - 2026-05-16
+
 ### Added
-- 🎤 **录音题辅助** — 听后转述/回答问题自动弹窗显示参考答案（Catppuccin 深色风格）
+- **录音题启动窗口** — 脚本启动即显示所有录音题（听后转述/短文朗读/回答问题）参考答案，关闭窗口即停止脚本
+- `collector.read`（短文朗读）题型答案加载
+- `show_recording_answers_window()` — 深色主题 Catppuccin 风格 tkinter 窗口，后台线程运行
 - `--log FILE` CLI 参数 — 将所有输出保存到日志文件
 - GitHub Actions 自动构建 `.exe` — push tag 时触发 PyInstaller 打包
-- `is_recording_page()` 检测 + `show_recording_popup()` tkinter 弹窗
-- `collector.picture` / `collector.dialogue` 题型答案加载
+- `collector.picture` / `collector.dialogue` 题型答案加载（含 info.value 为空时的 fallback 链）
+- Anti-cheat toString 伪装 — Hook 函数伪装为 native code，防止指纹检测
+- `_js_escape()` 统一转义方法 — 安全处理 JS 注入字符串
 - 回调钩子：`on_connect` / `on_question_answered` / `on_complete` / `on_error`（GUI 可用）
 - `get_all_answers()` 公开方法 — 返回所有答案字典
 - `show_answers()` 方法 — 打印答案清单
@@ -14,12 +18,20 @@
 - `--json` CLI 参数 — 输出机器可读 JSON
 - `run()` 返回结果字典，方便 GUI 程序化调用
 - 模块可 import：`from ets_auto import ETSAutoAnswer`
+
 ### Changed
-- 录音题不再自动跳过 — 识别后弹窗展示答案，等待用户录音完成后继续
-- README 指令更新（新 CLI 参数 + 录音题 FAQ）
-- README SEO 优化（加入 e听说自动答题 / ETS答案提取 搜索高频词）
+- 录音题处理从"逐题检测弹窗"改为"启动即展示所有答案窗口"，大幅简化逻辑
+- `get_page_state()` 增加 `offsetHeight > 0` 可见性检查，过滤 Vue 幽灵 DOM
+- `load_answers()` 填空题 "/" 分隔答案取第一项
+- Pinia set_id 不匹配时自动回退到 URL 提取
+- Bridge wrap 模式兼容 CEF 原生函数（作业/练习双模式）
+- README SEO 优化 + 小白指南 + 竞品对比
 - 文件结构：`src/auto/ets_auto.py`
+
 ### Removed
+- `is_recording_page()` — 不再需要逐页检测录音题
+- `show_recording_popup()` — 改为启动窗口
+- `_handle_recording()` — 录音题不再阻塞主循环
 - HANDOVER.md
 - docs/competitive_analysis.md（内部参考，不发布）
 

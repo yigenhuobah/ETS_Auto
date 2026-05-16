@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -19,7 +22,7 @@ jobs:
         run: pip install -r requirements.txt pyinstaller
 
       - name: Build
-        run: pyinstaller --onefile --name ets_auto src/auto/ets_auto.py
+        run: pyinstaller --onefile --hidden-import=websocket --name ets_auto src/auto/ets_auto.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
