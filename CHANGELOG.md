@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.0] - 2026-05-23
+
+### Added
+- **模块拆分** — 提取 `ets_common.py` 共享基类，消除 exam/pk 重复代码
+- **单词PK自动答题** — `ets_word_pk.py` v5，派生词生成+短语提取+四级匹配+自学习
+- **统一入口** — `run.py exam|pk` 子命令式启动
+- **双 EXE 构建** — GitHub Actions 同时构建 `ets_auto.exe`（套卷）和 `ets_pk.exe`（PK）
+- ECDICT 字典补充（ecdict_pk.json）
+- PK 自学习映射（pk_extra.json）+ 未命中记录（pk_misses.json）
+
+### Changed
+- `ets_auto.py` → `ets_exam.py`（继承 `ETSBase`）
+- `eval_js()` 增加事件过滤（跳过 CDP 事件消息直到匹配响应）
+- `connect()` 拆分为基类连接 + 子类 Pinia 读取
+- `_js_escape()` → `ETSBase.js_escape()` 静态方法
+
+### Removed
+- `ets_auto.py` — 重命名为 `ets_exam.py`
+
 ## [0.2.0] - 2026-05-16
 
 ### Added
@@ -11,7 +30,7 @@
 - `collector.picture` / `collector.dialogue` 题型答案加载（含 info.value 为空时的 fallback 链）
 - Anti-cheat toString 伪装 — Hook 函数伪装为 native code，防止指纹检测
 - `_js_escape()` 统一转义方法 — 安全处理 JS 注入字符串
-- 回调钩子：`on_connect` / `on_question_answered` / `on_complete` / `on_error`（GUI 可用）
+- 回调钩子：`on_connect` / `on_question_answered` / `on_complete` / `on_error`
 - `get_all_answers()` 公开方法 — 返回所有答案字典
 - `show_answers()` 方法 — 打印答案清单
 - `--show-answers` CLI 参数 — 不自动答题，仅显示答案
@@ -25,15 +44,12 @@
 - `load_answers()` 填空题 "/" 分隔答案取第一项
 - Pinia set_id 不匹配时自动回退到 URL 提取
 - Bridge wrap 模式兼容 CEF 原生函数（作业/练习双模式）
-- README SEO 优化 + 小白指南 + 竞品对比
 - 文件结构：`src/auto/ets_auto.py`
 
 ### Removed
 - `is_recording_page()` — 不再需要逐页检测录音题
 - `show_recording_popup()` — 改为启动窗口
 - `_handle_recording()` — 录音题不再阻塞主循环
-- HANDOVER.md
-- docs/competitive_analysis.md（内部参考，不发布）
 
 ## [0.1.0] - 2026-05-10
 

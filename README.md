@@ -6,18 +6,18 @@
 [![Windows](https://img.shields.io/badge/Platform-Windows-0078D6.svg)]()
 [![ETS v5.7.8](https://img.shields.io/badge/ETS-v5.7.8-success.svg)](https://www.ets100.com/home/index.html)
 
-> 🚀 **e听说自动答题 / ETS答案提取** · 听后选择零秒作答 · 听后记录自动填词 · 无需管理员权限 · 不篡改客户端 · 纯本地零网络
+> 🚀 **e听说自动答题 / 单词PK自动答题** · 听后选择零秒作答 · 听后记录自动填词 · 单词PK 85%+ 命中率 · 无需管理员权限 · 不篡改客户端 · 纯本地零网络
 
-**每天被 e 听说作业折磨？** 这个工具能自动完成 PC 端的听说选择题和填空题，遇到语音题自动停住等你开口读。不修改客户端、不篡改分数、不依赖网络，是目前 ETS 环境下最**合规安全**的自动答题方案。
+**每天被 e 听说作业折磨？** 这个工具能自动完成 PC 端的听说选择题和填空题，还能自动答单词 PK。遇到语音题自动停住等你开口读。不修改客户端、不篡改分数、不依赖网络，是目前 ETS 环境下最**合规安全**的自动答题方案。
 
 ---
 
 ## ✨ 功能特性
 
-- ✅ **选择题自动作答** — 自动点击正确选项，听后选择1/听后选择2 通杀
-- ✅ **填空题自动填值** — 自动填入答案，听后记录/单词填空无缝支持
+- ✅ **套卷自动答题** — 选择题自动点击 + 填空题自动填值，听后选择/听后记录通杀
+- ✅ **单词PK自动答题** — 四级匹配策略 + 派生词生成 + 自学习，85%+ 命中率
 - ✅ **录音题答案展示** — 听后转述/回答问题/短文朗读自动弹出参考答案窗口
-- ✅ **零网络依赖** — e听说答案从本地缓存直接提取，无需抓包联网
+- ✅ **零网络依赖** — 答案从本地缓存直接提取，无需抓包联网
 - ✅ **双模式兼容** — 模拟练习 & 作业模式自动检测，无缝切换
 - ✅ **跨题型自动导航** — 选择→填空 Section 过渡自动等待重试
 
@@ -27,9 +27,9 @@
 
 ### 推荐方式：直接使用打包版 (免安装任何环境)
 1. 前往本仓库的 [Releases 页面](https://github.com/yigenhuobah/ETS_Auto/releases/latest)。
-2. 在 `Assets` 列表中下载最新的 `ets_auto.exe`。
-3. 打开 ETS PC 客户端，登录并进入具体的题目答题页面。
-4. 双击运行下载好的 `ets_auto.exe`，享受喝茶的时光。
+2. 在 `Assets` 列表中下载 `ets_auto.exe`（套卷答题）和/或 `ets_pk.exe`（单词PK）。
+3. 打开 ETS PC 客户端，登录并进入答题页面（套卷进题目页，PK 进 PK 匹配页）。
+4. 双击运行对应的 exe，享受喝茶的时光。
 
 ---
 
@@ -42,9 +42,11 @@ A: ETS 客户端未运行，或尚未进入答题页面。请先在 ETS 中点�
 A: 你还没有打开过这套题。ETS 需要先加载一次题目页面，答案才会缓存到本地。去客户端里看一眼题目再回来运行即可。
 * **Q: 脚本一直卡住不动了**
 A: 在终端里按 `Ctrl + C` 强制终止，然后加上 `--debug` 参数重新运行，查看详细报错信息：
-`python src/auto/ets_auto.py --debug`
+`python src/auto/run.py exam --debug`
 * **Q: 语音录音题怎么处理？**
 A: 脚本启动时会自动弹出参考答案窗口（听后转述/回答问题/短文朗读），你可以边看答案边录音。选择题和填空题做完后，关闭答案窗口即可停止脚本。
+* **Q: 单词 PK 怎么用？**
+A: 运行 `python run.py pk` 或 `ets_pk.exe`，然后进入 ETS 的单词 PK 匹配页面即可。脚本会自动抓取题目并从本地字典匹配答案，答错的会自动学习，命中率越来越高。
 
 ---
 
@@ -64,13 +66,22 @@ git clone https://github.com/yigenhuobah/ETS_Auto.git
 cd ETS_Auto
 pip install -r requirements.txt
 
-# 2. 运行脚本 (请确保已在客户端进入答题页)
-python src/auto/ets_auto.py              # 默认模式（静默极简输出）
-python src/auto/ets_auto.py --debug      # 调试模式（输出 CDP 交互日志）
-python src/auto/ets_auto.py --max 200    # 设定安全步数上限为200（默认 999，通常无需手动干预）
-python src/auto/ets_auto.py --log run.log  # 将所有输出保存到 run.log
-python src/auto/ets_auto.py --show-answers  # 仅查看答案，不自动答题
-python src/auto/ets_auto.py --json       # 以 JSON 格式输出结果
+# 2. 运行套卷答题 (请确保已在客户端进入答题页)
+python src/auto/run.py exam                # 默认模式（静默极简输出）
+python src/auto/run.py exam --debug        # 调试模式（输出 CDP 交互日志）
+python src/auto/run.py exam --max 200      # 设定安全步数上限
+python src/auto/run.py exam --log run.log  # 保存日志
+python src/auto/run.py exam --show-answers # 仅查看答案
+python src/auto/run.py exam --json         # JSON 格式输出
+
+# 3. 运行单词PK (请确保已在客户端进入PK匹配页)
+python src/auto/run.py pk                  # 默认模式
+python src/auto/run.py pk --debug          # 调试模式
+python src/auto/run.py pk --max 50         # 限制题数
+
+# 或者直接运行子模块
+python src/auto/ets_exam.py --debug        # 套卷答题
+python src/auto/ets_word_pk.py --debug     # 单词PK
 
 ```
 
@@ -79,6 +90,7 @@ python src/auto/ets_auto.py --json       # 以 JSON 格式输出结果
 ## 📊 运行效果展示
 
 ```text
+# ── 套卷答题 ──
 ETS Auto
 ========================================
 ETS connected
@@ -91,12 +103,20 @@ Recording answers: 3 types available
   ...
   Fill 584731_1 = Organise
   Fill 584731_2 = trust
-  Fill 584731_3 = patient
-  Fill 584731_4 = review
 ========================================
 Done: 14 choose + 4 fill = 18 answered
 Coverage: 18/21 (86%)
-3 recording questions shown in answer window
+
+# ── 单词PK ──
+ETS Word PK Auto v5 (Derivatives + Phrases)
+=============================================
+Dictionary: 4200 base + 800 ecdict + 120 deriv + 45 compound + 30 extra = 5195 total
+---------------------------------------------
+  #3/15 -> besides [dict]
+  #4/15 -> deliberately [learned]
+  ...
+=============================================
+Done: 13 hit / 15 total = 87% | 2 miss | 0 err | 3 learned
 
 ```
 
@@ -116,12 +136,19 @@ Coverage: 18/21 (86%)
            │ Chrome DevTools Protocol (WebSocket)
            ▼
 ┌──────────────────────────────────┐
-│          ets_auto.py               │
-│  - Runtime.evaluate: JS 操作 DOM │
-│  - setPCChoose2(): ETS 内部选择题 API│
-│  - 原生 Setter: 劫持填空题双向绑定 │
-│  - 本地 JSON: 零网络依赖物理读答案 │
-└──────────────────────────────────┘
+│          ets_common.py (ETSBase)  │
+│  - CDP 连接 & eval_js()          │
+│  - debug 日志 & js_escape 工具   │
+└──────┬───────────────┬───────────┘
+       │               │
+       ▼               ▼
+┌──────────────┐  ┌───────────────┐
+│ ets_exam.py  │  │ ets_word_pk.py│
+│ 套卷自动答题  │  │ 单词PK自动答题 │
+│ - setPCChoose2│  │ - 四级匹配策略 │
+│ - 原生Setter │  │ - 派生词生成   │
+│ - 本地JSON   │  │ - 自学习机制   │
+└──────────────┘  └───────────────┘
 
 ```
 
@@ -133,13 +160,17 @@ ETS 的交互选项为原生 DOM 节点 (`.choose2`) 而非 Canvas 渲染，可�
 
 ```text
 ETS_Auto/
-├── .github/workflows/build-exe.yml  # CI: 自动打包 exe
+├── .github/workflows/build-exe.yml  # CI: 自动打包双 exe
 ├── LICENSE
 ├── README.md
 ├── requirements.txt
 ├── CHANGELOG.md
+├── ecdict_pk.json                # ECDICT 字典补充 (PK用)
 └── src/auto/
-    └── ets_auto.py              # ★ 核心驱动脚本
+    ├── ets_common.py             # ★ 共享基类 (CDP连接/eval_js)
+    ├── ets_exam.py               # ★ 套卷自动答题
+    ├── ets_word_pk.py            # ★ 单词PK自动答题
+    └── run.py                    # 统一入口 (exam|pk)
 
 ```
 
@@ -147,9 +178,10 @@ ETS_Auto/
 
 ## 🗺️ 演进路线 (Roadmap)
 
-* [ ] **完善 Issue 规范** —— 等这个项目火了再说吧（
-* [x] **录音题辅助视窗** —— 语音题弹出悬浮参考答案，边看边读告别卡壳。 ✅ v0.2.0 已实现
-* [x] **一键执行程序** —— GitHub Actions 云端构建 `.exe`，双击即用，彻底免除 Python 环境配置。 ✅ v0.2.0 已实现
+* [x] **录音题辅助视窗** —— 语音题弹出悬浮参考答案，边看边读告别卡壳。 ✅ v0.2.0
+* [x] **一键执行程序** —— GitHub Actions 云端构建 `.exe`，双击即用。 ✅ v0.2.0
+* [x] **单词PK自动答题** —— 四级匹配+派生词+自学习，85%+命中率。 ✅ v0.3.0
+* [x] **模块拆分** —— 提取 ets_common.py 共享基类，统一入口 run.py。 ✅ v0.3.0
 * [ ] **傻瓜式 GUI 界面** —— 加入可视化窗口，点点鼠标即可完成。
 
 > **注**：由于移动端系统级权限管控，本脚本目前及未来均**不计划**兼容 Android 或 iOS 平台。如果有移动端相关需求，请尝试开源社区的其他相关库吧（如 `Fuck_ets100`，适用于安卓设备的答案检索工具）。
@@ -163,8 +195,8 @@ ETS_Auto/
 
 ### 🐛 遇到问题？
 如果你遇到了无法解决的 Bug，欢迎来提 Issue，但为了能更快帮你定位问题，提问前请务必走一遍这个流程：
-1. **先查 FAQ**：请先仔细阅读上方的【小白指南】和【常见问题】，90% 的问题（如环境没装好、忘了先进题目页）已经在那里有了解答。
-2. **带上日志**：请在命令行后面加上 `--debug` 重新运行脚本（`python src/auto/ets_auto.py --debug`）。
+1. **先查 FAQ**：请先仔细阅读上方的【小白指南】和【常见问题】，90% 的问题已经在那里有了解答。
+2. **带上日志**：请在命令行后面加上 `--debug` 重新运行脚本（`python src/auto/run.py exam --debug`）。
 3. **提交 Issue**：前往 [Issues 页面](https://github.com/Yigenhuobah/ETS_Auto/issues)，点击 `New issue`。
 4. **提供关键信息**：在内容中务必包含：
    - 你的系统版本 和 ETS 客户端的版本号。

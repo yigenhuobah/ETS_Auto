@@ -35,6 +35,10 @@ Thumbs.db
 screenshots/*.png
 screenshots/*.jpg
 
+# PK user data (personal, not for distribution)
+pk_extra.json
+pk_misses.json
+
 # Test artifacts tests/__pycache__/
 tools/__pycache__/
 versions/__pycache__/

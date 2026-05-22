@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 """
-ETS Auto — e听说PC端自动答题工具
+ETS Exam Auto — e听说PC端套卷自动答题工具
 CDP + JS注入DOM，支持听后选择和听后记录题型。
 
 Usage:
-  python ets_auto.py              # 自动答题（默认安全上限 999 步）
-  python ets_auto.py --max 50     # 限制步数
-  python ets_auto.py --debug      # 调试模式
-  python ets_auto.py --show-answers  # 仅查看答案
-  python ets_auto.py --json       # JSON 输出
+  python ets_exam.py              # 自动答题（默认安全上限 999 步）
+  python ets_exam.py --max 50     # 限制步数
+  python ets_exam.py --debug      # 调试模式
+  python ets_exam.py --show-answers  # 仅查看答案
+  python ets_exam.py --json       # JSON 输出
 """
-import json, urllib.request, websocket, os, time, sys
+import json, os, time, sys
 from urllib.parse import urlparse, parse_qs
+from ets_common import ETSBase
 
 
-class ETSAutoAnswer:
+class ETSAutoAnswer(ETSBase):
     def __init__(self, port=10086, debug_mode=False):
-        self.port = port
-        self.ws = None
-        self.mid = 0
-        self.debug_mode = debug_mode
+        super().__init__(port=port, debug_mode=debug_mode)
         self.ets_base = None
         self.answers = {}
         self.set_id = None
@@ -40,16 +38,7 @@ class ETSAutoAnswer:
             'next_click': 0, 'errors': 0
         }
 
-    def debug(self, msg):
-        if self.debug_mode:
-            print("  [D] " + msg)
-
     # ── Public API (CLI + GUI) ─────────────────────────────
-
-    @staticmethod
-    def _js_escape(s):
-        """Escape string for safe JS single-quoted string injection."""
-        return s.replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n').replace('\r', '')
 
     def get_all_answers(self):
         """Return all loaded answers. Usable before or after run().
@@ -86,23 +75,19 @@ class ETSAutoAnswer:
     # ── Connection ────────────────────────────────────────────
 
     def connect(self):
-        url = "http://localhost:%d/json" % self.port
-        tabs = json.loads(urllib.request.urlopen(url, timeout=5).read())
-        ets_tabs = [t for t in tabs if "ets100.com" in t.get("url", "")]
-        if not ets_tabs:
-            raise Exception("No ETS tab found")
-        self.tab = ets_tabs[0]
-        self.ws = websocket.create_connection(self.tab["webSocketDebuggerUrl"], timeout=None)
-        print("ETS connected")
-        self.debug("URL: " + self.tab['url'][:120])
+        """Connect to ETS and read Pinia config for dynamic paths/mode."""
+        super().connect()
 
+        # Read Pinia stores for dynamic config + mode detection
         self._read_pinia_config()
 
+        # Fallback: extract set_id from URL if Pinia didn't give us one
         if not self.set_id:
             self.set_id = self._get_url_set_id()
             if self.set_id:
                 self.debug("set_id from URL: " + self.set_id)
 
+        # Last-resort fallback for ets_base
         if not self.ets_base:
             self.ets_base = os.path.expandvars(r'%APPDATA%').replace('\\', '/') + '/ETS'
             self.debug("ets_base (default): " + self.ets_base)
@@ -159,21 +144,6 @@ class ETSAutoAnswer:
             self.debug("Pinia: mode=" + mode_str)
         except Exception as e:
             self.debug("Pinia parse error: " + str(e))
-
-    # ── CDP Helpers ───────────────────────────────────────────
-
-    def eval_js(self, expr):
-        self.mid += 1
-        self.ws.send(json.dumps({
-            "id": self.mid, "method": "Runtime.evaluate",
-            "params": {"expression": expr, "returnByValue": True}
-        }))
-        resp = json.loads(self.ws.recv())
-        if "error" in resp:
-            self.debug("[WS ERROR] " + str(resp["error"]))
-            return None
-        result = resp.get("result", {}).get("result", {})
-        return result.get("value")
 
     # ── Bridge Injection ──────────────────────────────────────
 
@@ -477,7 +447,7 @@ class ETSAutoAnswer:
                     continue
 
             print("  Fill %s = %s" % (inp_id, value))
-            safe_val = self._js_escape(value)
+            safe_val = self.js_escape(value)
 
             js_fill = '''(function(){
             var doc = document.querySelector("iframe").contentDocument || document.querySelector("iframe").contentWindow.document;
@@ -689,8 +659,6 @@ class ETSAutoAnswer:
             time.sleep(0.3)
         return False, False
 
-    # ── Recording Handler ────────────────────────────────────
-
     # ── Main Loop ─────────────────────────────────────────────
 
     def run(self, max_steps=999):
@@ -896,6 +864,7 @@ class ETSAutoAnswer:
 
         return result
 
+
 class TeeOutput:
     """Tee output to both terminal and log file."""
     def __init__(self, file_path):
@@ -915,14 +884,14 @@ class TeeOutput:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="ETS Auto — e听说PC端自动答题工具")
-    parser.add_argument("--max", type=int, default=999, help="Safety limit (default: 999, exam auto-stops when done)")
+    parser = argparse.ArgumentParser(description="ETS Exam Auto — e听说PC端套卷自动答题")
+    parser.add_argument("--max", type=int, default=999, help="Safety limit (default: 999)")
     parser.add_argument("--debug", action="store_true", help="Verbose output for troubleshooting")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
     parser.add_argument("--show-answers", action="store_true", help="Show all answers without auto-answering")
     parser.add_argument("--log", type=str, default=None, metavar="FILE", help="Save all output to a log file")
     args = parser.parse_args()
-    
+
     # Setup log file (tee stdout to file)
     tee = None
     if args.log:
@@ -939,7 +908,7 @@ if __name__ == "__main__":
         result = auto.run(max_steps=args.max)
         if args.json and result:
             print(json.dumps(result, ensure_ascii=False))
-    
+
     # Cleanup: restore stdout and close log file
     if tee:
         sys.stdout = tee.terminal

@@ -21,18 +21,29 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller
 
-      - name: Build
-        run: pyinstaller --onefile --hidden-import=websocket --name ets_auto src/auto/ets_auto.py
+      - name: Build exam
+        run: pyinstaller --onefile --hidden-import=websocket --name ets_auto src/auto/ets_exam.py
 
-      - name: Upload artifact
+      - name: Build PK
+        run: pyinstaller --onefile --hidden-import=websocket --name ets_pk src/auto/ets_word_pk.py
+
+      - name: Upload exam artifact
         uses: actions/upload-artifact@v4
         with:
           name: ets_auto.exe
           path: dist/ets_auto.exe
 
+      - name: Upload PK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ets_pk.exe
+          path: dist/ets_pk.exe
+
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/ets_auto.exe
+          files: |
+            dist/ets_auto.exe
+            dist/ets_pk.exe
           generate_release_notes: true
