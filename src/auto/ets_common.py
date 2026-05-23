@@ -8,7 +8,7 @@ Provides ETSBase class with:
   - Debug logging helper
   - JS string escaping utility
 """
-import json, urllib.request, websocket, os
+import json, time, urllib.request, websocket, os
 
 
 class ETSBase:
@@ -46,20 +46,45 @@ class ETSBase:
         print("ETS connected")
         self.debug("URL: " + self.tab['url'][:120])
 
+    _EVAL_JS_TIMEOUT = 15  # seconds per eval_js call
+
     def eval_js(self, expr):
         """Evaluate JavaScript expression via CDP Runtime.evaluate.
 
         Handles event filtering — CDP may send events between request
         and response; this method skips non-matching messages until
         the response with matching id is found.
+
+        Includes a safety timeout so a dead browser or blocked JS
+        cannot deadlock the calling thread.
+        Catches WebSocket disconnection gracefully.
         """
         self.mid += 1
         self.ws.send(json.dumps({
             "id": self.mid, "method": "Runtime.evaluate",
             "params": {"expression": expr, "returnByValue": True}
         }))
+        deadline = time.time() + self._EVAL_JS_TIMEOUT
         while True:
-            resp = json.loads(self.ws.recv())
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "eval_js timed out after %ds (browser may have crashed)"
+                    % self._EVAL_JS_TIMEOUT)
+            self.ws.settimeout(remaining)
+            try:
+                raw = self.ws.recv()
+            except websocket.WebSocketConnectionClosedException:
+                raise ConnectionError(
+                    "WebSocket closed — browser disconnected during eval_js")
+            except websocket.WebSocketTimeoutException:
+                raise TimeoutError(
+                    "eval_js timed out after %ds (browser may have crashed)"
+                    % self._EVAL_JS_TIMEOUT)
+            except OSError as e:
+                raise ConnectionError(
+                    "WebSocket I/O error during eval_js: %s" % e)
+            resp = json.loads(raw)
             if resp.get("id") == self.mid:
                 if "error" in resp:
                     self.debug("[WS ERROR] " + str(resp["error"]))

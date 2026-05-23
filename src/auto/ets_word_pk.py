@@ -7,17 +7,57 @@ import json, os, time, re, sys
 from ets_common import ETSBase
 
 
+def _edit_dist(a, b):
+    """Levenshtein distance — lightweight tie-breaker (no numpy needed)."""
+    la, lb = len(a), len(b)
+    if la == 0: return lb
+    if lb == 0: return la
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        curr = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cost = 0 if a[i-1] == b[j-1] else 1
+            curr[j] = min(curr[j-1] + 1, prev[j] + 1, prev[j-1] + cost)
+        prev = curr
+    return prev[lb]
+
+
+def _resource_path(filename):
+    """Resolve bundled resource path — works both in dev and PyInstaller --onefile.
+
+    Read-only data files (ecdict_pk.json) are bundled inside the exe via
+    sys._MEIPASS.  User-writable files (pk_extra.json, pk_misses.json)
+    must live NEXT TO the exe, so they are NOT resolved through _MEIPASS.
+    """
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, filename)
+    # Dev mode: project root = 3 levels up from src/auto/ets_word_pk.py
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), filename)
+
+
+def _exe_dir_path(filename):
+    """Resolve user-writable file path next to the executable (or script dir in dev).
+
+    pk_extra.json and pk_misses.json must be writable and persist across runs,
+    so they go next to the exe, NOT inside the PyInstaller bundle.
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.join(os.path.dirname(sys.executable), filename)
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), filename)
+
+
 class ETSWordPK(ETSBase):
     def __init__(self, port=10086, debug_mode=False):
         super().__init__(port=port, debug_mode=debug_mode)
         self.ets_base = os.path.join(os.path.expandvars(r'%APPDATA%'), 'ETS')
         self.dict_path = os.path.join(self.ets_base, 'pc_xst_dict', 'pc_xst_dict.json')
-        self.ecdict_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__)))), 'ecdict_pk.json')
-        self.extra_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__)))), 'pk_extra.json')
-        self.misses_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__)))), 'pk_misses.json')
+        # Read-only: bundled inside exe via --add-data (PyInstaller _MEIPASS)
+        self.ecdict_path = _resource_path('ecdict_pk.json')
+        # User-writable: must live next to the exe, not inside the bundle
+        self.extra_path = _exe_dir_path('pk_extra.json')
+        self.misses_path = _exe_dir_path('pk_misses.json')
         self.word_trans = {}      # word.lower() -> full_trans
         self.trans_index = {}     # chinese_segment -> [word1, word2, ...]
         self.pk_extra = {}        # question_text -> correct_option (self-learned)
@@ -121,6 +161,17 @@ class ETSWordPK(ETSBase):
                 for ph in phrases:
                     ph = ph.strip()
                     phl = ph.lower()
+                    # Skip noise: grammar abbreviations, single-letter fragments, sth/sb/etc
+                    _skip = False
+                    for _tok in phl.split():
+                        if _tok in ('sth', 'sb', 'etc', 'ie', 'eg', 'vs', 'cf', 'al'):
+                            _skip = True
+                            break
+                        if len(_tok) <= 1:
+                            _skip = True
+                            break
+                    if _skip:
+                        continue
                     if ' ' in phl and phl not in self.word_trans and len(phl) <= 40:
                         self.word_trans[phl] = line
                         cn = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', line).strip()
@@ -140,6 +191,8 @@ class ETSWordPK(ETSBase):
                     self.trans_index.setdefault(q_clean, []).insert(0, answer)
                     # Also add exact question text as key
                     self.trans_index.setdefault(q_text, []).insert(0, answer)
+                # Also add to word_trans so total count is correct
+                self.word_trans.setdefault(q_text, answer)
                 extra_count += 1
             print("  Self-learned extra: +%d mappings" % extra_count)
 
@@ -154,10 +207,10 @@ class ETSWordPK(ETSBase):
         w = word.lower().strip()
         candidates = [w]
         
-        # British → American spelling conversion
-        for brit, us in [('ise', 'ize'), ('isation', 'ization'), ('ising', 'izing'),
-                         ('yse', 'yze'), ('our', 'or'), ('re', 'er'),
-                         ('ogue', 'og'), ('ence', 'ense')]:
+        # British → American spelling conversion (longest suffix first!)
+        for brit, us in [('isation', 'ization'), ('ising', 'izing'), ('ogue', 'og'),
+                         ('ence', 'ense'), ('ise', 'ize'), ('yse', 'yze'),
+                         ('our', 'or'), ('re', 'er')]:
             if w.endswith(brit) and len(w) > len(brit) + 1:
                 candidates.append(w[:-len(brit)] + us)
         if w.endswith('ly') and len(w) > 4:
@@ -178,6 +231,8 @@ class ETSWordPK(ETSBase):
                 candidates.append(w[:-3] + 'y')  # studied → study
         if w.endswith('es') and len(w) > 4:
             candidates.append(w[:-2])            # boxes → box
+            if w.endswith('ies'):
+                candidates.append(w[:-3] + 'y')  # studies → study
         if w.endswith('s') and len(w) > 3 and not w.endswith('ss'):
             candidates.append(w[:-1])            # cats → cat
         if w.endswith('er') and len(w) > 4:
@@ -263,7 +318,8 @@ class ETSWordPK(ETSBase):
                         bigram = opt_cn_str[j:j+2]
                         if bigram in trans_text:
                             score += 8
-                    if score > best_score:
+                    if score > best_score or (score == best_score and score > 0 and
+                            _edit_dist(opt_clean, q_clean) < _edit_dist(options[best_idx], q_clean)):
                         best_score = score
                         best_idx = i
                 if best_idx >= 0 and best_score > 0:
@@ -350,6 +406,7 @@ class ETSWordPK(ETSBase):
             if len(q_cn_chars) >= 2:
                 best_idx = -1
                 best_score = 0
+                best_combined = ''
                 for i, opt in enumerate(options):
                     trans_result = self.get_opt_trans(opt)
                     combined = trans_result['combined']
@@ -363,9 +420,11 @@ class ETSWordPK(ETSBase):
                         bigram = q_cn_str[j:j+2]
                         if bigram in combined:
                             score += 15
-                    if score > best_score:
+                    if score > best_score or (score == best_score and score > 0 and
+                            _edit_dist(combined, q) < _edit_dist(best_combined, q)):
                         best_score = score
                         best_idx = i
+                        best_combined = combined
                         self.debug("CharOverlap: '%s' overlap=%d score=%d -> '%s'" % (
                             opt, len(overlap), score, combined[:40]))
                 if best_idx >= 0 and best_score >= 5:
@@ -415,7 +474,13 @@ class ETSWordPK(ETSBase):
                progress:prog?prog.innerText.trim():'',hasQuestion:!!t&&items.length>=2};
         items.forEach(function(item){
             var c=item.querySelector('.select-item-content');
-            r.options.push(c?c.innerText.trim():item.innerText.trim().split('\n')[0]);
+            var text=c?c.innerText.trim():item.innerText.trim();
+            /* Extract last non-empty line — skip prefixes like "A.", icons, etc. */
+            var lines=text.split(/\n/).map(function(l){return l.trim();}).filter(function(l){return l;});
+            var picked=lines.length?lines[lines.length-1]:text;
+            /* Strip leading ordinal prefixes: "A.", "A)", "1.", bullets */
+            picked=picked.replace(/^[A-Z][.)]\s*/, '').replace(/^\d+[.)]\s*/, '').trim();
+            r.options.push(picked||text);
         });
         return JSON.stringify(r);
         })()'''
@@ -454,7 +519,10 @@ class ETSWordPK(ETSBase):
             if (i !== %d && (cls.indexOf('correct') >= 0 || cls.indexOf('right') >= 0 ||
                 cls.indexOf('success') >= 0 || (html.indexOf('svg-icon') >= 0 && cls.indexOf('correct') >= 0))) {
                 var c = items[i].querySelector('.select-item-content');
-                correctOpt = c ? c.innerText.trim() : items[i].innerText.trim().split('\n')[0];
+                var text = c ? c.innerText.trim() : items[i].innerText.trim();
+                var lines = text.split(/\n/).map(function(l){return l.trim();}).filter(function(l){return l;});
+                correctOpt = lines.length ? lines[lines.length-1] : text;
+                correctOpt = correctOpt.replace(/^[A-Z][.)]\s*/, '').replace(/^\d+[.)]\s*/, '').trim() || text;
             }
         }
         return JSON.stringify({isWrong: isWrong, correctAnswer: correctOpt});
@@ -479,26 +547,35 @@ class ETSWordPK(ETSBase):
             q_clean = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', q).strip()
             if q_clean != q:
                 self.trans_index.setdefault(q_clean, []).insert(0, correct_answer)
-            with open(self.extra_path, 'w', encoding='utf-8') as f:
-                json.dump(self.pk_extra, f, ensure_ascii=False, indent=2)
+            # Atomic write: temp file + os.replace() — never leaves a 0-byte file on crash
+            import tempfile
+            dir_name = os.path.dirname(self.extra_path) or '.'
+            tmp_path = ''
+            try:
+                fd, tmp_path = tempfile.mkstemp(suffix='.json', dir=dir_name)
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(self.pk_extra, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, self.extra_path)
+                tmp_path = ''  # success — nothing to clean up
+            except Exception:
+                if tmp_path:
+                    try: os.unlink(tmp_path)
+                    except Exception: pass
+                raise
             print("  [LEARN] '%s' -> %s" % (q, correct_answer))
 
     def record_miss(self, question, options):
-        """Record a miss for later manual review"""
-        misses = []
-        if os.path.exists(self.misses_path):
-            try:
-                with open(self.misses_path, 'r', encoding='utf-8') as f:
-                    misses = json.load(f)
-            except:
-                misses = []
-        misses.append({
+        """Record a miss for later manual review (JSONL append — O(1) disk I/O)"""
+        record = {
             'question': question.strip(),
             'options': options,
             'time': time.strftime('%Y-%m-%d %H:%M:%S')
-        })
-        with open(self.misses_path, 'w', encoding='utf-8') as f:
-            json.dump(misses, f, ensure_ascii=False, indent=2)
+        }
+        try:
+            with open(self.misses_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record, ensure_ascii=False) + '\n')
+        except Exception as e:
+            self.debug("record_miss write error: %s" % e)
 
     # ── Main Loop ───────────────────────────────────────────
 
@@ -517,71 +594,78 @@ class ETSWordPK(ETSBase):
         same_count = 0
         no_q_count = 0
 
-        while answered + no_match < max_q:
-            state = self.get_pk_state()
+        try:
+            while answered + no_match < max_q:
+                state = self.get_pk_state()
 
-            if not state.get('hasQuestion'):
-                no_q_count += 1
-                if no_q_count >= 20:
-                    print("\nPK ended (no more questions).")
-                    break
-                time.sleep(0.4)
-                continue
-            no_q_count = 0
+                if not state.get('hasQuestion'):
+                    no_q_count += 1
+                    if no_q_count >= 20:
+                        print("\nPK ended (no more questions).")
+                        break
+                    time.sleep(0.4)
+                    continue
+                no_q_count = 0
 
-            title = state.get('title', '')
-            options = [opt for opt in state.get('options', []) if opt]
-            progress = state.get('progress', '')
+                title = state.get('title', '')
+                options = [opt for opt in state.get('options', []) if opt]
+                progress = state.get('progress', '')
 
-            if progress:
-                last_progress = progress
-            elif title == '' and not progress:
-                time.sleep(0.3)
-                continue
-
-            if same_count > 0 and title == last_title and title != '':
-                same_count += 1
-                if same_count >= 5:
-                    print("  (same question, moving on)")
-                    no_match += 1
-                    same_count = 0
-                    last_title = ''
-                    time.sleep(0.5)
-                else:
+                if progress:
+                    last_progress = progress
+                elif title == '' and not progress:
                     time.sleep(0.3)
-                continue
+                    continue
 
-            same_count = 1
-            last_title = title
-            if not title or len(options) < 2:
-                time.sleep(0.3)
-                continue
+                if same_count != 0 and title == last_title and title != '':
+                    # same_count > 0: counting repeats; same_count < 0: cooling down
+                    same_count += 1
+                    if same_count >= 5:
+                        print("  (same question, moving on)")
+                        no_match += 1
+                        same_count = -10  # cooldown: skip 10 cycles, don't reset last_title
+                        time.sleep(0.5)
+                    elif same_count > 0:
+                        time.sleep(min(0.3 * (2 ** (same_count - 1)), 2.0))  # exponential backoff
+                    else:
+                        time.sleep(0.4)  # cooling down after skip
+                    continue
 
-            idx = self.find_answer(title, options)
-            n = answered + no_match + 1
+                # New or different question — reset tracker
+                same_count = 1
+                last_title = title
+                if not title or len(options) < 2:
+                    time.sleep(0.3)
+                    continue
 
-            if idx >= 0:
-                source = 'learned' if (title in self.pk_extra and options[idx].strip() == self.pk_extra[title].strip()) else 'dict'
-                print("  #%s -> %s [%s]" % (progress or n, options[idx], source))
-                r = self.click_option(idx)
-                if r.get('ok'):
-                    answered += 1
-                    if source == 'learned':
-                        self.stats['learned'] += 1
+                idx = self.find_answer(title, options)
+                n = answered + no_match + 1
+
+                if idx >= 0:
+                    source = 'learned' if (title in self.pk_extra and options[idx].strip() == self.pk_extra[title].strip()) else 'dict'
+                    print("  #%s -> %s [%s]" % (progress or n, options[idx], source))
+                    r = self.click_option(idx)
+                    if r.get('ok'):
+                        answered += 1
+                        if source == 'learned':
+                            self.stats['learned'] += 1
+                    else:
+                        self.stats['errors'] += 1
+                    # Check if answer was wrong → try to capture correct answer
+                    time.sleep(0.5)
+                    correct = self.capture_wrong_answer(idx)
+                    if correct:
+                        print("  [LEARN] '%s' -> %s" % (title, correct))
+                        self.learn_miss(title, correct)
                 else:
-                    self.stats['errors'] += 1
-                # Check if answer was wrong → try to capture correct answer
-                time.sleep(0.5)
-                correct = self.capture_wrong_answer(idx)
-                if correct:
-                    print("  [LEARN] '%s' -> %s" % (title, correct))
-                    self.learn_miss(title, correct)
-            else:
-                print("  #%s -> ??? [%s]" % (progress or n, ' / '.join(options)))
-                no_match += 1
-                self.record_miss(title, options)
+                    print("  #%s -> ??? [%s]" % (progress or n, ' / '.join(options)))
+                    no_match += 1
+                    self.record_miss(title, options)
 
-            time.sleep(0.8)
+                time.sleep(0.8)
+
+        except (ConnectionError, TimeoutError) as e:
+            print("\nConnection lost: %s" % e)
 
         total = answered + no_match
         rate = (answered * 100 / total) if total > 0 else 0
@@ -591,8 +675,20 @@ class ETSWordPK(ETSBase):
         if self.stats['learned'] > 0:
             print("Self-learned hits: %d" % self.stats['learned'])
 
+        # Cleanup WebSocket
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
+    # Force UTF-8 on Windows terminals (GBK can't encode IPA/special chars)
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
     import argparse
     p = argparse.ArgumentParser(description="ETS Word PK Auto v5")
     p.add_argument("--max", type=int, default=999, help="Max questions")

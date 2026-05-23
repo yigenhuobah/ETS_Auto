@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.1] - 2026-05-23
+
+### Fixed
+- **TeeOutput class 声明丢失** — `_run_loop` 方法末尾缺少 `class TeeOutput:` 声明，导致其 `__init__` 覆盖 `ETSAutoAnswer.__init__`，import 报 `OSError: [WinError 6]`
+- **same_count 鬼畜连点 (ets_word_pk)** — same_count >= 5 时清空 last_title 导致跳过保护失效，改为 same_count=-10 冷却保留 last_title
+- **__ets_recorded 内存泄漏 (ets_exam)** — Bridge 注入的记录数组只 push 不清理，长时间运行 OOM。加 length > 200 时 slice(-100) 水位线
+- **toString 反爬指纹 (ets_exam)** — `fn.toString = ...` 赋值可被枚举检测。改为 `Object.defineProperty` + enumerable:false
+- **路径斜杠混搭 (ets_exam)** — ets_base 用正斜杠拼接后 os.path.join 产出反斜杠。统一改用 os.path.join
+- **GBK 终端 UnicodeEncodeError** — ecdict 含 IPA 音标，Windows 默认 GBK 崩溃。__main__ 入口强制 sys.stdout/stderr UTF-8
+- **record_miss 全量重写 (ets_word_pk)** — 每次读-改-写整个 JSON，大文件 I/O 阻塞。改为 JSONL 追加 (O(1) disk I/O)
+
 ## [0.3.0] - 2026-05-23
 
 ### Added

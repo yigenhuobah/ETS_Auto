@@ -89,7 +89,7 @@ class ETSAutoAnswer(ETSBase):
 
         # Last-resort fallback for ets_base
         if not self.ets_base:
-            self.ets_base = os.path.expandvars(r'%APPDATA%').replace('\\', '/') + '/ETS'
+            self.ets_base = os.path.join(os.path.expandvars(r'%APPDATA%'), 'ETS')
             self.debug("ets_base (default): " + self.ets_base)
 
     def _get_url_set_id(self):
@@ -130,8 +130,8 @@ class ETSAutoAnswer(ETSBase):
                 return
             if cfg.get('appDataPath'):
                 path = cfg['appDataPath'].replace('\\', '/')
-                if not path.endswith('/ETS'):
-                    path += '/ETS'
+                if not path.replace('\\', '/').endswith('/ETS'):
+                    path = os.path.join(path, 'ETS')
                 self.ets_base = path
                 self.debug("Pinia: dataPath=" + self.ets_base)
             self.homework_mode = cfg.get('doHomework')
@@ -164,19 +164,28 @@ class ETSAutoAnswer(ETSBase):
                 try { _origChoose(data); } catch(e) {}
             }
             window.top.__ets_recorded.push(data);
+            /* Drain: keep array bounded to prevent V8 heap OOM */
+            if (window.top.__ets_recorded.length > 200) {
+                window.top.__ets_recorded = window.top.__ets_recorded.slice(-100);
+            }
         };
-        win.kttb_ReturnChoose.toString = function() {
-            return "function kttb_ReturnChoose() { [native code] }";
-        };
+        Object.defineProperty(win.kttb_ReturnChoose, 'toString', {
+            value: function() { return "function kttb_ReturnChoose() { [native code] }"; },
+            enumerable: false, configurable: false
+        });
         win.kttb_returnPcBlank = function(data) {
             if (_origBlank && typeof _origBlank === 'function') {
                 try { _origBlank(data); } catch(e) {}
             }
             window.top.__ets_recorded_fill.push(data);
+            if (window.top.__ets_recorded_fill.length > 200) {
+                window.top.__ets_recorded_fill = window.top.__ets_recorded_fill.slice(-100);
+            }
         };
-        win.kttb_returnPcBlank.toString = function() {
-            return "function kttb_returnPcBlank() { [native code] }";
-        };
+        Object.defineProperty(win.kttb_returnPcBlank, 'toString', {
+            value: function() { return "function kttb_returnPcBlank() { [native code] }"; },
+            enumerable: false, configurable: false
+        });
         return JSON.stringify({
             nativeChoose: hadNativeChoose,
             nativeFill: hadNativeFill
@@ -220,7 +229,8 @@ class ETSAutoAnswer(ETSBase):
             if not os.path.exists(cj):
                 continue
             try:
-                data = json.load(open(cj, 'r', encoding='utf-8'))
+                with open(cj, 'r', encoding='utf-8') as _f:
+                    data = json.load(_f)
                 stype = data.get('structure_type', '')
                 info = data.get('info', {})
                 stid = info.get('stid', '')
@@ -441,7 +451,7 @@ class ETSAutoAnswer(ETSBase):
             value = ans['answer']
 
             if inp.get('value') and inp['value'].strip():
-                if inp['value'].strip() == value:
+                if inp['value'].strip().lower() == value.strip().lower():
                     self.debug("Already filled: %s = %s" % (inp_id, value))
                     self.stats['fill_skip'] += 1
                     continue
@@ -661,45 +671,9 @@ class ETSAutoAnswer(ETSBase):
 
     # ── Main Loop ─────────────────────────────────────────────
 
-    def run(self, max_steps=999):
-        """Run auto-answer loop. Stops when exam is done or recording window is closed.
-        max_steps is a safety limit only — you should never need to set it."""
-        print("\nETS Auto")
-        print("=" * 40)
-
-        self.connect()
-
-        # Fire on_connect callback
-        if self._on_connect:
-            try:
-                self._on_connect(self.ets_base, self.set_id, self.homework_mode, self.total_questions)
-            except Exception as e:
-                self.debug("on_connect callback error: " + str(e))
-
-        if 'Result' in self.tab.get('url', ''):
-            print("Already on a result page — open a mock exam to auto-answer")
-            return
-
-        if not self.load_answers():
-            print("Failed to load answers, aborting")
-            return
-
-        mode_str = "HOMEWORK" if self.homework_mode else "PRACTICE"
-        print("Mode: %s | Questions: %d" % (mode_str, self.total_questions))
-
-        # Show recording answers window upfront (if any)
-        if self.recording_answers:
-            print("Recording answers: %d types available" % len(self.recording_answers))
-            # Show window in background thread so script continues
-            import threading
-            def _show_window():
-                self.show_recording_answers_window()
-            t = threading.Thread(target=_show_window, daemon=True)
-            t.start()
-            time.sleep(0.5)  # Give window time to appear
-        else:
-            print("No recording questions in this exam")
-
+    def _run_loop(self, max_steps=999):
+        """Inner business-logic loop. Called by run(); separated so that
+        run() can put this in a worker thread when a GUI is present."""
         print("-" * 40)
 
         consecutive_empty = 0
@@ -862,7 +836,67 @@ class ETSAutoAnswer(ETSBase):
             except Exception as e:
                 self.debug("on_complete callback error: " + str(e))
 
+        # Cleanup WebSocket
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
         return result
+
+    def run(self, max_steps=999):
+        """Run auto-answer loop. Stops when exam is done or recording window is closed.
+        max_steps is a safety limit only — you should never need to set it."""
+        print("\nETS Auto")
+        print("=" * 40)
+
+        self.connect()
+
+        # Fire on_connect callback
+        if self._on_connect:
+            try:
+                self._on_connect(self.ets_base, self.set_id, self.homework_mode, self.total_questions)
+            except Exception as e:
+                self.debug("on_connect callback error: " + str(e))
+
+        if 'Result' in self.tab.get('url', ''):
+            print("Already on a result page — open a mock exam to auto-answer")
+            return
+
+        if not self.load_answers():
+            print("Failed to load answers, aborting")
+            return
+
+        mode_str = "HOMEWORK" if self.homework_mode else "PRACTICE"
+        print("Mode: %s | Questions: %d" % (mode_str, self.total_questions))
+
+        # Show recording answers window upfront (if any)
+        if self.recording_answers:
+            print("Recording answers: %d types available" % len(self.recording_answers))
+            # GUI must run on main thread; run business logic in worker thread
+            import threading, queue
+            result_q = queue.Queue()
+            def _worker():
+                try:
+                    r = self._run_loop(max_steps)
+                    result_q.put(r)
+                except Exception as e:
+                    result_q.put(e)
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+            self.show_recording_answers_window()  # blocks on mainloop
+            t.join(timeout=5)
+            if not result_q.empty():
+                result = result_q.get_nowait()
+                if isinstance(result, Exception):
+                    raise result
+                return result
+            return {'total_answered': 0}
+        else:
+            print("No recording questions in this exam")
+
+        return self._run_loop(max_steps)
 
 
 class TeeOutput:
@@ -883,6 +917,11 @@ class TeeOutput:
 
 
 if __name__ == "__main__":
+    # Force UTF-8 on Windows terminals (GBK can't encode IPA/special chars)
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
     import argparse
     parser = argparse.ArgumentParser(description="ETS Exam Auto — e听说PC端套卷自动答题")
     parser.add_argument("--max", type=int, default=999, help="Safety limit (default: 999)")
@@ -904,6 +943,11 @@ if __name__ == "__main__":
         auto.show_answers()
         if args.json:
             print(json.dumps(auto.get_all_answers(), ensure_ascii=False, indent=2))
+        if auto.ws:
+            try:
+                auto.ws.close()
+            except Exception:
+                pass
     else:
         result = auto.run(max_steps=args.max)
         if args.json and result:

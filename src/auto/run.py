@@ -10,12 +10,14 @@ Usage:
 import sys
 
 
-def main():
-    if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help', 'help'):
+def main(args_list=None):
+    if args_list is None:
+        args_list = sys.argv[1:]
+    if not args_list or args_list[0] in ('-h', '--help', 'help'):
         print(__doc__)
         print("Commands:")
-        print("  exam    套卷自动答题 (auto-answer exam questions)")
-        print("  pk      单词PK自动答题 (auto-answer word PK)")
+        print("  exam    \u5957\u5377\u81ea\u52a8\u7b54\u9898 (auto-answer exam questions)")
+        print("  pk      \u5355\u8bcdPK\u81ea\u52a8\u7b54\u9898 (auto-answer word PK)")
         print()
         print("Examples:")
         print("  python run.py exam --debug")
@@ -23,9 +25,8 @@ def main():
         print("  python run.py exam --show-answers")
         sys.exit(0)
 
-    command = sys.argv[1].lower()
-    # Remove the command from argv so argparse in sub-modules works correctly
-    sys.argv = [sys.argv[0]] + sys.argv[2:]
+    command = args_list[0].lower()
+    sub_args = args_list[1:]
 
     if command == 'exam':
         from ets_exam import ETSAutoAnswer
@@ -37,7 +38,7 @@ def main():
         parser.add_argument("--json", action="store_true", help="Output results as JSON")
         parser.add_argument("--show-answers", action="store_true", help="Show all answers without auto-answering")
         parser.add_argument("--log", type=str, default=None, metavar="FILE", help="Save all output to a log file")
-        args = parser.parse_args()
+        args = parser.parse_args(sub_args)
 
         from ets_exam import TeeOutput
         tee = None
@@ -70,7 +71,7 @@ def main():
         parser.add_argument("--max", type=int, default=999, help="Max questions")
         parser.add_argument("--debug", action="store_true", help="Show debug info")
         parser.add_argument("--port", type=int, default=10086, help="CDP port")
-        args = parser.parse_args()
+        args = parser.parse_args(sub_args)
 
         ETSWordPK(port=args.port, debug_mode=args.debug).run(max_q=args.max)
 
