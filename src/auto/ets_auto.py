@@ -4,13 +4,13 @@ ETS Exam Auto — e听说PC端套卷自动答题工具
 CDP + JS注入DOM，支持听后选择和听后记录题型。
 
 Usage:
-  python ets_exam.py              # 自动答题（默认安全上限 999 步）
-  python ets_exam.py --max 50     # 限制步数
-  python ets_exam.py --debug      # 调试模式
-  python ets_exam.py --show-answers  # 仅查看答案
-  python ets_exam.py --json       # JSON 输出
+  python ets_auto.py              # 自动答题（默认安全上限 999 步）
+  python ets_auto.py --max 50     # 限制步数
+  python ets_auto.py --debug      # 调试模式
+  python ets_auto.py --show-answers  # 仅查看答案
+  python ets_auto.py --json       # JSON 输出
 """
-import json, os, time, sys
+import json, os, time, sys, threading
 from urllib.parse import urlparse, parse_qs
 from ets_common import ETSBase
 
@@ -148,13 +148,19 @@ class ETSAutoAnswer(ETSBase):
     # ── Bridge Injection ──────────────────────────────────────
 
     def inject_bridge(self):
-        """Wrap kttb_ReturnChoose / kttb_returnPcBlank.
+        """Wrap kttb_ReturnChoose / kttb_returnPcBlank (idempotent).
         In homework mode: call native CEF function first, then record.
-        In practice mode: record only (no native function exists)."""
+        In practice mode: record only (no native function exists).
+        Guards against re-wrapping: checks __ets_hooked flag so repeated
+        calls on the same iframe don't nest wrappers."""
         js = '''(function(){
         var win = document.querySelector("iframe").contentWindow;
         window.top.__ets_recorded = window.top.__ets_recorded || [];
         window.top.__ets_recorded_fill = window.top.__ets_recorded_fill || [];
+        /* Idempotent guard: skip if already hooked on this iframe */
+        if (win.__ets_hooked) {
+            return JSON.stringify({nativeChoose: !!win.__ets_origChoose, nativeFill: !!win.__ets_origBlank, skipped: true});
+        }
         var hadNativeChoose = typeof win.kttb_ReturnChoose === 'function';
         var hadNativeFill = typeof win.kttb_returnPcBlank === 'function';
         var _origChoose = win.kttb_ReturnChoose;
@@ -186,6 +192,10 @@ class ETSAutoAnswer(ETSBase):
             value: function() { return "function kttb_returnPcBlank() { [native code] }"; },
             enumerable: false, configurable: false
         });
+        /* Mark as hooked and stash originals for idempotent guard */
+        win.__ets_hooked = true;
+        win.__ets_origChoose = hadNativeChoose ? _origChoose : null;
+        win.__ets_origBlank = hadNativeFill ? _origBlank : null;
         return JSON.stringify({
             nativeChoose: hadNativeChoose,
             nativeFill: hadNativeFill
@@ -509,16 +519,17 @@ class ETSAutoAnswer(ETSBase):
 
     # ── Recording Helper ────────────────────────────────────
 
-    def show_recording_answers_window(self):
+    def show_recording_answers_window(self, poll_worker_fn=None):
         """Show ALL recording answers in a single tkinter window at startup.
         Window stays open while script runs; closing it signals the script to stop.
-        Returns True if a window was shown."""
+        poll_worker_fn: optional callback to register with root.after for thread monitoring."""
         if not self.recording_answers:
             return False
         import tkinter as tk
         from tkinter import scrolledtext
 
         root = tk.Tk()
+        self._tk_root = root  # Assign immediately so _poll_worker can reference it
         root.title('[Recording] 录音题参考答案')
         root.configure(bg='#1e1e2e')
 
@@ -607,6 +618,10 @@ class ETSAutoAnswer(ETSBase):
 
         print('[REC] Recording answers window opened (%d types)' % len(self.recording_answers))
 
+        # Register poll_worker AFTER root is created (fixes _tk_root AttributeError)
+        if poll_worker_fn:
+            self._tk_root.after(500, poll_worker_fn)
+
         root.focus_force()
         root.mainloop()
         self._recording_window_closed = True
@@ -658,18 +673,34 @@ class ETSAutoAnswer(ETSBase):
 
     def wait_iframe_ready(self, timeout=10):
         start = time.time()
-        empty_count = 0
         while time.time() - start < timeout:
             state = self.get_page_state()
             if state.get('choices') or state.get('inputs'):
                 return True, True
-            empty_count += 1
-            if empty_count >= 4:
-                return False, False
             time.sleep(0.3)
         return False, False
 
     # ── Main Loop ─────────────────────────────────────────────
+
+    def _wait_for_next(self, max_wait_loops=30, wait_sec=2, label="next"):
+        """Wait for Next button to become available after it was disabled/not found.
+        Returns True if Next succeeded, False if exam appears complete."""
+        for _ in range(max_wait_loops):
+            time.sleep(wait_sec)
+            if self._recording_window_closed:
+                return False
+            nr2 = self.click_next()
+            if nr2.get('success'):
+                time.sleep(0.6)
+                return True
+            if nr2.get('reason') == 'not found':
+                # Page may still be loading — keep waiting
+                continue
+            if nr2.get('reason') != 'disabled':
+                # Unexpected reason — treat as complete
+                return False
+        # Exhausted wait — exam likely complete
+        return False
 
     def _run_loop(self, max_steps=999):
         """Inner business-logic loop. Called by run(); separated so that
@@ -728,22 +759,17 @@ class ETSAutoAnswer(ETSBase):
                     elif nr.get('reason') == 'disabled':
                         # Button temporarily disabled — wait and retry
                         self.debug("  Next disabled after choices, waiting...")
-                        for _ in range(30):
-                            time.sleep(2)
-                            if self._recording_window_closed:
-                                break
-                            nr2 = self.click_next()
-                            if nr2.get('success'):
-                                time.sleep(0.6)
-                                break
-                            new_state = self.get_page_state()
-                            if not new_state.get('hasChoice'):
-                                state = new_state
-                                break
-                        else:
-                            print("Exam completed (next disabled after choices)")
-                            break
-                        continue
+                        if self._wait_for_next(max_wait_loops=30, wait_sec=2, label="choices"):
+                            continue
+                        print("Exam completed (next disabled after choices)")
+                        break
+                    elif nr.get('reason') == 'not found':
+                        # Page may still be loading
+                        self.debug("  Next button not found after choices, waiting...")
+                        if self._wait_for_next(max_wait_loops=10, wait_sec=2, label="choices-load"):
+                            continue
+                        print("Exam completed (next not found after choices)")
+                        break
                     else:
                         print("Exam completed")
                         break
@@ -753,6 +779,19 @@ class ETSAutoAnswer(ETSBase):
                     if nr.get('success'):
                         time.sleep(0.6)
                         continue
+                    elif nr.get('reason') == 'disabled':
+                        # Audio may still be playing — wait, don't break immediately
+                        self.debug("  Next disabled (no choice answer), waiting...")
+                        if self._wait_for_next(max_wait_loops=30, wait_sec=2, label="choice-no-answer"):
+                            consecutive_empty = 0
+                            continue
+                        print("Exam completed (next disabled, no answer)")
+                        break
+                    elif nr.get('reason') == 'not found':
+                        if self._wait_for_next(max_wait_loops=10, wait_sec=2, label="choice-no-ans-load"):
+                            consecutive_empty = 0
+                            continue
+                        consecutive_empty = 10
                     else:
                         consecutive_empty = 10
             elif state.get('hasInput'):
@@ -765,22 +804,16 @@ class ETSAutoAnswer(ETSBase):
                     elif nr.get('reason') == 'disabled':
                         # Button disabled during fill section (ETS replays audio)
                         self.debug("  Next disabled (fill audio replay), waiting for button...")
-                        for _ in range(60):  # up to ~4 minutes
-                            time.sleep(4)
-                            if self._recording_window_closed:
-                                break
-                            nr2 = self.click_next()
-                            if nr2.get('success'):
-                                time.sleep(0.6)
-                                break
-                            new_state = self.get_page_state()
-                            if not new_state.get('hasInput'):
-                                state = new_state
-                                break
-                        else:
-                            print("Exam completed (fill section, next disabled too long)")
-                            break
-                        continue
+                        if self._wait_for_next(max_wait_loops=60, wait_sec=4, label="fill-audio"):
+                            continue
+                        print("Exam completed (fill section, next disabled too long)")
+                        break
+                    elif nr.get('reason') == 'not found':
+                        if self._wait_for_next(max_wait_loops=10, wait_sec=2, label="fill-load"):
+                            continue
+                        print("Exam completed (fill section, next not found)")
+                        break
+                    continue
             else:
                 # No choices AND no inputs — section transition
                 consecutive_empty += 1
@@ -796,7 +829,18 @@ class ETSAutoAnswer(ETSBase):
             if nr.get('success'):
                 time.sleep(0.6)
             elif nr.get('reason') == 'disabled':
+                # Don't immediately break — audio may still be playing
+                self.debug("  Next disabled after answering, waiting...")
+                if self._wait_for_next(max_wait_loops=30, wait_sec=2, label="post-answer"):
+                    continue
                 print("Exam completed (next disabled)")
+                break
+            elif nr.get('reason') == 'not found':
+                # Page may still be loading — wait instead of breaking
+                self.debug("  Next button not found, waiting for page load...")
+                if self._wait_for_next(max_wait_loops=10, wait_sec=2, label="post-answer-load"):
+                    continue
+                print("Exam completed (next not found)")
                 break
             else:
                 print("Exam completed")
@@ -853,13 +897,6 @@ class ETSAutoAnswer(ETSBase):
 
         self.connect()
 
-        # Fire on_connect callback
-        if self._on_connect:
-            try:
-                self._on_connect(self.ets_base, self.set_id, self.homework_mode, self.total_questions)
-            except Exception as e:
-                self.debug("on_connect callback error: " + str(e))
-
         if 'Result' in self.tab.get('url', ''):
             print("Already on a result page — open a mock exam to auto-answer")
             return
@@ -870,6 +907,13 @@ class ETSAutoAnswer(ETSBase):
 
         mode_str = "HOMEWORK" if self.homework_mode else "PRACTICE"
         print("Mode: %s | Questions: %d" % (mode_str, self.total_questions))
+
+        # Fire on_connect callback AFTER load_answers so total_questions is populated
+        if self._on_connect:
+            try:
+                self._on_connect(self.ets_base, self.set_id, self.homework_mode, self.total_questions)
+            except Exception as e:
+                self.debug("on_connect callback error: " + str(e))
 
         # Show recording answers window upfront (if any)
         if self.recording_answers:
@@ -885,7 +929,17 @@ class ETSAutoAnswer(ETSBase):
                     result_q.put(e)
             t = threading.Thread(target=_worker, daemon=True)
             t.start()
-            self.show_recording_answers_window()  # blocks on mainloop
+            # Monitor worker thread from main thread: auto-destroy window when done
+            def _poll_worker():
+                if not t.is_alive():
+                    # Worker finished — destroy window to exit mainloop
+                    if self._tk_root and self._tk_root.winfo_exists():
+                        self._tk_root.destroy()
+                    return
+                self._tk_root.after(500, _poll_worker)
+            # _poll_worker is registered inside show_recording_answers_window
+            # after self._tk_root is created, avoiding AttributeError
+            self.show_recording_answers_window(poll_worker_fn=_poll_worker)  # blocks on mainloop
             t.join(timeout=5)
             if not result_q.empty():
                 result = result_q.get_nowait()
@@ -901,26 +955,56 @@ class ETSAutoAnswer(ETSBase):
 
 class TeeOutput:
     """Tee output to both terminal and log file."""
-    def __init__(self, file_path):
-        self.terminal = sys.stdout
-        self.log = open(file_path, 'w', encoding='utf-8')
+    _shared_lock = threading.Lock()  # protect concurrent writes to same file
+
+    def __init__(self, file_path, original_stream=None, mode='w', shared_handle=None):
+        self.terminal = original_stream or sys.stdout
+        if shared_handle is not None:
+            self.log = shared_handle
+            self._owns_handle = False
+        else:
+            self.log = open(file_path, mode, encoding='utf-8')
+            self._owns_handle = True
     def write(self, message):
-        if self.terminal is not None:
-            self.terminal.write(message)
-        self.log.write(message)
+        with self._shared_lock:
+            if self.terminal is not None:
+                self.terminal.write(message)
+            self.log.write(message)
     def flush(self):
-        if self.terminal is not None:
-            self.terminal.flush()
-        self.log.flush()
+        with self._shared_lock:
+            if self.terminal is not None:
+                self.terminal.flush()
+            self.log.flush()
     def close(self):
-        self.log.close()
+        if self._owns_handle:
+            self.log.close()
+    # Standard text IO attributes (Bug 13: PyInstaller/pip may read these)
+    @property
+    def encoding(self):
+        return self.terminal.encoding if self.terminal and hasattr(self.terminal, 'encoding') else 'utf-8'
+    @property
+    def errors(self):
+        return self.terminal.errors if self.terminal and hasattr(self.terminal, 'errors') else 'replace'
+    @property
+    def mode(self):
+        return 'w'
+    @property
+    def name(self):
+        return self.log.name if hasattr(self.log, 'name') else None
+    def fileno(self):
+        return self.log.fileno()
+    def isatty(self):
+        return self.terminal.isatty() if self.terminal and hasattr(self.terminal, 'isatty') else False
 
 
 if __name__ == "__main__":
     # Force UTF-8 on Windows terminals (GBK can't encode IPA/special chars)
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    if sys.platform == 'win32':
+        try:
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, LookupError):
+            pass
 
     import argparse
     parser = argparse.ArgumentParser(description="ETS Exam Auto — e听说PC端套卷自动答题")
@@ -931,30 +1015,37 @@ if __name__ == "__main__":
     parser.add_argument("--log", type=str, default=None, metavar="FILE", help="Save all output to a log file")
     args = parser.parse_args()
 
-    # Setup log file (tee stdout to file)
+    # Setup log file (tee stdout AND stderr to file)
     tee = None
+    tee_err = None
     if args.log:
-        tee = TeeOutput(args.log)
+        tee = TeeOutput(args.log)  # opens file in 'w' mode
         sys.stdout = tee
-    auto = ETSAutoAnswer(debug_mode=args.debug)
-    if args.show_answers:
-        auto.connect()
-        auto.load_answers()
-        auto.show_answers()
-        if args.json:
-            print(json.dumps(auto.get_all_answers(), ensure_ascii=False, indent=2))
-        if auto.ws:
-            try:
-                auto.ws.close()
-            except Exception:
-                pass
-    else:
-        result = auto.run(max_steps=args.max)
-        if args.json and result:
-            print(json.dumps(result, ensure_ascii=False))
-
-    # Cleanup: restore stdout and close log file
-    if tee:
-        sys.stdout = tee.terminal
-        tee.close()
-        print("Log saved to: " + args.log)
+        tee_err = TeeOutput(args.log, original_stream=sys.stderr, shared_handle=tee.log)
+        sys.stderr = tee_err
+    try:
+        auto = ETSAutoAnswer(debug_mode=args.debug)
+        if args.show_answers:
+            auto.connect()
+            auto.load_answers()
+            auto.show_answers()
+            if args.json:
+                print(json.dumps(auto.get_all_answers(), ensure_ascii=False, indent=2))
+            if auto.ws:
+                try:
+                    auto.ws.close()
+                except Exception:
+                    pass
+        else:
+            result = auto.run(max_steps=args.max)
+            if args.json and result:
+                print(json.dumps(result, ensure_ascii=False))
+    finally:
+        # Cleanup: restore stdout/stderr BEFORE closing log file
+        # (so any exception during close can still write to stderr)
+        if tee_err:
+            sys.stderr = tee_err.terminal
+        if tee:
+            sys.stdout = tee.terminal
+            tee.close()
+            print("Log saved to: " + args.log)

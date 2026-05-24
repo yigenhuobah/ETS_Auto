@@ -22,11 +22,34 @@ def _edit_dist(a, b):
     return prev[lb]
 
 
+def _same_script(a, b):
+    """Check if both strings share at least one script (CJK, Latin, etc).
+    Cross-script edit distance is meaningless (Chinese vs English),
+    so we use this to gate tie-breaking."""
+    def _has_cjk(s):
+        return any('\u4e00' <= c <= '\u9fff' for c in s)
+    def _has_latin(s):
+        return any('a' <= c.lower() <= 'z' for c in s)
+    a_cjk, b_cjk = _has_cjk(a), _has_cjk(b)
+    a_lat, b_lat = _has_latin(a), _has_latin(b)
+    return (a_cjk and b_cjk) or (a_lat and b_lat)
+
+
+def _tie_breaker(a, b, reference):
+    """Prefer the string closer to reference by edit distance.
+    Falls back to length similarity when scripts don't match."""
+    if _same_script(a, reference) and _same_script(b, reference):
+        return _edit_dist(a, reference) < _edit_dist(b, reference)
+    # Cross-script: prefer shorter edit distance on shared characters
+    # or just length similarity as a weak signal
+    return abs(len(a) - len(reference)) < abs(len(b) - len(reference))
+
+
 def _resource_path(filename):
     """Resolve bundled resource path — works both in dev and PyInstaller --onefile.
 
     Read-only data files (ecdict_pk.json) are bundled inside the exe via
-    sys._MEIPASS.  User-writable files (pk_extra.json, pk_misses.json)
+    sys._MEIPASS.  User-writable files (pk_extra.json, pk_misses.jsonl)
     must live NEXT TO the exe, so they are NOT resolved through _MEIPASS.
     """
     if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
@@ -39,7 +62,7 @@ def _resource_path(filename):
 def _exe_dir_path(filename):
     """Resolve user-writable file path next to the executable (or script dir in dev).
 
-    pk_extra.json and pk_misses.json must be writable and persist across runs,
+    pk_extra.json and pk_misses.jsonl must be writable and persist across runs,
     so they go next to the exe, NOT inside the PyInstaller bundle.
     """
     if getattr(sys, 'frozen', False):
@@ -57,7 +80,7 @@ class ETSWordPK(ETSBase):
         self.ecdict_path = _resource_path('ecdict_pk.json')
         # User-writable: must live next to the exe, not inside the bundle
         self.extra_path = _exe_dir_path('pk_extra.json')
-        self.misses_path = _exe_dir_path('pk_misses.json')
+        self.misses_path = _exe_dir_path('pk_misses.jsonl')
         self.word_trans = {}      # word.lower() -> full_trans
         self.trans_index = {}     # chinese_segment -> [word1, word2, ...]
         self.pk_extra = {}        # question_text -> correct_option (self-learned)
@@ -157,17 +180,22 @@ class ETSWordPK(ETSBase):
                 line = line.strip()
                 if not line:
                     continue
-                phrases = re.findall(r'([a-z][a-z\-]+(?:\s[a-z][a-z\-]+)+)', line)
+                phrases = re.findall(r'([a-z][a-z\-]*(?:\s[a-z][a-z\-]*)+)', line)
                 for ph in phrases:
                     ph = ph.strip()
                     phl = ph.lower()
                     # Skip noise: grammar abbreviations, single-letter fragments, sth/sb/etc
+                    # Use startswith to also catch possessive forms: sb's, sth's, etc.
                     _skip = False
                     for _tok in phl.split():
-                        if _tok in ('sth', 'sb', 'etc', 'ie', 'eg', 'vs', 'cf', 'al'):
+                        if _tok in ('etc', 'ie', 'eg', 'vs', 'cf', 'al'):
                             _skip = True
                             break
-                        if len(_tok) <= 1:
+                        if _tok.startswith('sb') or _tok.startswith('sth'):
+                            _skip = True
+                            break
+                        # Allow single-letter words like 'a' in 'deal with a problem'
+                        if _tok and not _tok[0].isalpha():
                             _skip = True
                             break
                     if _skip:
@@ -215,11 +243,11 @@ class ETSWordPK(ETSBase):
                 candidates.append(w[:-len(brit)] + us)
         if w.endswith('ly') and len(w) > 4:
             candidates.append(w[:-2])           # mentally → mental
-            if w[:-3].endswith('al'):            # musically → music
-                candidates.append(w[:-4])
-            if w[:-3].endswith('ic'):            # artistically → artist
-                candidates.append(w[:-4])
-            if w[:-3].endswith('le'):            # gently → gentle
+            if w[:-2].endswith('al'):            # musically → music → musical → music
+                candidates.append(w[:-4])  # strip 'ally' to get base
+            if w[:-2].endswith('ic'):            # artistically → artistic → artist
+                candidates.append(w[:-4])  # strip 'ically' to get base
+            if w[:-2].endswith('le'):            # gently → gentle
                 candidates.append(w[:-2] + 'le')
         if w.endswith('ing') and len(w) > 5:
             candidates.append(w[:-3])            # talking → talk
@@ -242,7 +270,10 @@ class ETSWordPK(ETSBase):
         return list(set(c for c in candidates if c))
 
     def get_opt_trans(self, opt):
-        """Get translations for an option, including sub-phrase extraction."""
+        """Get translations for an option, including sub-phrase extraction.
+        Finds ALL non-overlapping matching sub-phrases (longest first),
+        not just the first match — so "deal with a problem" can match
+        both "deal with" and "problem" instead of losing the tail."""
         stems = self.get_stems(opt)
         word_trans_parts = []
         for s in stems:
@@ -252,14 +283,20 @@ class ETSWordPK(ETSBase):
         phrase_trans = []
         if ' ' in opt:
             words = opt.split()
-            for n in range(len(words), 1, -1):
+            matched = set()  # indices already covered by a longer match
+            for n in range(len(words), 0, -1):  # include single words (n=1)
                 for start in range(len(words) - n + 1):
+                    # Skip if any word in this range is already matched
+                    if any(i in matched for i in range(start, start + n)):
+                        continue
                     sub = ' '.join(words[start:start+n])
                     if sub in self.word_trans:
                         phrase_trans.append(self.word_trans[sub])
-                        break
-                if phrase_trans:
-                    break
+                        for i in range(start, start + n):
+                            matched.add(i)
+        elif opt in self.word_trans:
+            # Single word option — direct lookup
+            phrase_trans.append(self.word_trans[opt])
 
         all_parts = phrase_trans + word_trans_parts
         combined = ' '.join(all_parts) if all_parts else ''
@@ -295,6 +332,7 @@ class ETSWordPK(ETSBase):
             if stem in self.word_trans:
                 trans_text = self.word_trans[stem]
                 best_idx = -1
+                best_clean = ''
                 best_score = 0
                 for i, opt in enumerate(options):
                     opt_clean = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', opt).strip()
@@ -319,9 +357,10 @@ class ETSWordPK(ETSBase):
                         if bigram in trans_text:
                             score += 8
                     if score > best_score or (score == best_score and score > 0 and
-                            _edit_dist(opt_clean, q_clean) < _edit_dist(options[best_idx], q_clean)):
+                            _tie_breaker(opt_clean, best_clean, q_clean)):
                         best_score = score
                         best_idx = i
+                        best_clean = opt_clean
                 if best_idx >= 0 and best_score > 0:
                     self.debug("EnQ: '%s' (stem=%s) -> opt[%d]='%s' score=%d" % (q, stem, best_idx, options[best_idx], best_score))
                     return best_idx
@@ -421,7 +460,7 @@ class ETSWordPK(ETSBase):
                         if bigram in combined:
                             score += 15
                     if score > best_score or (score == best_score and score > 0 and
-                            _edit_dist(combined, q) < _edit_dist(best_combined, q)):
+                            _tie_breaker(combined, best_combined, q)):
                         best_score = score
                         best_idx = i
                         best_combined = combined
@@ -505,48 +544,87 @@ class ETSWordPK(ETSBase):
 
     # ── Self-Learning ─────────────────────────────────────────
 
-    def capture_wrong_answer(self, clicked_idx):
-        """After clicking an option, check if it was wrong and capture the correct answer"""
+    def capture_wrong_answer(self, clicked_idx, current_options=None):
+        """After clicking an option, check if it was wrong and capture the correct answer.
+        current_options: list of current option texts for validation (Bug 18: prevents
+        learning stale data from a page transition)."""
         js = r'''(function(){
         var items = document.querySelectorAll('.question-items-item');
         var clicked = items[%d];
         var clickedCls = clicked ? (clicked.className || '') : '';
         var isWrong = clickedCls.indexOf('wrong') >= 0 || clickedCls.indexOf('error') >= 0;
         var correctOpt = '';
+        var allOpts = [];
         for (var i = 0; i < items.length; i++) {
             var cls = items[i].className || '';
             var html = items[i].innerHTML || '';
+            var c = items[i].querySelector('.select-item-content');
+            var text = c ? c.innerText.trim() : items[i].innerText.trim();
+            allOpts.push(text);
             if (i !== %d && (cls.indexOf('correct') >= 0 || cls.indexOf('right') >= 0 ||
                 cls.indexOf('success') >= 0 || (html.indexOf('svg-icon') >= 0 && cls.indexOf('correct') >= 0))) {
-                var c = items[i].querySelector('.select-item-content');
-                var text = c ? c.innerText.trim() : items[i].innerText.trim();
                 var lines = text.split(/\n/).map(function(l){return l.trim();}).filter(function(l){return l;});
                 correctOpt = lines.length ? lines[lines.length-1] : text;
                 correctOpt = correctOpt.replace(/^[A-Z][.)]\s*/, '').replace(/^\d+[.)]\s*/, '').trim() || text;
             }
         }
-        return JSON.stringify({isWrong: isWrong, correctAnswer: correctOpt});
+        return JSON.stringify({isWrong: isWrong, correctAnswer: correctOpt, allOpts: allOpts});
         })()''' % (clicked_idx, clicked_idx)
         result = self.eval_js(js)
         try:
             info = json.loads(result) if result else {}
             if info.get('isWrong') and info.get('correctAnswer'):
-                return info['correctAnswer']
+                captured = info['correctAnswer']
+                # Bug 18: Validate captured answer is among current options
+                # If page transitioned, the DOM options won't match our known options
+                if current_options is not None:
+                    dom_opts = info.get('allOpts', [])
+                    # Check if DOM options match what we expected
+                    if len(dom_opts) != len(current_options):
+                        self.debug("capture_wrong_answer: DOM option count mismatch (%d vs %d), skipping" % (len(dom_opts), len(current_options)))
+                        return ''
+                    # Content validation: prevent stale-page pollution when option count matches
+                    # (e.g. both old and new questions have 4 options)
+                    expected_texts = set(o.strip().lower() for o in current_options)
+                    actual_texts = set(o.strip().lower() for o in dom_opts)
+                    if expected_texts != actual_texts:
+                        self.debug("capture_wrong_answer: DOM option content mismatch, page likely transitioned, skipping")
+                        return ''
+                return captured
         except:
             pass
         return ''
 
+    @staticmethod
+    def _is_chinese(text):
+        """Check if text contains CJK characters (Chinese/Japanese/Korean)"""
+        for ch in text:
+            if '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf':
+                return True
+        return False
+
     def learn_miss(self, question, correct_answer):
-        """Record a learned mapping: question -> correct_answer"""
+        """Record a learned mapping: question -> correct_answer
+        Also updates trans_index in the correct direction (cn -> [en_words])."""
         q = question.strip()
         if not q or not correct_answer:
             return
         if q not in self.pk_extra or self.pk_extra[q] != correct_answer:
             self.pk_extra[q] = correct_answer
-            self.trans_index.setdefault(q, []).insert(0, correct_answer)
-            q_clean = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', q).strip()
-            if q_clean != q:
-                self.trans_index.setdefault(q_clean, []).insert(0, correct_answer)
+            # trans_index direction: chinese_key -> [english_words]
+            # Determine which is Chinese and insert in the correct direction
+            if self._is_chinese(q):
+                # q=Chinese, correct_answer=English → correct direction
+                self.trans_index.setdefault(q, []).insert(0, correct_answer)
+                q_clean = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', q).strip()
+                if q_clean != q:
+                    self.trans_index.setdefault(q_clean, []).insert(0, correct_answer)
+            else:
+                # q=English, correct_answer=Chinese → reverse: cn_key -> [en_word]
+                self.trans_index.setdefault(correct_answer, []).insert(0, q)
+                cn_clean = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', correct_answer).strip()
+                if cn_clean != correct_answer:
+                    self.trans_index.setdefault(cn_clean, []).insert(0, q)
             # Atomic write: temp file + os.replace() — never leaves a 0-byte file on crash
             import tempfile
             dir_name = os.path.dirname(self.extra_path) or '.'
@@ -622,7 +700,7 @@ class ETSWordPK(ETSBase):
                     same_count += 1
                     if same_count >= 5:
                         print("  (same question, moving on)")
-                        no_match += 1
+                        # Don't add no_match here — already counted when first encountered
                         same_count = -10  # cooldown: skip 10 cycles, don't reset last_title
                         time.sleep(0.5)
                     elif same_count > 0:
@@ -653,9 +731,8 @@ class ETSWordPK(ETSBase):
                         self.stats['errors'] += 1
                     # Check if answer was wrong → try to capture correct answer
                     time.sleep(0.5)
-                    correct = self.capture_wrong_answer(idx)
+                    correct = self.capture_wrong_answer(idx, current_options=options)
                     if correct:
-                        print("  [LEARN] '%s' -> %s" % (title, correct))
                         self.learn_miss(title, correct)
                 else:
                     print("  #%s -> ??? [%s]" % (progress or n, ' / '.join(options)))
@@ -685,9 +762,12 @@ class ETSWordPK(ETSBase):
 
 if __name__ == "__main__":
     # Force UTF-8 on Windows terminals (GBK can't encode IPA/special chars)
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    if sys.platform == 'win32':
+        try:
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, LookupError):
+            pass
 
     import argparse
     p = argparse.ArgumentParser(description="ETS Word PK Auto v5")

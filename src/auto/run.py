@@ -8,6 +8,21 @@ Usage:
   python run.py --help             # Show help
 """
 import sys
+import os
+
+
+def _force_utf8():
+    """Force UTF-8 output on Windows to prevent UnicodeEncodeError with phonetic symbols."""
+    if sys.platform == 'win32':
+        os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+        try:
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, LookupError):
+            pass  # Python <3.7 or unsupported
+
+
+_force_utf8()
 
 
 def main(args_list=None):
@@ -29,7 +44,7 @@ def main(args_list=None):
     sub_args = args_list[1:]
 
     if command == 'exam':
-        from ets_exam import ETSAutoAnswer
+        from ets_auto import ETSAutoAnswer
         import argparse, json
 
         parser = argparse.ArgumentParser(description="ETS Exam Auto — e听说PC端套卷自动答题")
@@ -40,28 +55,34 @@ def main(args_list=None):
         parser.add_argument("--log", type=str, default=None, metavar="FILE", help="Save all output to a log file")
         args = parser.parse_args(sub_args)
 
-        from ets_exam import TeeOutput
+        from ets_auto import TeeOutput
         tee = None
+        tee_err = None
         if args.log:
             tee = TeeOutput(args.log)
             sys.stdout = tee
+            tee_err = TeeOutput(args.log, original_stream=sys.stderr, shared_handle=tee.log)
+            sys.stderr = tee_err
 
-        auto = ETSAutoAnswer(debug_mode=args.debug)
-        if args.show_answers:
-            auto.connect()
-            auto.load_answers()
-            auto.show_answers()
-            if args.json:
-                print(json.dumps(auto.get_all_answers(), ensure_ascii=False, indent=2))
-        else:
-            result = auto.run(max_steps=args.max)
-            if args.json and result:
-                print(json.dumps(result, ensure_ascii=False))
-
-        if tee:
-            sys.stdout = tee.terminal
-            tee.close()
-            print("Log saved to: " + args.log)
+        try:
+            auto = ETSAutoAnswer(debug_mode=args.debug)
+            if args.show_answers:
+                auto.connect()
+                auto.load_answers()
+                auto.show_answers()
+                if args.json:
+                    print(json.dumps(auto.get_all_answers(), ensure_ascii=False, indent=2))
+            else:
+                result = auto.run(max_steps=args.max)
+                if args.json and result:
+                    print(json.dumps(result, ensure_ascii=False))
+        finally:
+            if tee_err:
+                sys.stderr = tee_err.terminal
+            if tee:
+                sys.stdout = tee.terminal
+                tee.close()
+                print("Log saved to: " + args.log)
 
     elif command == 'pk':
         from ets_word_pk import ETSWordPK
@@ -71,9 +92,27 @@ def main(args_list=None):
         parser.add_argument("--max", type=int, default=999, help="Max questions")
         parser.add_argument("--debug", action="store_true", help="Show debug info")
         parser.add_argument("--port", type=int, default=10086, help="CDP port")
+        parser.add_argument("--log", type=str, default=None, metavar="FILE", help="Save all output to a log file")
         args = parser.parse_args(sub_args)
 
-        ETSWordPK(port=args.port, debug_mode=args.debug).run(max_q=args.max)
+        from ets_auto import TeeOutput
+        tee = None
+        tee_err = None
+        if args.log:
+            tee = TeeOutput(args.log)
+            sys.stdout = tee
+            tee_err = TeeOutput(args.log, original_stream=sys.stderr, shared_handle=tee.log)
+            sys.stderr = tee_err
+
+        try:
+            ETSWordPK(port=args.port, debug_mode=args.debug).run(max_q=args.max)
+        finally:
+            if tee_err:
+                sys.stderr = tee_err.terminal
+            if tee:
+                sys.stdout = tee.terminal
+                tee.close()
+                print("Log saved to: " + args.log)
 
     else:
         print("Unknown command: %s" % command)

@@ -60,10 +60,18 @@ class ETSBase:
         Catches WebSocket disconnection gracefully.
         """
         self.mid += 1
-        self.ws.send(json.dumps({
+        payload = json.dumps({
             "id": self.mid, "method": "Runtime.evaluate",
             "params": {"expression": expr, "returnByValue": True}
-        }))
+        })
+        try:
+            self.ws.send(payload)
+        except websocket.WebSocketConnectionClosedException:
+            raise ConnectionError(
+                "WebSocket closed — browser disconnected before eval_js send")
+        except OSError as e:
+            raise ConnectionError(
+                "WebSocket I/O error during eval_js send: %s" % e)
         deadline = time.time() + self._EVAL_JS_TIMEOUT
         while True:
             remaining = deadline - time.time()
@@ -84,14 +92,36 @@ class ETSBase:
             except OSError as e:
                 raise ConnectionError(
                     "WebSocket I/O error during eval_js: %s" % e)
-            resp = json.loads(raw)
+            try:
+                resp = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                # Non-JSON protocol message — skip it (e.g. browser shutdown noise)
+                self.debug("[WS] non-JSON message skipped: %s" % raw[:200])
+                continue
             if resp.get("id") == self.mid:
                 if "error" in resp:
                     self.debug("[WS ERROR] " + str(resp["error"]))
                     return None
-                return resp.get("result", {}).get("result", {}).get("value")
+                # Check for JS runtime exceptions (e.g. TypeError from null iframe)
+                result_obj = resp.get("result", {}).get("result", {})
+                exc_detail = resp.get("result", {}).get("exceptionDetails")
+                if exc_detail:
+                    exc_text = exc_detail.get("text", "")
+                    # Try to extract exception description from the first preview property
+                    exc_obj = exc_detail.get("exception", {})
+                    if exc_obj.get("type") == "object" and exc_obj.get("preview", {}).get("properties"):
+                        for prop in exc_obj["preview"]["properties"]:
+                            if prop.get("name") == "message":
+                                exc_text = prop.get("value", exc_text)
+                                break
+                    elif exc_obj.get("description"):
+                        exc_text = exc_obj["description"]
+                    self.debug("[JS EXCEPTION] " + exc_text)
+                    return None
+                return result_obj.get("value")
 
     @staticmethod
     def js_escape(s):
-        """Escape string for safe JS single-quoted string injection."""
-        return s.replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n').replace('\r', '')
+        """Escape string for safe JS single-quoted or double-quoted string injection."""
+        return (s.replace('\\', '\\\\').replace("'", "\\'")
+                 .replace('"', '\\"').replace('\n', '\\n').replace('\r', ''))

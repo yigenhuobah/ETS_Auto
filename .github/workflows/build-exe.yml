@@ -22,7 +22,7 @@ jobs:
         run: pip install -r requirements.txt pyinstaller
 
       - name: Build exam
-        run: pyinstaller --onefile --hidden-import=websocket --hidden-import=ets_common --name ets_auto src/auto/ets_exam.py
+        run: pyinstaller --onefile --hidden-import=websocket --hidden-import=ets_common --name ets_auto src/auto/ets_auto.py
 
       - name: Build PK
         run: pyinstaller --onefile --hidden-import=websocket --hidden-import=ets_common --add-data "ecdict_pk.json;." --name ets_pk src/auto/ets_word_pk.py
