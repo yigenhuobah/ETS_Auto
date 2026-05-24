@@ -80,7 +80,7 @@ python src/auto/run.py pk --debug          # 调试模式
 python src/auto/run.py pk --max 50         # 限制题数
 
 # 或者直接运行子模块
-python src/auto/ets_exam.py --debug        # 套卷答题
+python src/auto/ets_auto.py --debug        # 套卷答题
 python src/auto/ets_word_pk.py --debug     # 单词PK
 
 ```
@@ -143,7 +143,7 @@ Done: 13 hit / 15 total = 87% | 2 miss | 0 err | 3 learned
        │               │
        ▼               ▼
 ┌──────────────┐  ┌───────────────┐
-│ ets_exam.py  │  │ ets_word_pk.py│
+│ ets_auto.py  │  │ ets_word_pk.py│
 │ 套卷自动答题  │  │ 单词PK自动答题 │
 │ - setPCChoose2│  │ - 四级匹配策略 │
 │ - 原生Setter │  │ - 派生词生成   │
@@ -168,7 +168,7 @@ ETS_Auto/
 ├── ecdict_pk.json                # ECDICT 字典补充 (PK用)
 └── src/auto/
     ├── ets_common.py             # ★ 共享基类 (CDP连接/eval_js)
-    ├── ets_exam.py               # ★ 套卷自动答题
+    ├── ets_auto.py                # ★ 套卷自动答题
     ├── ets_word_pk.py            # ★ 单词PK自动答题
     └── run.py                    # 统一入口 (exam|pk)
 

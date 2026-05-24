@@ -313,13 +313,53 @@ class ETSWordPK(ETSBase):
         if not q:
             return -1
 
-        # ── Strategy 0: Self-learned exact match ──
+        # ── Strategy 0: Self-learned exact + fuzzy match ──
         if q in self.pk_extra:
             answer = self.pk_extra[q]
+            ans_s = answer.strip().lower()
+            # Exact match
             for i, opt in enumerate(options):
-                if opt.strip() == answer.strip():
+                if opt.strip().lower() == ans_s:
                     self.debug("Learned: '%s' -> %s" % (q, answer))
                     return i
+            # Fuzzy: answer contained in option or vice versa
+            for i, opt in enumerate(options):
+                opt_s = opt.strip().lower()
+                if opt_s and ans_s and (opt_s in ans_s or ans_s in opt_s):
+                    self.debug("Learned(fuzzy): '%s' -> %s ~ %s" % (q, answer, opt))
+                    return i
+        # Reverse lookup: Chinese question not in pk_extra but matches a pk_extra key substring
+        if self._is_chinese(q):
+            q_clean2 = re.sub(r'[^\u4e00-\u9fff]', '', q)
+            if len(q_clean2) >= 2:
+                best_idx = -1
+                best_score = 0
+                best_answer = ''
+                for pk_q, pk_a in self.pk_extra.items():
+                    pk_q_clean = re.sub(r'[^\u4e00-\u9fff]', '', pk_q)
+                    if not pk_q_clean:
+                        continue
+                    # Overlap scoring
+                    overlap = 0
+                    for j in range(len(q_clean2) - 1):
+                        if q_clean2[j:j+2] in pk_q_clean:
+                            overlap += 1
+                    for j in range(len(pk_q_clean) - 1):
+                        if pk_q_clean[j:j+2] in q_clean2:
+                            overlap += 1
+                    if overlap > best_score:
+                        # Check if pk_a matches any option
+                        pk_a_s = pk_a.strip().lower()
+                        for i, opt in enumerate(options):
+                            opt_s = opt.strip().lower()
+                            if opt_s == pk_a_s or (opt_s and pk_a_s and (opt_s in pk_a_s or pk_a_s in opt_s)):
+                                best_score = overlap
+                                best_idx = i
+                                best_answer = pk_a
+                                break
+                if best_idx >= 0 and best_score >= 2:
+                    self.debug("Learned(reverse): '%s' ~ '%s' -> %s" % (q, best_answer, options[best_idx]))
+                    return best_idx
 
         q_clean = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', q).strip()
         q_terms = re.split(r'[，,、；；]', q_clean)
@@ -701,12 +741,16 @@ class ETSWordPK(ETSBase):
                     if same_count >= 5:
                         print("  (same question, moving on)")
                         # Don't add no_match here — already counted when first encountered
-                        same_count = -10  # cooldown: skip 10 cycles, don't reset last_title
+                        same_count = -8  # cooldown: skip 8 cycles then re-check
                         time.sleep(0.5)
                     elif same_count > 0:
                         time.sleep(min(0.3 * (2 ** (same_count - 1)), 2.0))  # exponential backoff
                     else:
-                        time.sleep(0.4)  # cooling down after skip
+                        same_count += 1  # count towards zero
+                        if same_count >= 0:
+                            same_count = 0  # cooldown done, reset for re-check
+                            last_title = ''  # force re-evaluate next cycle
+                        time.sleep(0.4)
                     continue
 
                 # New or different question — reset tracker
