@@ -1,4 +1,4 @@
-﻿
+
 # 🎯 ETS Auto — e听说 PC 端自动答题工具
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPL%20v3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
@@ -6,17 +6,19 @@
 [![Windows](https://img.shields.io/badge/Platform-Windows-0078D6.svg)]()
 [![ETS v5.7.8](https://img.shields.io/badge/ETS-v5.7.8-success.svg)](https://www.ets100.com/home/index.html)
 
-> 🚀 **e听说自动答题 / 单词PK自动答题** · 听后选择零秒作答 · 听后记录自动填词 · 单词PK 85%+ 命中率 · 无需管理员权限 · 不篡改客户端 · 纯本地零网络
+> 🚀 **e听说自动答题 / 单词PK自动答题 / 离线试卷浏览器** · 听后选择零秒作答 · 听后记录自动填词 · 单词PK 85%+ 命中率 · 离线浏览所有缓存试卷 · 无需管理员权限 · 不篡改客户端 · 纯本地零网络
 
-**每天被 e 听说作业折磨？** 这个工具能自动完成 PC 端的听说选择题和填空题，还能自动答单词 PK。遇到语音题自动停住等你开口读。不修改客户端、不篡改分数、不依赖网络，是目前 ETS 环境下最**合规安全**的自动答题方案。
+**每天被 e 听说作业折磨？** 这个工具能自动完成 PC 端的听说选择题和填空题，还能自动答单词 PK，更内置离线试卷浏览器让你提前预览所有答案。遇到语音题自动停住等你开口读。不修改客户端、不篡改分数、不依赖网络，是目前 ETS 环境下最**合规安全**的自动答题方案。
 
 ---
 
 ## ✨ 功能特性
 
 - ✅ **套卷自动答题** — 选择题自动点击 + 填空题自动填值，听后选择/听后记录通杀
-- ✅ **单词PK自动答题** — 四级匹配策略 + 派生词生成 + 自学习，85%+ 命中率
+- ✅ **单词PK自动答题** — 四级匹配策略 + 派生词生成 + 双向自学习，85%+ 命中率
 - ✅ **录音题答案展示** — 听后转述/回答问题/短文朗读自动弹出参考答案窗口
+- ✅ **📚 离线试卷浏览器** — 扫描本地缓存，选择题标红正确答案、填空题展示标准答案、口语题列出所有可接受回答
+- ✅ **🖥️ 图形界面** — CustomTkinter GUI，选模式→输端口→点开始，小白友好
 - ✅ **零网络依赖** — 答案从本地缓存直接提取，无需抓包联网
 - ✅ **双模式兼容** — 模拟练习 & 作业模式自动检测，无缝切换
 - ✅ **跨题型自动导航** — 选择→填空 Section 过渡自动等待重试
@@ -27,12 +29,19 @@
 
 ### 推荐方式：直接使用打包版 (免安装任何环境)
 1. 前往本仓库的 [Releases 页面](https://github.com/yigenhuobah/ETS_Auto/releases/latest)。
-2. 在 `Assets` 列表中下载 `ets_auto.exe`（套卷答题）和/或 `ets_pk.exe`（单词PK）。
+2. 在 `Assets` 列表中下载你需要的 exe：
+   - `ets_auto.exe` — 套卷答题（命令行）
+   - `ets_pk.exe` — 单词PK（命令行）
+   - `ets_gui.exe` — 图形界面（集成套卷/PK/离线浏览器）
 3. 打开 ETS PC 客户端，登录并进入答题页面（套卷进题目页，PK 进 PK 匹配页）。
 4. 双击运行对应的 exe，享受喝茶的时光。
 
----
+### 图形界面使用
+运行 `ets_gui.exe` 后：
+1. **Tab 1 套卷/PK**：选择模式、输入 CDP 端口，点击 🚀 开始
+2. **Tab 3 📚 离线试卷浏览器**：左侧选择试卷，右侧逐节查看题目和答案
 
+---
 
 ### ❓ 常见问题 (FAQ)
 
@@ -47,6 +56,8 @@ A: 在终端里按 `Ctrl + C` 强制终止，然后加上 `--debug` 参数重新
 A: 脚本启动时会自动弹出参考答案窗口（听后转述/回答问题/短文朗读），你可以边看答案边录音。选择题和填空题做完后，关闭答案窗口即可停止脚本。
 * **Q: 单词 PK 怎么用？**
 A: 运行 `python run.py pk` 或 `ets_pk.exe`，然后进入 ETS 的单词 PK 匹配页面即可。脚本会自动抓取题目并从本地字典匹配答案，答错的会自动学习，命中率越来越高。
+* **Q: 离线试卷浏览器看不到任何试卷？**
+A: 浏览器读取 `%APPDATA%\ETS` 目录下的缓存。需要先在 ETS 客户端中打开过至少一次作业，系统才会缓存试卷数据。
 
 ---
 
@@ -66,7 +77,10 @@ git clone https://github.com/yigenhuobah/ETS_Auto.git
 cd ETS_Auto
 pip install -r requirements.txt
 
-# 2. 运行套卷答题 (请确保已在客户端进入答题页)
+# 2. 运行图形界面 (推荐)
+python src/auto/ets_gui.py
+
+# 3. 运行套卷答题 (请确保已在客户端进入答题页)
 python src/auto/run.py exam                # 默认模式（静默极简输出）
 python src/auto/run.py exam --debug        # 调试模式（输出 CDP 交互日志）
 python src/auto/run.py exam --max 200      # 设定安全步数上限
@@ -74,10 +88,13 @@ python src/auto/run.py exam --log run.log  # 保存日志
 python src/auto/run.py exam --show-answers # 仅查看答案
 python src/auto/run.py exam --json         # JSON 格式输出
 
-# 3. 运行单词PK (请确保已在客户端进入PK匹配页)
+# 4. 运行单词PK (请确保已在客户端进入PK匹配页)
 python src/auto/run.py pk                  # 默认模式
 python src/auto/run.py pk --debug          # 调试模式
 python src/auto/run.py pk --max 50         # 限制题数
+
+# 5. 离线试卷浏览器 (独立运行)
+python src/auto/ets_parser.py
 
 # 或者直接运行子模块
 python src/auto/ets_auto.py --debug        # 套卷答题
@@ -118,6 +135,21 @@ Dictionary: 4200 base + 800 ecdict + 120 deriv + 45 compound + 30 extra = 5195 t
 =============================================
 Done: 13 hit / 15 total = 87% | 2 miss | 0 err | 3 learned
 
+# ── 离线试卷浏览器 ──
+扫描 %APPDATA%\ETS → 发现 18 套试卷
+试卷 398810 (9题)  📝 🗣️ 🖼️ 📖
+  ━━ 📝 选择题 ━━
+  【题1】1. Who did Lucy think invented the light bulb?
+     A. Emerson.
+     B. Edison.
+  ✅ C. Einstein.
+  正确答案：C
+
+  ━━ ✏️ 填空题 ━━
+  【第16空】parents
+  【第17空】March
+  【第18空】36000/36,000/thirty-six thousand
+
 ```
 
 ---
@@ -147,12 +179,23 @@ Done: 13 hit / 15 total = 87% | 2 miss | 0 err | 3 learned
 │ 套卷自动答题  │  │ 单词PK自动答题 │
 │ - setPCChoose2│  │ - 四级匹配策略 │
 │ - 原生Setter │  │ - 派生词生成   │
-│ - 本地JSON   │  │ - 自学习机制   │
+│ - 本地JSON   │  │ - 双向自学习   │
+└──────────────┘  └───────────────┘
+       │
+       ▼
+┌──────────────┐  ┌───────────────┐
+│ ets_gui.py   │  │ ets_parser.py │
+│ 图形界面启动器 │  │ 离线试卷浏览器 │
+│ - 模式/端口   │  │ - 选择题标红   │
+│ - 实时日志    │  │ - 填空标准答案 │
+│ - Tab 3 集成  │  │ - 口语可接受答案│
 └──────────────┘  └───────────────┘
 
 ```
 
 ETS 的交互选项为原生 DOM 节点 (`.choose2`) 而非 Canvas 渲染，可直接通过 JS `.click()` 或其内部 API 触发。答案数据在试卷初始化时已明文下发并存储于本地 `%APPDATA%` 缓存中，这赋予了脚本零网络请求即可拿满分的物理外挂特性。
+
+离线试卷浏览器直接解析 `%APPDATA%\ETS\<set_id>\content_xxxx\content.json`，支持五种题型：`collector.choose`（选择题）、`collector.fill`（填空题）、`collector.role`（口语问答）、`collector.picture`（图片描述）、`collector.read`（朗读）。
 
 ---
 
@@ -160,7 +203,7 @@ ETS 的交互选项为原生 DOM 节点 (`.choose2`) 而非 Canvas 渲染，可�
 
 ```text
 ETS_Auto/
-├── .github/workflows/build-exe.yml  # CI: 自动打包双 exe
+├── .github/workflows/build-exe.yml  # CI: 自动打包三 exe
 ├── LICENSE
 ├── README.md
 ├── requirements.txt
@@ -170,7 +213,9 @@ ETS_Auto/
     ├── ets_common.py             # ★ 共享基类 (CDP连接/eval_js)
     ├── ets_auto.py                # ★ 套卷自动答题
     ├── ets_word_pk.py            # ★ 单词PK自动答题
-    └── run.py                    # 统一入口 (exam|pk)
+    ├── ets_gui.py                # ★ 图形界面 (CustomTkinter)
+    ├── ets_parser.py             # ★ 离线试卷浏览器
+    └── run.py                    # 统一入口 (exam|pk|gui)
 
 ```
 
@@ -182,7 +227,10 @@ ETS_Auto/
 * [x] **一键执行程序** —— GitHub Actions 云端构建 `.exe`，双击即用。 ✅ v0.2.0
 * [x] **单词PK自动答题** —— 四级匹配+派生词+自学习，85%+命中率。 ✅ v0.3.0
 * [x] **模块拆分** —— 提取 ets_common.py 共享基类，统一入口 run.py。 ✅ v0.3.0
-* [ ] **傻瓜式 GUI 界面** —— 加入可视化窗口，点点鼠标即可完成。
+* [x] **傻瓜式 GUI 界面** —— CustomTkinter 可视化窗口，点点鼠标即可完成。 ✅ v0.4.0
+* [x] **离线试卷浏览器** —— 扫描本地缓存，红字高亮正确答案，支持五种题型。 ✅ v0.4.0
+* [ ] **热键支持** —— 全局快捷键控制开始/暂停/停止
+* [ ] **答案本地解析增强** — 断连恢复/双重验证/作业列表
 
 > **注**：由于移动端系统级权限管控，本脚本目前及未来均**不计划**兼容 Android 或 iOS 平台。如果有移动端相关需求，请尝试开源社区的其他相关库吧（如 `Fuck_ets100`，适用于安卓设备的答案检索工具）。
 
@@ -207,7 +255,7 @@ ETS_Auto/
 一个人（还有机）的力量是有限的，目标平台的版本和题型也千奇百怪。我们极其欢迎各路技术大佬共同参与开发！
 无论你是：
 - 修复了某个特定旧版本客户端的兼容性 Bug。
-- 实现了 Roadmap 中的 GUI 界面或 `.exe` 一键打包。
+- 实现了 Roadmap 中的热键支持或答案解析增强。
 - 优化了底层的 JS 注入逻辑。
 - 甚至只是修正了readme里的一个错别字。
 都可以直接 Fork 本仓库并提交 Pull Requests！
@@ -218,4 +266,3 @@ ETS_Auto/
 1. **限制**：脚本不会也无法替你发声，遇到语音录入题目请自觉拿起麦克风。
 2. **测试环境覆盖**：当前脚本主要针对 ETS v5.7.8 版本开发测试，若官方大更新可能失效。
 3. **免责声明**：本项目仅供 Python 自动化学习与前端 Web 安全防护研究使用，旨在揭示 Electron/CEF 架构在本地数据明文存储上的设计缺陷。请勿用于任何违反校规或平台协议的违规操作。
-

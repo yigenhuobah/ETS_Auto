@@ -3,10 +3,9 @@
 ETS Auto GUI — CustomTkinter launcher for ETS automation tools.
 
 Provides a graphical interface for:
-  - Selecting mode (Exam / Word PK)
-  - Configuring CDP port and debug mode
-  - Running automation in a background thread
-  - Viewing real-time log output
+  - Tab 1: Selecting mode (Exam / Word PK) + CDP settings
+  - Tab 2: 📚 离线试卷浏览器 (ETS cached data viewer)
+  - Real-time log output for automation
 
 Usage:
   python ets_gui.py
@@ -85,9 +84,9 @@ class ETSApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("ETS Auto")
-        self.geometry("520x520")
+        self.geometry("680x560")
         self.resizable(True, True)
-        self.minsize(420, 400)
+        self.minsize(580, 480)
 
         # State
         self._worker = None
@@ -104,8 +103,22 @@ class ETSApp(ctk.CTk):
 
     # ── UI Construction ──────────────────────────────────────
     def _build_ui(self):
+        # Tab view
+        self._tabview = ctk.CTkTabview(self)
+        self._tabview.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Tab 1: Auto mode
+        tab1 = self._tabview.add("🤖 自动答题")
+        self._build_auto_tab(tab1)
+
+        # Tab 2: Offline browser
+        tab2 = self._tabview.add("📚 离线试卷浏览器")
+        self._build_browser_tab(tab2)
+
+    def _build_auto_tab(self, parent):
+        """Build the auto-answer tab (original GUI content)."""
         # Top frame: settings
-        settings = ctk.CTkFrame(self, fg_color="transparent")
+        settings = ctk.CTkFrame(parent, fg_color="transparent")
         settings.pack(fill="x", padx=16, pady=(16, 8))
 
         # Mode selector
@@ -145,7 +158,7 @@ class ETSApp(ctk.CTk):
         self._max_entry.grid(row=3, column=1, sticky="w", pady=(8, 0))
 
         # Buttons
-        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame = ctk.CTkFrame(parent, fg_color="transparent")
         btn_frame.pack(fill="x", padx=16, pady=(4, 8))
 
         self._start_btn = ctk.CTkButton(
@@ -160,15 +173,24 @@ class ETSApp(ctk.CTk):
         # Status bar
         self._status_var = ctk.StringVar(value="就绪")
         self._status_label = ctk.CTkLabel(
-            self, textvariable=self._status_var, anchor="w",
+            parent, textvariable=self._status_var, anchor="w",
             font=ctk.CTkFont(size=12, weight="bold"))
         self._status_label.pack(fill="x", padx=16, pady=(0, 4))
 
         # Log output
         self._log_text = ctk.CTkTextbox(
-            self, wrap="word", state="disabled",
+            parent, wrap="word", state="disabled",
             font=ctk.CTkFont(family="Consolas", size=12))
         self._log_text.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+    def _build_browser_tab(self, parent):
+        """Build the offline paper browser tab using ets_parser."""
+        try:
+            from ets_parser import create_browser_tab
+            create_browser_tab(parent)
+        except ImportError as e:
+            ctk.CTkLabel(parent, text="加载离线浏览器失败: %s" % e,
+                         text_color="red").pack(padx=20, pady=20)
 
     def _on_mode_change(self):
         """Update max label based on selected mode."""
