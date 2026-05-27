@@ -1,8 +1,9 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 ETS Auto — Unified entry point for ETS automation tools.
 
 Usage:
+  python run.py gui                 # 启动GUI界面 (default)
   python run.py exam [options]     # 套卷自动答题
   python run.py pk [options]       # 单词PK自动答题
   python run.py --help             # Show help
@@ -31,10 +32,13 @@ def main(args_list=None):
     if not args_list or args_list[0] in ('-h', '--help', 'help'):
         print(__doc__)
         print("Commands:")
-        print("  exam    \u5957\u5377\u81ea\u52a8\u7b54\u9898 (auto-answer exam questions)")
-        print("  pk      \u5355\u8bcdPK\u81ea\u52a8\u7b54\u9898 (auto-answer word PK)")
+        print("  gui     启动GUI界面 (launch graphical interface)")
+        print("  exam    套卷自动答题 (auto-answer exam questions)")
+        print("  pk      单词PK自动答题 (auto-answer word PK)")
         print()
         print("Examples:")
+        print("  python run.py")
+        print("  python run.py gui")
         print("  python run.py exam --debug")
         print("  python run.py pk --max 50")
         print("  python run.py exam --show-answers")
@@ -43,7 +47,12 @@ def main(args_list=None):
     command = args_list[0].lower()
     sub_args = args_list[1:]
 
-    if command == 'exam':
+    if command == 'gui':
+        from ets_gui import ETSApp
+        app = ETSApp()
+        app.mainloop()
+
+    elif command == 'exam':
         from ets_auto import ETSAutoAnswer
         import argparse, json
 

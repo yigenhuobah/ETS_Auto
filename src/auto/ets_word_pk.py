@@ -328,37 +328,44 @@ class ETSWordPK(ETSBase):
                 if opt_s and ans_s and (opt_s in ans_s or ans_s in opt_s):
                     self.debug("Learned(fuzzy): '%s' -> %s ~ %s" % (q, answer, opt))
                     return i
-        # Reverse lookup: Chinese question not in pk_extra but matches a pk_extra key substring
+        # Reverse lookup A: Chinese question matches pk_extra KEY (cn→en records)
+        # Reverse lookup B: Chinese question matches pk_extra VALUE (en→cn records)
         if self._is_chinese(q):
             q_clean2 = re.sub(r'[^\u4e00-\u9fff]', '', q)
             if len(q_clean2) >= 2:
                 best_idx = -1
                 best_score = 0
                 best_answer = ''
+                best_source = ''
                 for pk_q, pk_a in self.pk_extra.items():
+                    # A: match against pk_extra key (e.g. pk_q="在押/入狱", pk_a="behind bars")
                     pk_q_clean = re.sub(r'[^\u4e00-\u9fff]', '', pk_q)
-                    if not pk_q_clean:
-                        continue
-                    # Overlap scoring
-                    overlap = 0
-                    for j in range(len(q_clean2) - 1):
-                        if q_clean2[j:j+2] in pk_q_clean:
-                            overlap += 1
-                    for j in range(len(pk_q_clean) - 1):
-                        if pk_q_clean[j:j+2] in q_clean2:
-                            overlap += 1
-                    if overlap > best_score:
-                        # Check if pk_a matches any option
-                        pk_a_s = pk_a.strip().lower()
-                        for i, opt in enumerate(options):
-                            opt_s = opt.strip().lower()
-                            if opt_s == pk_a_s or (opt_s and pk_a_s and (opt_s in pk_a_s or pk_a_s in opt_s)):
-                                best_score = overlap
-                                best_idx = i
-                                best_answer = pk_a
-                                break
+                    # B: match against pk_extra value (e.g. pk_q="behind bars", pk_a="在押/入狱")
+                    pk_a_clean = re.sub(r'[^\u4e00-\u9fff]', '', pk_a)
+                    for text_clean, match_side in [(pk_q_clean, 'key'), (pk_a_clean, 'val')]:
+                        if not text_clean or len(text_clean) < 2:
+                            continue
+                        overlap = 0
+                        for j in range(len(q_clean2) - 1):
+                            if q_clean2[j:j+2] in text_clean:
+                                overlap += 1
+                        for j in range(len(text_clean) - 1):
+                            if text_clean[j:j+2] in q_clean2:
+                                overlap += 1
+                        if overlap > best_score:
+                            # key side matched → answer is pk_a; val side matched → answer is pk_q
+                            candidate = pk_a if match_side == 'key' else pk_q
+                            cand_s = candidate.strip().lower()
+                            for i, opt in enumerate(options):
+                                opt_s = opt.strip().lower()
+                                if opt_s == cand_s or (opt_s and cand_s and (opt_s in cand_s or cand_s in opt_s)):
+                                    best_score = overlap
+                                    best_idx = i
+                                    best_answer = candidate
+                                    best_source = match_side
+                                    break
                 if best_idx >= 0 and best_score >= 2:
-                    self.debug("Learned(reverse): '%s' ~ '%s' -> %s" % (q, best_answer, options[best_idx]))
+                    self.debug("Learned(reverse-%s): '%s' ~ '%s' -> %s" % (best_source, q, best_answer, options[best_idx]))
                     return best_idx
 
         q_clean = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', q).strip()
