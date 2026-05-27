@@ -39,10 +39,16 @@ screenshots/*.jpg
 pk_extra.json
 pk_misses.json
 
-# Test artifacts tests/__pycache__/
+# Test/dev scripts (live in ETS_Project repo)
+test_*.py
+check_*.py
+
+# Test artifacts
+tests/__pycache__/
 tools/__pycache__/
 versions/__pycache__/
 
-# CDP temp files cdp_*/
+# CDP temp files
+cdp_*/
 temp/
 tmp/
