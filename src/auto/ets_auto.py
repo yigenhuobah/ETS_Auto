@@ -320,14 +320,22 @@ class ETSAutoAnswer(ETSBase):
         var choices = doc.querySelectorAll(".choose2");
         var groups = {};
         var choiceInfo = [];
+        var hasReviewMode = false;
         choices.forEach(function(c){
             if (c.offsetHeight <= 0) return;  // skip hidden (Vue ghost DOM)
             var id = c.id || "";
             var parts = id.split("_");
             var qid = parts.slice(0, -1).join("_");
-            if (!groups[qid]) groups[qid] = {qid: qid, choices: [], anySelected: false};
+            if (!groups[qid]) groups[qid] = {qid: qid, choices: [], anySelected: false, inReview: false};
             var sel = c.classList.contains("choose_selected") || c.classList.contains("on");
-            groups[qid].choices.push({id: id, selected: sel, text: c.textContent.trim().substring(0, 40)});
+            var isWrong = c.classList.contains("choose_wrong");
+            var isCorrect = c.classList.contains("choose_correct");
+            var isDisabled = c.classList.contains("choose_disable");
+            if (isWrong || isCorrect || isDisabled) {
+                groups[qid].inReview = true;
+                hasReviewMode = true;
+            }
+            groups[qid].choices.push({id: id, selected: sel, text: c.textContent.trim().substring(0, 40), wrong: isWrong, correct: isCorrect, disabled: isDisabled});
             if (sel) groups[qid].anySelected = true;
             choiceInfo.push({id: id, selected: sel, text: c.textContent.trim().substring(0, 40)});
         });
@@ -341,7 +349,8 @@ class ETSAutoAnswer(ETSBase):
         });
         return JSON.stringify({
             choices: choiceInfo, question_groups: groupList, inputs: inputInfo,
-            hasChoice: choices.length > 0, hasInput: inputs.length > 0
+            hasChoice: choices.length > 0, hasInput: inputs.length > 0,
+            inReviewMode: hasReviewMode
         });
         })()'''
         result = self.eval_js(js)
@@ -360,10 +369,20 @@ class ETSAutoAnswer(ETSBase):
         if not groups:
             return False, False  # (any_answered, likely_done)
 
+        # If page is in review/analysis mode (submitted answers shown), skip answering
+        if state.get('inReviewMode'):
+            self.debug("Page in review mode (choose_wrong/choose_correct/choose_disable detected)")
+            return False, True  # (no_new_answers, likely_done=True → advance to next)
+
         any_new = False
         all_already_done = True
         for g in groups:
             qid = g['qid']
+
+            if g.get('inReview'):
+                self.debug("Q:%s in review mode, skipping" % qid)
+                self.stats['choose_skip'] += 1
+                continue
 
             if g.get('anySelected'):
                 self.debug("Q:%s already selected" % qid)
@@ -630,7 +649,9 @@ class ETSAutoAnswer(ETSBase):
     # ── Navigation ────────────────────────────────────────────
 
     def click_next(self):
-        """Advance to next question. Try iframe next() first, then DOM button."""
+        """Advance to next question. Try iframe next() first, then .next_icon in iframe,
+        then .icon-nextQuestion in main frame."""
+        # 1. Try iframe.next() (older ETS versions)
         js_iframe_next = '''(function(){
         var iframe = document.querySelector("iframe");
         if (iframe && iframe.contentWindow && typeof iframe.contentWindow.next === 'function') {
@@ -643,6 +664,29 @@ class ETSAutoAnswer(ETSBase):
             self.debug("Next: iframe.next()")
             return {'success': True, 'method': 'iframe.next()'}
 
+        # 2. Try .next_icon inside iframe (listen-say choose2 pages)
+        js_iframe_next_icon = r'''(function(){
+        var iframe = document.querySelector("iframe");
+        if (!iframe) return JSON.stringify({success: false, reason: "no iframe"});
+        var iDoc = iframe.contentDocument || iframe.contentWindow.document;
+        var ni = iDoc.querySelector(".next_icon");
+        if (!ni) return JSON.stringify({success: false, reason: "no next_icon"});
+        // If parent container is hidden, force-show it (ETS hides submit until audio/timeout,
+        // but we've already selected an answer, so it's safe to submit)
+        var parent = ni.parentElement;
+        if (parent && getComputedStyle(parent).display === "none") {
+            parent.classList.remove("none");
+        }
+        ni.click();
+        return JSON.stringify({success: true, method: "iframe .next_icon"});
+        })()'''
+        result = json.loads(self.eval_js(js_iframe_next_icon) or "{}")
+        if result.get('success'):
+            self.stats['next_click'] += 1
+            self.debug("Next: iframe .next_icon")
+            return result
+
+        # 3. Try .icon-nextQuestion in main frame (legacy)
         js = '''(function(){
         var btn = document.querySelector(".icon-nextQuestion");
         if(btn){
@@ -680,6 +724,31 @@ class ETSAutoAnswer(ETSBase):
             time.sleep(0.3)
         return False, False
 
+    def _all_sidebar_correct(self):
+        """Check if all sidebar question items are marked is-correct (exam/homework complete).
+        Returns True only if sidebar exists, all items are is-correct,
+        AND we have answered at least as many questions as total_questions."""
+        js = '''(function(){
+        var orders = document.querySelectorAll('.question-order');
+        if (!orders || orders.length === 0) return JSON.stringify({hasSidebar: false});
+        var total = 0, correct = 0;
+        for (var i = 0; i < orders.length; i++) {
+            total++;
+            if (orders[i].classList.contains('is-correct')) correct++;
+        }
+        return JSON.stringify({hasSidebar: true, total: total, correct: correct, allCorrect: total > 0 && total === correct});
+        })()'''
+        try:
+            result = json.loads(self.eval_js(js) or '{}')
+            # Only declare complete if sidebar all correct AND we've answered enough
+            if result.get('allCorrect'):
+                answered = self.stats['choose_answered'] + self.stats['fill_answered']
+                if answered >= self.total_questions:
+                    return True
+            return False
+        except:
+            return False
+
     # ── Main Loop ─────────────────────────────────────────────
 
     def _wait_for_next(self, max_wait_loops=30, wait_sec=2, label="next"):
@@ -689,12 +758,16 @@ class ETSAutoAnswer(ETSBase):
             time.sleep(wait_sec)
             if self._recording_window_closed:
                 return False
+            # Early exit: if all sidebar items are correct, exam is complete
+            if self._all_sidebar_correct():
+                self.debug("All sidebar items are correct, exam complete")
+                return False
             nr2 = self.click_next()
             if nr2.get('success'):
                 time.sleep(0.6)
                 return True
-            if nr2.get('reason') == 'not found':
-                # Page may still be loading — keep waiting
+            if nr2.get('reason') in ('not found', 'next_icon hidden'):
+                # Page may still be loading / answer not yet selected — keep waiting
                 continue
             if nr2.get('reason') != 'disabled':
                 # Unexpected reason — treat as complete
@@ -751,17 +824,23 @@ class ETSAutoAnswer(ETSBase):
             if state.get('hasChoice'):
                 any_new, likely_done = self.answer_choose()
                 if likely_done and not any_new:
-                    # All choices already answered or no cache match — just advance
+                    # Review mode or all choices already answered — check completion then advance
+                    if self._all_sidebar_correct():
+                        print("Exam completed (all %d questions answered and correct)" % self.total_questions)
+                        break
                     nr = self.click_next()
                     if nr.get('success'):
                         time.sleep(0.6)
                         continue
-                    elif nr.get('reason') == 'disabled':
-                        # Button temporarily disabled — wait and retry
-                        self.debug("  Next disabled after choices, waiting...")
+                    elif nr.get('reason') in ('disabled', 'next_icon hidden'):
+                        # Button temporarily disabled / hidden — check sidebar then wait
+                        if self._all_sidebar_correct():
+                            print("Exam completed (all questions correct)")
+                            break
+                        self.debug("  Next disabled/hidden after choices, waiting...")
                         if self._wait_for_next(max_wait_loops=30, wait_sec=2, label="choices"):
                             continue
-                        print("Exam completed (next disabled after choices)")
+                        print("Exam completed (next disabled/hidden after choices)")
                         break
                     elif nr.get('reason') == 'not found':
                         # Page may still be loading
@@ -779,13 +858,13 @@ class ETSAutoAnswer(ETSBase):
                     if nr.get('success'):
                         time.sleep(0.6)
                         continue
-                    elif nr.get('reason') == 'disabled':
-                        # Audio may still be playing — wait, don't break immediately
-                        self.debug("  Next disabled (no choice answer), waiting...")
+                    elif nr.get('reason') in ('disabled', 'next_icon hidden'):
+                        # Audio may still be playing / answer not yet selected — wait
+                        self.debug("  Next disabled/hidden (no choice answer), waiting...")
                         if self._wait_for_next(max_wait_loops=30, wait_sec=2, label="choice-no-answer"):
                             consecutive_empty = 0
                             continue
-                        print("Exam completed (next disabled, no answer)")
+                        print("Exam completed (next disabled/hidden, no answer)")
                         break
                     elif nr.get('reason') == 'not found':
                         if self._wait_for_next(max_wait_loops=10, wait_sec=2, label="choice-no-ans-load"):
@@ -828,12 +907,12 @@ class ETSAutoAnswer(ETSBase):
             nr = self.click_next()
             if nr.get('success'):
                 time.sleep(0.6)
-            elif nr.get('reason') == 'disabled':
-                # Don't immediately break — audio may still be playing
-                self.debug("  Next disabled after answering, waiting...")
+            elif nr.get('reason') in ('disabled', 'next_icon hidden'):
+                # Don't immediately break — audio may still be playing / answer pending
+                self.debug("  Next disabled/hidden after answering, waiting...")
                 if self._wait_for_next(max_wait_loops=30, wait_sec=2, label="post-answer"):
                     continue
-                print("Exam completed (next disabled)")
+                print("Exam completed (next disabled/hidden)")
                 break
             elif nr.get('reason') == 'not found':
                 # Page may still be loading — wait instead of breaking
