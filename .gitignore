@@ -34,21 +34,25 @@ Thumbs.db
 *.log
 screenshots/*.png
 screenshots/*.jpg
+*.screenshot.png
+*_screenshot.png
+*_now.png
+gui_*.png
+ets_gui_*.png
 
-# PK user data (personal, not for distribution)
-pk_extra.json
-pk_misses.json
-
-# Test/dev scripts (live in ETS_Project repo)
-test_*.py
-check_*.py
-
-# Test artifacts
-tests/__pycache__/
+# Test artifacts tests/__pycache__/
 tools/__pycache__/
 versions/__pycache__/
 
-# CDP temp files
-cdp_*/
+# CDP temp files cdp_*/
 temp/
 tmp/
+
+# Runtime data (not part of source)
+ecdict-stardict/
+ecdict-stardict-28.zip
+ecdict_compact.json
+ecdict_lite.json
+ecdict_pk.json
+pk_extra.json
+pk_misses.json

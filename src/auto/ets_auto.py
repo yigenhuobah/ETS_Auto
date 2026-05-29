@@ -14,6 +14,7 @@ import json, os, time, sys, threading
 from urllib.parse import urlparse, parse_qs
 from urllib.error import URLError
 from ets_common import ETSBase
+from ets_strategy import ETSStrategy
 
 
 class ETSAutoAnswer(ETSBase):
@@ -28,6 +29,7 @@ class ETSAutoAnswer(ETSBase):
         self._recording_window_closed = False
         self.total_questions = 0
         self.recording_answers = []   # list of dicts for picture/dialogue
+        self.strategy = ETSStrategy()  # strategy layer for local answer lookup
         # Callback hooks (set via on_* methods or direct assignment)
         self._on_connect = None           # fn(ets_base, set_id, mode, total_questions)
         self._on_question_answered = None # fn(qid, answer, qtype) where qtype='choose'|'fill'
@@ -309,6 +311,16 @@ class ETSAutoAnswer(ETSBase):
 
         self.total_questions = len(self.answers)
         print("Loaded %d answers (set_id=%s)" % (self.total_questions, self.set_id))
+
+        # ── Load strategy layer (composite key index + fallback chain) ──
+        if self.set_id:
+            strat_ok = self.strategy.load_set(self.set_id)
+            if strat_ok:
+                print("Strategy layer: %d sections, %d indexed answers" % (
+                    len(self.strategy.sections), len(self.strategy.answer_index)))
+            else:
+                self.debug("Strategy layer: no cache data for set_id=%s" % self.set_id)
+
         return self.total_questions > 0
 
     # ── Page State ────────────────────────────────────────────
@@ -396,6 +408,16 @@ class ETSAutoAnswer(ETSBase):
                 self.debug("Q:%s no answer in cache" % qid)
                 continue
 
+            # ── Strategy layer double-check ──
+            stid_part, qid_part = (qid.rsplit('_', 1) + [''])[:2]
+            strat_ans = self.strategy.lookup('collector.choose', stid_part, qid=qid_part)
+            if strat_ans and strat_ans.get('source') == 'local':
+                strat_letter = strat_ans['answer'].upper()
+                if strat_letter != ans['answer'].upper():
+                    print("  ⚠ MISMATCH Q:%s: answers=%s strategy=%s — using strategy" % (
+                        qid, ans['answer'], strat_letter))
+                    ans = strat_ans
+
             answer_letter = ans['answer'].upper()
             answer_map = {'A': '1', 'B': '2', 'C': '3', 'D': '4', 'E': '5', 'F': '6', 'G': '7'}
             target_idx = answer_map.get(answer_letter, '1')
@@ -477,6 +499,15 @@ class ETSAutoAnswer(ETSBase):
             if ans.get('type') != 'fill':
                 self.debug("No fill answer for: " + inp_id)
                 continue
+
+            # ── Strategy layer double-check ──
+            stid_part, qid_part = (inp_id.rsplit('_', 1) + [''])[:2]
+            strat_ans = self.strategy.lookup('collector.fill', stid_part, qid=qid_part)
+            if strat_ans and strat_ans.get('source') == 'local':
+                if strat_ans['answer'].strip().lower() != ans['answer'].strip().lower():
+                    print("  ⚠ FILL MISMATCH %s: answers=%s strategy=%s — using strategy" % (
+                        inp_id, ans['answer'], strat_ans['answer']))
+                    ans = strat_ans
 
             value = ans['answer']
 
@@ -781,10 +812,36 @@ class ETSAutoAnswer(ETSBase):
         run() can put this in a worker thread when a GUI is present."""
         print("-" * 40)
 
+        # ── Register global hotkeys (Windows only) ──
+        hotkey = None
+        try:
+            from ets_hotkey import ETSHotkey
+            hotkey = ETSHotkey()
+            hotkey.register()
+        except Exception as e:
+            self.debug("Hotkey init failed (non-Windows?): %s" % e)
+            hotkey = None
+
         consecutive_empty = 0
         step = 0
 
         while True:
+            # ── Hotkey checks ──
+            if hotkey and hotkey.should_stop:
+                print("\n🛑 Emergency stop (F12)")
+                self.stop_event.set()
+                break
+            if hotkey and hotkey.should_skip:
+                hotkey.clear_skip()
+                print("\n⏭ Skipping current question (F10)")
+                nr = self.click_next()
+                if nr.get('success'):
+                    self.interruptible_sleep(1)
+                continue
+            if hotkey and hotkey.is_paused:
+                self.interruptible_sleep(0.5)
+                continue
+
             # Check if recording window was closed (user signal to stop)
             if self._recording_window_closed:
                 print("\nRecording window closed - stopping script")
@@ -964,6 +1021,13 @@ class ETSAutoAnswer(ETSBase):
         if self.ws:
             try:
                 self.ws.close()
+            except Exception:
+                pass
+
+        # Unregister hotkeys
+        if hotkey:
+            try:
+                hotkey.unregister()
             except Exception:
                 pass
 
