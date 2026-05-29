@@ -22,6 +22,11 @@ import json
 import re
 import html
 
+try:
+    import customtkinter as ctk
+except ImportError:
+    ctk = None
+
 # ── Path setup ───────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
     _BASE = sys._MEIPASS
@@ -460,7 +465,8 @@ def create_browser_tab(tab_frame):
 
 def main():
     """Run as standalone browser window."""
-    import customtkinter as ctk
+    if ctk is None:
+        raise ImportError("customtkinter is required. Install: pip install customtkinter")
 
     ctk.set_appearance_mode('dark')
     ctk.set_default_color_theme('blue')
