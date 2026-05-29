@@ -9,6 +9,7 @@ Supports question types:
   - collector.choose   → Multiple choice (A/B/C)
   - collector.fill     → Fill-in-the-blank (standard answers)
   - collector.role     → Oral response (acceptable answer variants)
+  - collector.dialogue → Dialogue-based oral Q&A (same structure as role)
   - collector.picture  → Picture description (model answers)
   - collector.read     → Read aloud (passage text)
 
@@ -50,6 +51,7 @@ TYPE_LABELS = {
     'collector.choose':  '选择题',
     'collector.fill':    '填空题',
     'collector.role':    '口语问答',
+    'collector.dialogue': '对话问答',
     'collector.picture': '图片描述',
     'collector.read':    '朗读',
 }
@@ -58,6 +60,7 @@ TYPE_ICONS = {
     'collector.choose':  '📝',
     'collector.fill':    '✏️',
     'collector.role':    '🗣️',
+    'collector.dialogue': '💬',
     'collector.picture': '🖼️',
     'collector.read':    '📖',
 }
@@ -213,7 +216,7 @@ def render_section(section_data):
 
         for std in info.get('std', []):
             q_num = std.get('th', '')
-            answer = std.get('value', '')
+            answer = _html_to_text(std.get('value', ''))
             ai = std.get('ai', '')
             parts.append(("第%s空 → " % q_num, 'q_num'))
             parts.append(("%s\n" % answer, 'answer'))
@@ -222,8 +225,8 @@ def render_section(section_data):
 
         parts.append(("\n", ''))
 
-    # ── Role ────────────────────────────────────────────
-    elif stype == 'collector.role':
+    # ── Role / Dialogue ────────────────────────────────
+    elif stype in ('collector.role', 'collector.dialogue'):
         passage = _html_to_text(info.get('value', ''))
         if passage:
             parts.append(("对话/材料：\n", 'muted'))
@@ -245,7 +248,7 @@ def render_section(section_data):
                 parts.append(("  可接受答案：\n", ''))
                 shown = set()
                 for s in stds[:8]:
-                    val = s.get('value', '')
+                    val = _html_to_text(s.get('value', ''))
                     if val not in shown:
                         shown.add(val)
                         parts.append(("    • %s\n" % val, 'answer'))
@@ -274,7 +277,7 @@ def render_section(section_data):
             parts.append(("\n", ''))
 
         for i, std in enumerate(info.get('std', []), 1):
-            answer = std.get('value', '')
+            answer = _html_to_text(std.get('value', ''))
             parts.append(("参考答案 %d\n" % i, 'q_num'))
             parts.append(("  %s\n\n" % answer, 'answer'))
 
