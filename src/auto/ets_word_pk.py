@@ -72,8 +72,8 @@ def _exe_dir_path(filename):
 
 
 class ETSWordPK(ETSBase):
-    def __init__(self, port=10086, debug_mode=False):
-        super().__init__(port=port, debug_mode=debug_mode)
+    def __init__(self, port=10086, debug_mode=False, stop_event=None):
+        super().__init__(port=port, debug_mode=debug_mode, stop_event=stop_event)
         self.ets_base = os.path.join(os.path.expandvars(r'%APPDATA%'), 'ETS')
         self.dict_path = os.path.join(self.ets_base, 'pc_xst_dict', 'pc_xst_dict.json')
         # Read-only: bundled inside exe via --add-data (PyInstaller _MEIPASS)
@@ -705,9 +705,14 @@ class ETSWordPK(ETSBase):
     # ── Main Loop ───────────────────────────────────────────
 
     def run(self, max_q=999):
-        print("\nETS Word PK Auto v5 (Derivatives + Phrases)")
+        print("ETS Word PK Auto v5 (Derivatives + Phrases)")
         print("=" * 45)
-        self.connect()
+        try:
+            self.connect()
+        except Exception as e:
+            print("\n连接失败: %s" % e)
+            print("请检查: 1) e听说PC端已启动  2) 调试端口 %d 正确" % self.port)
+            return
         if not self.load_dictionary():
             return
         print("-" * 45)
@@ -728,7 +733,7 @@ class ETSWordPK(ETSBase):
                     if no_q_count >= 20:
                         print("\nPK ended (no more questions).")
                         break
-                    time.sleep(0.4)
+                    self.interruptible_sleep(0.4)
                     continue
                 no_q_count = 0
 
@@ -739,7 +744,7 @@ class ETSWordPK(ETSBase):
                 if progress:
                     last_progress = progress
                 elif title == '' and not progress:
-                    time.sleep(0.3)
+                    self.interruptible_sleep(0.3)
                     continue
 
                 if same_count != 0 and title == last_title and title != '':
@@ -749,22 +754,22 @@ class ETSWordPK(ETSBase):
                         print("  (same question, moving on)")
                         # Don't add no_match here — already counted when first encountered
                         same_count = -8  # cooldown: skip 8 cycles then re-check
-                        time.sleep(0.5)
+                        self.interruptible_sleep(0.5)
                     elif same_count > 0:
-                        time.sleep(min(0.3 * (2 ** (same_count - 1)), 2.0))  # exponential backoff
+                        self.interruptible_sleep(min(0.3 * (2 ** (same_count - 1)), 2.0))  # exponential backoff
                     else:
                         same_count += 1  # count towards zero
                         if same_count >= 0:
                             same_count = 0  # cooldown done, reset for re-check
                             last_title = ''  # force re-evaluate next cycle
-                        time.sleep(0.4)
+                        self.interruptible_sleep(0.4)
                     continue
 
                 # New or different question — reset tracker
                 same_count = 1
                 last_title = title
                 if not title or len(options) < 2:
-                    time.sleep(0.3)
+                    self.interruptible_sleep(0.3)
                     continue
 
                 idx = self.find_answer(title, options)
@@ -781,7 +786,7 @@ class ETSWordPK(ETSBase):
                     else:
                         self.stats['errors'] += 1
                     # Check if answer was wrong → try to capture correct answer
-                    time.sleep(0.5)
+                    self.interruptible_sleep(0.5)
                     correct = self.capture_wrong_answer(idx, current_options=options)
                     if correct:
                         self.learn_miss(title, correct)
@@ -790,7 +795,7 @@ class ETSWordPK(ETSBase):
                     no_match += 1
                     self.record_miss(title, options)
 
-                time.sleep(0.8)
+                self.interruptible_sleep(0.8)
 
         except (ConnectionError, TimeoutError) as e:
             print("\nConnection lost: %s" % e)

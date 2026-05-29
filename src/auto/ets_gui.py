@@ -93,10 +93,15 @@ class ETSApp(ctk.CTk):
         self._stop_event = threading.Event()
         self._log_queue = queue.Queue()
         self._running = False
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
 
         # Theme
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
+
+        # Clean shutdown on window close
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
         self._poll_log()
@@ -249,13 +254,37 @@ class ETSApp(ctk.CTk):
         self._status_var.set("正在停止...")
         self._append_log("\n[用户] 请求停止...\n")
 
+    def _on_close(self):
+        """Handle window close: stop worker, wait briefly, then destroy."""
+        if self._running:
+            self._stop_event.set()
+            self._status_var.set("正在停止...")
+            # Wait for worker to exit (max 3s)
+            if self._worker and self._worker.is_alive():
+                self._worker.join(timeout=3)
+            self._restore_streams()
+        self.destroy()
+
+    def _restore_streams(self):
+        """Restore stdout/stderr to original, flush any remaining log queue."""
+        # Flush remaining log messages before restoring streams
+        while not self._log_queue.empty():
+            try:
+                msg = self._log_queue.get_nowait()
+                if self._original_stdout:
+                    try:
+                        self._original_stdout.write(msg)
+                    except Exception:
+                        pass
+            except queue.Empty:
+                break
+
+        sys.stdout = self._original_stdout
+        sys.stderr = self._original_stderr
+
     def _run_finished(self):
         """Called on main thread when worker finishes."""
-        # Restore stdout/stderr
-        if hasattr(self, '_queue_writer_out') and self._queue_writer_out.original:
-            sys.stdout = self._queue_writer_out.original
-        if hasattr(self, '_queue_writer_err') and self._queue_writer_err.original:
-            sys.stderr = self._queue_writer_err.original
+        self._restore_streams()
 
         self._running = False
         self._start_btn.configure(state="normal")
@@ -267,33 +296,14 @@ class ETSApp(ctk.CTk):
 
     # ── Worker thread ────────────────────────────────────────
     def _run_worker(self, mode, port, debug, max_val):
-        """Run the selected automation in a background thread."""
+        """Run the selected automation in a background thread.
+        Uses stop_event passed to automation instances for clean interruption.
+        No global monkey-patching of time.sleep."""
         try:
             if mode == self.MODE_EXAM:
                 from ets_auto import ETSAutoAnswer
-                auto = ETSAutoAnswer(port=port, debug_mode=debug)
-
-                # Wire up stop check
-                original_run = auto.run
-                def _run_with_stop(*args, **kwargs):
-                    # Monkey-patch time.sleep to check stop_event
-                    _orig_sleep = time.sleep
-                    def _interruptible_sleep(seconds):
-                        if self._stop_event.is_set():
-                            raise InterruptedError("User stopped")
-                        # Sleep in small chunks for responsiveness
-                        end = time.time() + seconds
-                        while time.time() < end:
-                            if self._stop_event.is_set():
-                                raise InterruptedError("User stopped")
-                            _orig_sleep(min(0.2, end - time.time()))
-                    time.sleep = _interruptible_sleep
-                    try:
-                        return original_run(*args, **kwargs)
-                    finally:
-                        time.sleep = _orig_sleep
-
-                auto.run = _run_with_stop
+                auto = ETSAutoAnswer(port=port, debug_mode=debug,
+                                     stop_event=self._stop_event)
                 try:
                     auto.run(max_steps=max_val)
                 except InterruptedError:
@@ -305,20 +315,8 @@ class ETSApp(ctk.CTk):
 
             elif mode == self.MODE_PK:
                 from ets_word_pk import ETSWordPK
-                pk = ETSWordPK(port=port, debug_mode=debug)
-
-                # Wire up stop check via sleep patching
-                _orig_sleep = time.sleep
-                def _interruptible_sleep(seconds):
-                    if self._stop_event.is_set():
-                        raise InterruptedError("User stopped")
-                    end = time.time() + seconds
-                    while time.time() < end:
-                        if self._stop_event.is_set():
-                            raise InterruptedError("User stopped")
-                        _orig_sleep(min(0.2, end - time.time()))
-                time.sleep = _interruptible_sleep
-
+                pk = ETSWordPK(port=port, debug_mode=debug,
+                               stop_event=self._stop_event)
                 try:
                     pk.run(max_q=max_val)
                 except InterruptedError:
@@ -327,8 +325,6 @@ class ETSApp(ctk.CTk):
                     print("\n连接断开: %s" % e)
                 except Exception as e:
                     print("\n错误: %s" % e)
-                finally:
-                    time.sleep = _orig_sleep
 
         except ImportError as e:
             print("[错误] 导入失败: %s" % e)

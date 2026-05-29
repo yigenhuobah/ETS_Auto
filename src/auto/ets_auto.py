@@ -12,12 +12,13 @@ Usage:
 """
 import json, os, time, sys, threading
 from urllib.parse import urlparse, parse_qs
+from urllib.error import URLError
 from ets_common import ETSBase
 
 
 class ETSAutoAnswer(ETSBase):
-    def __init__(self, port=10086, debug_mode=False):
-        super().__init__(port=port, debug_mode=debug_mode)
+    def __init__(self, port=10086, debug_mode=False, stop_event=None):
+        super().__init__(port=port, debug_mode=debug_mode, stop_event=stop_event)
         self.ets_base = None
         self.answers = {}
         self.set_id = None
@@ -429,7 +430,7 @@ class ETSAutoAnswer(ETSBase):
                 if self.eval_js(js_check):
                     selected = True
                     break
-                time.sleep(0.15)
+                self.interruptible_sleep(0.15)
 
             if selected:
                 js_collect = r'''(function(){
@@ -721,7 +722,7 @@ class ETSAutoAnswer(ETSBase):
             state = self.get_page_state()
             if state.get('choices') or state.get('inputs'):
                 return True, True
-            time.sleep(0.3)
+            self.interruptible_sleep(0.3)
         return False, False
 
     def _all_sidebar_correct(self):
@@ -755,7 +756,7 @@ class ETSAutoAnswer(ETSBase):
         """Wait for Next button to become available after it was disabled/not found.
         Returns True if Next succeeded, False if exam appears complete."""
         for _ in range(max_wait_loops):
-            time.sleep(wait_sec)
+            self.interruptible_sleep(wait_sec)
             if self._recording_window_closed:
                 return False
             # Early exit: if all sidebar items are correct, exam is complete
@@ -764,7 +765,7 @@ class ETSAutoAnswer(ETSBase):
                 return False
             nr2 = self.click_next()
             if nr2.get('success'):
-                time.sleep(0.6)
+                self.interruptible_sleep(0.6)
                 return True
             if nr2.get('reason') in ('not found', 'next_icon hidden'):
                 # Page may still be loading / answer not yet selected — keep waiting
@@ -796,16 +797,16 @@ class ETSAutoAnswer(ETSBase):
 
             ready, _ = self.wait_iframe_ready()
             self.inject_bridge()
-            time.sleep(0.3)
+            self.interruptible_sleep(0.3)
 
             if not ready:
                 self.debug("Step %d: iframe not ready, waiting..." % step)
                 nr = self.click_next()
                 if nr.get('success'):
-                    time.sleep(1)
+                    self.interruptible_sleep(1)
                 # Wait for iframe to stabilize
                 for _wait_i in range(15):
-                    time.sleep(2)
+                    self.interruptible_sleep(2)
                     ready2, _ = self.wait_iframe_ready(timeout=5)
                     if ready2:
                         break
@@ -830,7 +831,7 @@ class ETSAutoAnswer(ETSBase):
                         break
                     nr = self.click_next()
                     if nr.get('success'):
-                        time.sleep(0.6)
+                        self.interruptible_sleep(0.6)
                         continue
                     elif nr.get('reason') in ('disabled', 'next_icon hidden'):
                         # Button temporarily disabled / hidden — check sidebar then wait
@@ -856,7 +857,7 @@ class ETSAutoAnswer(ETSBase):
                     consecutive_empty += 1
                     nr = self.click_next()
                     if nr.get('success'):
-                        time.sleep(0.6)
+                        self.interruptible_sleep(0.6)
                         continue
                     elif nr.get('reason') in ('disabled', 'next_icon hidden'):
                         # Audio may still be playing / answer not yet selected — wait
@@ -878,7 +879,7 @@ class ETSAutoAnswer(ETSBase):
                 if has_fills and not any_new:
                     nr = self.click_next()
                     if nr.get('success'):
-                        time.sleep(0.6)
+                        self.interruptible_sleep(0.6)
                         continue
                     elif nr.get('reason') == 'disabled':
                         # Button disabled during fill section (ETS replays audio)
@@ -900,13 +901,13 @@ class ETSAutoAnswer(ETSBase):
                 if consecutive_empty >= 5:
                     print("Too many empty pages, stopping.")
                     break
-                time.sleep(2)
+                self.interruptible_sleep(2)
                 continue
 
-            time.sleep(0.3)
+            self.interruptible_sleep(0.3)
             nr = self.click_next()
             if nr.get('success'):
-                time.sleep(0.6)
+                self.interruptible_sleep(0.6)
             elif nr.get('reason') in ('disabled', 'next_icon hidden'):
                 # Don't immediately break — audio may still be playing / answer pending
                 self.debug("  Next disabled/hidden after answering, waiting...")
@@ -971,10 +972,18 @@ class ETSAutoAnswer(ETSBase):
     def run(self, max_steps=999):
         """Run auto-answer loop. Stops when exam is done or recording window is closed.
         max_steps is a safety limit only — you should never need to set it."""
-        print("\nETS Auto")
+        print("ETS Auto")
         print("=" * 40)
 
-        self.connect()
+        try:
+            self.connect()
+        except urllib.error.URLError as e:
+            print("\n连接失败: %s" % e)
+            print("请检查: 1) e听说PC端已启动  2) 调试端口 %d 正确" % self.port)
+            return
+        except Exception as e:
+            print("\n连接失败: %s" % e)
+            return
 
         if 'Result' in self.tab.get('url', ''):
             print("Already on a result page — open a mock exam to auto-answer")

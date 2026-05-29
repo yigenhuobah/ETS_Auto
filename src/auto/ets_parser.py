@@ -3,7 +3,7 @@
 ETS Parser — Offline exam paper browser for ETS cached data.
 
 Scans %APPDATA%\\ETS for locally cached exam papers and displays
-them in a CustomTkinter GUI with answers highlighted in red.
+them in a CustomTkinter GUI with answers highlighted.
 
 Supports question types:
   - collector.choose   → Multiple choice (A/B/C)
@@ -45,13 +45,21 @@ if sys.platform == 'win32':
 # ── ETS data directory ──────────────────────────────────────
 ETS_DATA_DIR = os.path.join(os.environ.get('APPDATA', ''), 'ETS')
 
-# ── Type labels (Chinese) ───────────────────────────────────
+# ── Type labels & short labels ──────────────────────────────
 TYPE_LABELS = {
-    'collector.choose':  '📝 选择题',
-    'collector.fill':    '✏️ 填空题',
-    'collector.role':    '🗣️ 口语问答',
-    'collector.picture': '🖼️ 图片描述',
-    'collector.read':    '📖 朗读',
+    'collector.choose':  '选择题',
+    'collector.fill':    '填空题',
+    'collector.role':    '口语问答',
+    'collector.picture': '图片描述',
+    'collector.read':    '朗读',
+}
+
+TYPE_ICONS = {
+    'collector.choose':  '📝',
+    'collector.fill':    '✏️',
+    'collector.role':    '🗣️',
+    'collector.picture': '🖼️',
+    'collector.read':    '📖',
 }
 
 
@@ -68,53 +76,34 @@ def _read_json(path):
             return json.loads(raw.decode(enc))
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
-    # Last resort: replace errors
     return json.loads(raw.decode('utf-8', errors='replace'))
 
 
 def _html_to_text(html_str):
-    """Convert HTML markup from ETS content to plain text.
-
-    Handles: <br>, </br>, <p>, </p>, <span class="italic">, <i>, <b>,
-    HTML entities (&rsquo; &lsquo; etc.)
-    """
+    """Convert HTML markup from ETS content to plain text."""
     if not html_str:
         return ''
     text = html_str
-    # <br> and </br> → newline
     text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
-    # <p> → newline
     text = re.sub(r'<p\s*/?>', '\n', text, flags=re.IGNORECASE)
-    # </p> → nothing (already have newline from <p>)
     text = re.sub(r'</p>', '', text, flags=re.IGNORECASE)
-    # Remove remaining tags
     text = re.sub(r'<[^>]+>', '', text)
-    # HTML entities (&rsquo; &lsquo; &hellip; etc.)
     text = html.unescape(text)
-    # Collapse multiple blank lines
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 
 def _strip_template_prefix(text):
-    """Remove ETS template variable prefixes like 'ets_th1', 'ets_sm1' from text.
-
-    ETS content.json sometimes includes these as inline prefixes in question text,
-    e.g. 'ets_th1 Where did the woman see Sam?' → 'Where did the woman see Sam?'
-    """
+    """Remove ETS template variable prefixes like 'ets_th1', 'ets_sm1'."""
     if not text:
         return text
-    # Match ets_xxN at start of text followed by space or as standalone
     return re.sub(r'^ets_\w+\d*\s*', '', text).strip()
 
 
 # ═══════════════════════════════════════════════════════════
 
 def scan_sets():
-    """Scan ETS data directory and return list of exam set dicts.
-
-    Each dict: {id, path, sections, total_questions, types}
-    """
+    """Scan ETS data directory and return list of exam set dicts."""
     if not os.path.isdir(ETS_DATA_DIR):
         return []
 
@@ -171,18 +160,19 @@ def render_section(section_data):
     """Render a content section into rich text for display.
 
     Returns a list of (text, tag) tuples where tag is '' for normal
-    or 'answer'/'header'/'muted' for styled text.
+    or 'answer'/'header'/'muted'/'q_num'/'option'/'section_title' for styled text.
     """
     data = section_data.get('data', {})
     stype = data.get('structure_type', '')
     info = data.get('info', {})
     parts = []
 
-    # ── Section type label ───────────────────────────────
+    # Section type header
+    icon = TYPE_ICONS.get(stype, '📋')
     label = TYPE_LABELS.get(stype, stype)
-    parts.append(("━━ %s ━━\n\n" % label, 'header'))
+    parts.append(("%s %s\n\n" % (icon, label), 'section_title'))
 
-    # ── Choose (multiple choice) ────────────────────────
+    # ── Choose ──────────────────────────────────────────
     if stype == 'collector.choose':
         for xt in info.get('xtlist', []):
             q_num = xt.get('xt_xh', '')
@@ -191,70 +181,79 @@ def render_section(section_data):
             q_value = _html_to_text(xt.get('xt_value', ''))
             answer = xt.get('answer', '')
 
-            parts.append(("【题%s】%s\n" % (q_num, q_text), ''))
+            parts.append(("题 %s" % q_num, 'q_num'))
+            parts.append(("  %s\n" % q_text, ''))
 
             if q_value:
-                parts.append(("听力原文：\n%s\n\n" % q_value, 'muted'))
+                parts.append(("  听力原文：\n", 'muted'))
+                for line in q_value.split('\n'):
+                    parts.append(("    %s\n" % line, 'muted'))
+                parts.append(("\n", ''))
 
-            # Options
             for xx in xt.get('xxlist', []):
                 opt = xx.get('xx_mc', '')
                 opt_text = _html_to_text(xx.get('xx_nr', ''))
                 is_correct = (opt == answer)
-                tag = 'answer' if is_correct else ''
-                prefix = "✅ " if is_correct else "   "
-                parts.append(("%s%s. %s\n" % (prefix, opt, opt_text), tag))
+                if is_correct:
+                    parts.append(("  ✓ %s. " % opt, 'answer'))
+                    parts.append(("%s\n" % opt_text, 'answer'))
+                else:
+                    parts.append(("    %s. %s\n" % (opt, opt_text), 'option'))
 
-            if answer:
-                parts.append(("\n正确答案：%s\n" % answer, 'answer'))
             parts.append(("\n", ''))
 
-    # ── Fill (fill-in-the-blank) ────────────────────────
+    # ── Fill ────────────────────────────────────────────
     elif stype == 'collector.fill':
         passage = _html_to_text(info.get('value', ''))
         if passage:
-            parts.append(("短文/对话：\n%s\n\n" % passage, ''))
+            parts.append(("短文/对话：\n", 'muted'))
+            for line in passage.split('\n'):
+                parts.append(("  %s\n" % line, ''))
+            parts.append(("\n", ''))
 
         for std in info.get('std', []):
             q_num = std.get('th', '')
             answer = std.get('value', '')
             ai = std.get('ai', '')
-            parts.append(("【第%s空】" % q_num, ''))
+            parts.append(("第%s空 → " % q_num, 'q_num'))
             parts.append(("%s\n" % answer, 'answer'))
             if ai and ai != answer:
                 parts.append(("  (AI识别: %s)\n" % ai, 'muted'))
 
         parts.append(("\n", ''))
 
-    # ── Role (oral Q&A) ─────────────────────────────────
+    # ── Role ────────────────────────────────────────────
     elif stype == 'collector.role':
         passage = _html_to_text(info.get('value', ''))
         if passage:
-            parts.append(("对话/材料：\n%s\n\n" % passage, ''))
+            parts.append(("对话/材料：\n", 'muted'))
+            for line in passage.split('\n'):
+                parts.append(("  %s\n" % line, ''))
+            parts.append(("\n", ''))
 
         for qi, q in enumerate(info.get('question', []), 1):
             ask_raw = _html_to_text(q.get('ask', ''))
             ask = _strip_template_prefix(ask_raw)
             keywords = q.get('keywords', '')
-            parts.append(("【问%s】%s\n" % (qi, ask), ''))
+            parts.append(("问 %d" % qi, 'q_num'))
+            parts.append(("  %s\n" % ask, ''))
             if keywords:
-                parts.append(("关键词：%s\n" % keywords, 'muted'))
+                parts.append(("  关键词：%s\n" % keywords, 'muted'))
 
-            # Show first few acceptable answers
             stds = q.get('std', [])
             if stds:
-                parts.append(("可接受答案：\n", ''))
+                parts.append(("  可接受答案：\n", ''))
                 shown = set()
                 for s in stds[:8]:
                     val = s.get('value', '')
                     if val not in shown:
                         shown.add(val)
-                        parts.append(("  • %s\n" % val, 'answer'))
+                        parts.append(("    • %s\n" % val, 'answer'))
                 if len(stds) > 8:
-                    parts.append(("  ... 共%d个变体\n" % len(stds), 'muted'))
+                    parts.append(("    ... 共%d个变体\n" % len(stds), 'muted'))
             parts.append(("\n", ''))
 
-    # ── Picture (picture description) ───────────────────
+    # ── Picture ─────────────────────────────────────────
     elif stype == 'collector.picture':
         topic = info.get('topic', '')
         if topic:
@@ -262,26 +261,34 @@ def render_section(section_data):
 
         passage = _html_to_text(info.get('value', ''))
         if passage:
-            parts.append(("原文：\n%s\n\n" % passage, ''))
+            parts.append(("原文：\n", 'muted'))
+            for line in passage.split('\n'):
+                parts.append(("  %s\n" % line, ''))
+            parts.append(("\n", ''))
 
         keypoint = _html_to_text(info.get('keypoint', ''))
         if keypoint:
-            parts.append(("要点：\n%s\n\n" % keypoint, ''))
+            parts.append(("要点：\n", 'muted'))
+            for line in keypoint.split('\n'):
+                parts.append(("  %s\n" % line, ''))
+            parts.append(("\n", ''))
 
         for i, std in enumerate(info.get('std', []), 1):
             answer = std.get('value', '')
-            parts.append(("【参考答案%d】\n%s\n\n" % (i, answer), 'answer'))
+            parts.append(("参考答案 %d\n" % i, 'q_num'))
+            parts.append(("  %s\n\n" % answer, 'answer'))
 
-    # ── Read (read aloud) ───────────────────────────────
+    # ── Read ────────────────────────────────────────────
     elif stype == 'collector.read':
         passage = _html_to_text(info.get('value', ''))
         if passage:
-            parts.append(("朗读文本：\n%s\n" % passage, ''))
+            parts.append(("朗读文本：\n", 'muted'))
+            for line in passage.split('\n'):
+                parts.append(("  %s\n" % line, ''))
 
-    # ── Unknown type fallback ───────────────────────────
+    # ── Unknown fallback ────────────────────────────────
     else:
         parts.append(("(未识别题型: %s)\n" % stype, 'muted'))
-        # Dump raw for debugging
         raw = json.dumps(info, ensure_ascii=False, indent=2)
         if len(raw) > 2000:
             raw = raw[:2000] + '\n...(truncated)'
@@ -297,79 +304,131 @@ def render_section(section_data):
 def create_browser_tab(tab_frame):
     """Build the offline paper browser UI inside a CTkTabview tab.
 
-    This is called from ets_gui.py to add the browser tab.
+    Layout:
+      Left panel  (260px): set list with real-time search
+      Right panel (flex):  header + section dropdown + content + nav
     """
     # ── State ────────────────────────────────────────────
-    _sets = []
-    _current_set = [None]  # mutable list for closure
+    _current_set = [None]
+    _selected_card = [None]  # track highlighted card frame
 
-    # ── Layout: left panel (set list) + right panel (content) ──
+    # ── Color palette (works for both light & dark) ─────
+    _CARD_FG = ('#f0f0f0', '#2b2b2b')
+    _CARD_HOVER = ('#dce6f0', '#354050')
+    _CARD_ACTIVE_FG = ('#cde0f0', '#2a4a6a')
+    _CARD_ACTIVE_TEXT = ('#1a5276', '#7ec8e3')
+    _CARD_TEXT = ('#333333', '#eeeeee')
+    _CARD_SUBTEXT = ('#666666', '#aaaaaa')
+
+    # ── Main grid ───────────────────────────────────────
     tab_frame.grid_columnconfigure(1, weight=1)
     tab_frame.grid_rowconfigure(0, weight=1)
 
-    # Left panel
-    left = ctk.CTkFrame(tab_frame, width=220)
+    # ── Left panel ──────────────────────────────────────
+    left = ctk.CTkFrame(tab_frame, width=260, corner_radius=8)
     left.grid(row=0, column=0, sticky='ns', padx=(8, 4), pady=8)
     left.grid_propagate(False)
 
-    ctk.CTkLabel(left, text="📚 试卷列表", font=ctk.CTkFont(size=14, weight='bold')).pack(
-        pady=(8, 4))
+    # Left header
+    ctk.CTkLabel(
+        left, text="📚 试卷列表",
+        font=ctk.CTkFont(size=15, weight='bold')
+    ).pack(pady=(10, 6), padx=12, anchor='w')
 
-    # Search entry
+    # Search with real-time filter
     search_var = ctk.StringVar(value='')
-    search_entry = ctk.CTkEntry(left, placeholder_text="搜索ID...", textvariable=search_var, width=200)
-    search_entry.pack(padx=8, pady=(0, 4))
+    search_entry = ctk.CTkEntry(
+        left, placeholder_text="输入ID搜索...",
+        textvariable=search_var, width=236, height=32,
+        corner_radius=6)
+    search_entry.pack(padx=12, pady=(0, 6))
 
-    # Set list (scrollable)
-    set_list = ctk.CTkScrollableFrame(left, width=200, label_text='')
-    set_list.pack(fill='both', expand=True, padx=8, pady=(0, 8))
+    # Scrollable set list
+    set_list = ctk.CTkScrollableFrame(left, width=236, label_text='')
+    set_list.pack(fill='both', expand=True, padx=12, pady=(0, 10))
 
-    # Right panel
-    right = ctk.CTkFrame(tab_frame)
+    # ── Right panel ─────────────────────────────────────
+    right = ctk.CTkFrame(tab_frame, corner_radius=8)
     right.grid(row=0, column=1, sticky='nsew', padx=(4, 8), pady=8)
     right.grid_columnconfigure(0, weight=1)
     right.grid_rowconfigure(1, weight=1)
 
-    # Header
-    header_frame = ctk.CTkFrame(right, fg_color='transparent')
-    header_frame.grid(row=0, column=0, sticky='ew', padx=4, pady=(4, 0))
+    # Header bar: title + section dropdown
+    header_bar = ctk.CTkFrame(right, fg_color='transparent', height=40)
+    header_bar.grid(row=0, column=0, sticky='ew', padx=12, pady=(10, 0))
+    header_bar.grid_columnconfigure(1, weight=1)
 
     set_title_label = ctk.CTkLabel(
-        header_frame, text="← 选择一份试卷",
+        header_bar, text="← 选择一份试卷",
         font=ctk.CTkFont(size=15, weight='bold'), anchor='w')
-    set_title_label.pack(fill='x')
-
-    # Content display
-    content_box = ctk.CTkTextbox(
-        right, wrap='word', state='disabled',
-        font=ctk.CTkFont(family='Consolas', size=13),
-        activate_scrollbars=True)
-    content_box.grid(row=1, column=0, sticky='nsew', padx=4, pady=4)
-
-    # Configure tags for rich text (access internal tkinter Text widget)
-    content_box._textbox.tag_configure(
-        'answer', foreground='#e74c3c',
-        font=ctk.CTkFont(family='Consolas', size=13, weight='bold'))
-    content_box._textbox.tag_configure(
-        'header', foreground='#3498db',
-        font=ctk.CTkFont(family='Consolas', size=14, weight='bold'))
-    content_box._textbox.tag_configure(
-        'muted', foreground='#7f8c8d')
-
-    # ── Section navigation ───────────────────────────────
-    nav_frame = ctk.CTkFrame(right, fg_color='transparent')
-    nav_frame.grid(row=2, column=0, sticky='ew', padx=4, pady=(0, 4))
+    set_title_label.grid(row=0, column=0, sticky='w')
 
     section_var = ctk.StringVar(value='')
-    prev_btn = ctk.CTkButton(nav_frame, text="◀ 上一节", width=100, state='disabled')
-    prev_btn.pack(side='left', padx=(0, 4))
-    next_btn = ctk.CTkButton(nav_frame, text="下一节 ▶", width=100, state='disabled')
-    next_btn.pack(side='left')
-    section_label = ctk.CTkLabel(nav_frame, textvariable=section_var, font=ctk.CTkFont(size=12))
+    section_menu = ctk.CTkOptionMenu(
+        header_bar, variable=section_var,
+        values=[], width=200, height=30,
+        font=ctk.CTkFont(size=12),
+        command=lambda v: None)  # placeholder
+    section_menu.grid(row=0, column=1, sticky='e', padx=(8, 0))
+
+    # Content area
+    content_box = ctk.CTkTextbox(
+        right, wrap='word', state='disabled',
+        font=ctk.CTkFont(family='Microsoft YaHei UI', size=13),
+        activate_scrollbars=True,
+        corner_radius=6)
+    content_box.grid(row=1, column=0, sticky='nsew', padx=12, pady=8)
+
+    # Configure text tags via internal tkinter Text widget
+    _t = content_box._textbox
+    _t.configure(spacing1=2, spacing3=4, padx=8, pady=4)
+
+    _t.tag_configure(
+        'answer', foreground='#2ecc71',
+        font=ctk.CTkFont(family='Microsoft YaHei UI', size=13, weight='bold'),
+        lmargin1=20, lmargin2=20)
+    _t.tag_configure(
+        'section_title', foreground='#3498db',
+        font=ctk.CTkFont(family='Microsoft YaHei UI', size=15, weight='bold'),
+        spacing1=8, spacing3=4)
+    _t.tag_configure(
+        'q_num', foreground='#e67e22',
+        font=ctk.CTkFont(family='Microsoft YaHei UI', size=13, weight='bold'),
+        lmargin1=8)
+    _t.tag_configure(
+        'header', foreground='#3498db',
+        font=ctk.CTkFont(family='Microsoft YaHei UI', size=14, weight='bold'))
+    _t.tag_configure(
+        'muted', foreground='#7f8c8d',
+        font=ctk.CTkFont(family='Microsoft YaHei UI', size=12),
+        lmargin1=20, lmargin2=20)
+    _t.tag_configure(
+        'option', foreground='#95a5a6',
+        font=ctk.CTkFont(family='Microsoft YaHei UI', size=13),
+        lmargin1=30, lmargin2=30)
+
+    # ── Bottom navigation ───────────────────────────────
+    nav_frame = ctk.CTkFrame(right, fg_color='transparent', height=36)
+    nav_frame.grid(row=2, column=0, sticky='ew', padx=12, pady=(0, 10))
+
+    prev_btn = ctk.CTkButton(
+        nav_frame, text="◀ 上一节", width=110, height=32,
+        state='disabled', corner_radius=6)
+    prev_btn.pack(side='left', padx=(0, 6))
+
+    section_label = ctk.CTkLabel(
+        nav_frame, textvariable=section_var,
+        font=ctk.CTkFont(size=12), anchor='center')
     section_label.pack(side='left', padx=12)
 
-    _section_idx = [0]  # mutable for closure
+    next_btn = ctk.CTkButton(
+        nav_frame, text="下一节 ▶", width=110, height=32,
+        state='disabled', corner_radius=6)
+    next_btn.pack(side='left')
 
+    _section_idx = [0]
+
+    # ── Section display logic ───────────────────────────
     def _show_section(idx):
         if not _current_set[0] or idx < 0 or idx >= len(_current_set[0]['sections']):
             return
@@ -378,19 +437,22 @@ def create_browser_tab(tab_frame):
         parts = render_section(sec)
 
         content_box.configure(state='normal')
-        content_box._textbox.delete('1.0', 'end')
+        _t.delete('1.0', 'end')
         for text, tag in parts:
             if tag:
-                content_box._textbox.insert('end', text, tag)
+                _t.insert('end', text, tag)
             else:
-                content_box._textbox.insert('end', text)
+                _t.insert('end', text)
         content_box.configure(state='disabled')
-        content_box._textbox.see('1.0')
+        _t.see('1.0')
 
         total = len(_current_set[0]['sections'])
-        section_var.set("第 %d/%d 节" % (idx + 1, total))
+        section_var.set("%d / %d" % (idx + 1, total))
         prev_btn.configure(state='normal' if idx > 0 else 'disabled')
         next_btn.configure(state='normal' if idx < total - 1 else 'disabled')
+        # Sync dropdown
+        section_menu.set(TYPE_ICONS.get(sec['type'], '📋') + ' ' +
+                         TYPE_LABELS.get(sec['type'], sec['type']))
 
     def _on_prev():
         _show_section(_section_idx[0] - 1)
@@ -401,55 +463,134 @@ def create_browser_tab(tab_frame):
     prev_btn.configure(command=_on_prev)
     next_btn.configure(command=_on_next)
 
-    # ── Set card click ───────────────────────────────────
-    def _on_set_click(set_data):
+    # ── Section dropdown handler ────────────────────────
+    def _on_section_menu_select(value):
+        if not _current_set[0]:
+            return
+        sections = _current_set[0]['sections']
+        for i, sec in enumerate(sections):
+            menu_text = TYPE_ICONS.get(sec['type'], '📋') + ' ' + TYPE_LABELS.get(sec['type'], sec['type'])
+            if menu_text == value:
+                _show_section(i)
+                break
+
+    section_menu.configure(command=_on_section_menu_select)
+
+    # ── Card click & highlight helpers ──────────────────
+    def _highlight_card(card_frame, id_label, sub_label):
+        """Apply active highlight to a card."""
+        card_frame.configure(fg_color=_CARD_ACTIVE_FG)
+        id_label.configure(text_color=_CARD_ACTIVE_TEXT)
+        sub_label.configure(text_color=_CARD_ACTIVE_TEXT)
+
+    def _unhighlight_card(card_frame, id_label, sub_label):
+        """Remove active highlight from a card."""
+        card_frame.configure(fg_color=_CARD_FG)
+        id_label.configure(text_color=_CARD_TEXT)
+        sub_label.configure(text_color=_CARD_SUBTEXT)
+
+    def _on_set_click(set_data, card_frame, id_label, sub_label):
+        # Reset previous card highlight
+        if _selected_card[0] and _selected_card[0] != card_frame:
+            prev = _selected_card[0]
+            _unhighlight_card(
+                prev, prev._id_label, prev._sub_label)
+
+        # Highlight current card
+        _highlight_card(card_frame, id_label, sub_label)
+        _selected_card[0] = card_frame
+
         _current_set[0] = set_data
-        types_str = '  '.join(TYPE_LABELS.get(t, t) for t in sorted(set_data['types']))
-        set_title_label.configure(text="试卷 %s  (%d题)  %s" % (
-            set_data['id'], set_data['total_questions'], types_str))
+        types_str = ' · '.join(TYPE_LABELS.get(t, t) for t in sorted(set_data['types']))
+        set_title_label.configure(
+            text="📄 %s  ·  %d题  ·  %s" % (
+                set_data['id'], set_data['total_questions'], types_str))
+
+        # Populate section dropdown
+        sec_labels = []
+        for sec in set_data['sections']:
+            icon = TYPE_ICONS.get(sec['type'], '📋')
+            lbl = TYPE_LABELS.get(sec['type'], sec['type'])
+            sec_labels.append("%s %s" % (icon, lbl))
+        section_menu.configure(values=sec_labels)
+
         _show_section(0)
 
-    # ── Render set list ──────────────────────────────────
+    # ── Render set list ─────────────────────────────────
     def _render_sets(filter_text=''):
-        # Clear existing cards
         for w in set_list.winfo_children():
             w.destroy()
+
+        _selected_card[0] = None
 
         for s in _sets:
             if filter_text and filter_text not in s['id']:
                 continue
 
-            # Build concise type labels
-            type_parts = []
-            for t in sorted(s['types']):
-                lbl = TYPE_LABELS.get(t, t)
-                # Extract emoji + first 2 chars
-                type_parts.append(lbl)
-            types_str = '  '.join(type_parts)
+            # Card container frame (replaces CTkButton for better layout)
+            card = ctk.CTkFrame(
+                set_list, fg_color=_CARD_FG,
+                corner_radius=6, height=50,
+                cursor='hand2')
+            card.pack(fill='x', pady=2, padx=2)
+            card.pack_propagate(False)
 
-            card_text = "📄 %s  (%d题)\n   %s" % (s['id'], s['total_questions'], types_str)
+            # Card line 1: ID
+            id_label = ctk.CTkLabel(
+                card, text="📄 %s" % s['id'],
+                font=ctk.CTkFont(size=13, weight='bold'),
+                text_color=_CARD_TEXT, anchor='w')
+            id_label.pack(fill='x', padx=(8, 8), pady=(6, 0))
 
-            btn = ctk.CTkButton(
-                set_list, text=card_text, anchor='w',
-                font=ctk.CTkFont(size=12),
-                fg_color='transparent', hover_color=('#d0d0d0', '#3a3a3a'),
-                text_color=('#333333', '#eeeeee'),
-                command=lambda sd=s: _on_set_click(sd))
-            btn.pack(fill='x', pady=2)
+            # Card line 2: count + types
+            type_tags = '  '.join(TYPE_LABELS.get(t, t) for t in sorted(s['types']))
+            sub_label = ctk.CTkLabel(
+                card, text="%d题 · %s" % (s['total_questions'], type_tags),
+                font=ctk.CTkFont(size=11),
+                text_color=_CARD_SUBTEXT, anchor='w')
+            sub_label.pack(fill='x', padx=(8, 8), pady=(0, 4))
 
-    # ── Search ───────────────────────────────────────────
-    def _on_search(_=None):
+            # Store label refs on card frame for highlight access
+            card._id_label = id_label
+            card._sub_label = sub_label
+
+            # Hover effects
+            def _on_enter(event, cf=card, il=id_label, sl=sub_label):
+                if _selected_card[0] != cf:
+                    cf.configure(fg_color=_CARD_HOVER)
+
+            def _on_leave(event, cf=card, il=id_label, sl=sub_label):
+                if _selected_card[0] != cf:
+                    cf.configure(fg_color=_CARD_FG)
+
+            card.bind('<Enter>', _on_enter)
+            card.bind('<Leave>', _on_leave)
+            id_label.bind('<Enter>', _on_enter)
+            id_label.bind('<Leave>', _on_leave)
+            sub_label.bind('<Enter>', _on_enter)
+            sub_label.bind('<Leave>', _on_leave)
+
+            # Click handlers (on card + labels so clicking text also works)
+            def _on_click(event, sd=s, cf=card, il=id_label, sl=sub_label):
+                _on_set_click(sd, cf, il, sl)
+
+            card.bind('<Button-1>', _on_click)
+            id_label.bind('<Button-1>', _on_click)
+            sub_label.bind('<Button-1>', _on_click)
+
+    # ── Real-time search ────────────────────────────────
+    def _on_search_change(*_):
         _render_sets(search_var.get().strip())
 
-    search_entry.bind('<Return>', _on_search)
+    search_var.trace_add('write', _on_search_change)
 
-    # ── Load data ────────────────────────────────────────
+    # ── Load data ───────────────────────────────────────
     _sets = scan_sets()
     _render_sets()
 
     if not _sets:
         content_box.configure(state='normal')
-        content_box._textbox.insert('1.0',
+        _t.insert('1.0',
             "未找到 ETS 缓存数据。\n\n"
             "请确认路径：%s\n\n"
             "需要先在 ETS 客户端中开始一次作业，\n"
@@ -473,8 +614,8 @@ def main():
 
     root = ctk.CTk()
     root.title("ETS 离线试卷浏览器")
-    root.geometry("900x600")
-    root.minsize(700, 450)
+    root.geometry("960x640")
+    root.minsize(720, 480)
 
     create_browser_tab(root)
     root.mainloop()

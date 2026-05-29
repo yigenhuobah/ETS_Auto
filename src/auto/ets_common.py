@@ -8,7 +8,7 @@ Provides ETSBase class with:
   - Debug logging helper
   - JS string escaping utility
 """
-import json, time, urllib.request, websocket, os
+import json, time, urllib.request, websocket, os, threading
 
 
 class ETSBase:
@@ -18,12 +18,14 @@ class ETSBase:
     and provides common utilities shared by exam and PK scripts.
     """
 
-    def __init__(self, port=10086, debug_mode=False):
+    def __init__(self, port=10086, debug_mode=False, stop_event=None):
         self.port = port
         self.ws = None
         self.mid = 0
         self.debug_mode = debug_mode
         self.tab = None
+        # Optional threading.Event: when set, interruptible_sleep raises InterruptedError
+        self.stop_event = stop_event
 
     def debug(self, msg):
         """Print debug message if debug_mode is enabled."""
@@ -119,6 +121,27 @@ class ETSBase:
                     self.debug("[JS EXCEPTION] " + exc_text)
                     return None
                 return result_obj.get("value")
+
+    def interruptible_sleep(self, seconds):
+        """Sleep that can be interrupted by stop_event.
+
+        If stop_event is set during the sleep, raises InterruptedError.
+        If no stop_event was provided, falls back to normal time.sleep().
+        """
+        if self.stop_event is None:
+            time.sleep(seconds)
+            return
+        if self.stop_event.is_set():
+            raise InterruptedError("User stopped")
+        # Sleep in small chunks, checking stop_event between each
+        end = time.time() + seconds
+        while time.time() < end:
+            if self.stop_event.is_set():
+                raise InterruptedError("User stopped")
+            remaining = end - time.time()
+            self.stop_event.wait(timeout=min(0.2, remaining))
+            if self.stop_event.is_set():
+                raise InterruptedError("User stopped")
 
     @staticmethod
     def js_escape(s):
