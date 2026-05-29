@@ -1,5 +1,25 @@
 ﻿# Changelog
 
+## [0.4.3] - 2026-05-30
+
+### Added
+- **collector.dialogue 题型支持** — ets_parser.py 新增对话问答题型渲染（材料 + 口语问答 + 可接受答案变体），图标 💬，标签"对话问答"
+
+### Fixed
+- **答案 HTML 残留** — std.value 字段统一经 `_html_to_text()` 处理，消除 role/dialogue/picture 三种题型答案中的 `</br>` 残留
+
+## [0.4.2] - 2026-05-29
+
+### Changed
+- **可中断 sleep** — `time.sleep()` 改为轮询式 `_interruptible_sleep()`，GUI 停止按钮可即时响应
+- **GUI 清理** — 移除冗余 import，精简日志输出格式
+
+## [0.4.1] - 2026-05-29
+
+### Added
+- **离线试卷浏览器** — `ets_parser.py`，扫描 %APPDATA%\ETS 本地缓存，渲染 choose/fill/role/picture/read 五种题型答案
+- **GUI Tab 2 集成** — 在 GUI 中新增"试卷浏览"标签页，下拉选套卷→显示题目与答案
+
 ## [0.4.0] - 2026-05-28
 
 ### Added
