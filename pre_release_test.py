@@ -120,7 +120,42 @@ def test_requirements():
     assert len(lines) >= 3, f"requirements.txt should have >=3 deps, got {len(lines)}"
 test("requirements.txt exists with >=3 deps", test_requirements)
 
-# ── 5. Syntax check all .py files ──────────────────────────
+# ── 5. GUI Widget Smoke Tests ─────────────────────────────
+print("\n=== GUI Widget Tests ===")
+
+def t_gui_widgets():
+    import customtkinter as ctk
+    root = ctk.CTk()
+    # CTkEntry does NOT support command=; only bind() works
+    entry = ctk.CTkEntry(root, placeholder_text="test")
+    entry.bind('<Return>', lambda e: None)  # This should work
+    # Verify configure() only accepts valid CTkEntry kwargs
+    try:
+        entry.configure(command=lambda: None)
+        root.destroy()
+        raise AssertionError("CTkEntry.configure(command=...) should raise ValueError")
+    except ValueError:
+        pass  # Expected - command is not a valid CTkEntry argument
+    root.destroy()
+test("CTkEntry widget creation + bind (no command=)", t_gui_widgets)
+
+def t_gui_parser_tab():
+    """Smoke test: create_browser_tab must not crash with minimal data."""
+    import customtkinter as ctk
+    from ets_parser import create_browser_tab
+    root = ctk.CTk()
+    tab = ctk.CTkFrame(root)
+    tab.pack()
+    try:
+        create_browser_tab(tab)
+    except Exception as e:
+        # If ETS data dir doesn't exist, that's fine - just no crash from widget code
+        if 'ETS' not in str(e) and 'AppData' not in str(e) and 'scan_sets' not in str(e):
+            raise
+    root.destroy()
+test("create_browser_tab() widget creation", t_gui_parser_tab)
+
+# ── 6. Syntax check all .py files ──────────────────────────
 print("\n=== Syntax Check ===")
 
 def t_syntax_all():

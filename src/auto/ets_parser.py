@@ -441,7 +441,7 @@ def create_browser_tab(tab_frame):
     def _on_search(_=None):
         _render_sets(search_var.get().strip())
 
-    search_entry.configure(command=_on_search)
+    search_entry.bind('<Return>', _on_search)
 
     # ── Load data ────────────────────────────────────────
     _sets = scan_sets()
