@@ -21,6 +21,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller
 
+      - name: Pre-release tests
+        run: python pre_release_test.py
+
       - name: Build GUI
         run: pyinstaller --onefile --noconsole --hidden-import=websocket --hidden-import=ets_common --hidden-import=customtkinter --name ets_gui src/auto/ets_gui.py
 
