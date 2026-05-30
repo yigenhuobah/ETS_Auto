@@ -337,8 +337,8 @@ class ETSAutoAnswer(ETSBase):
         choices.forEach(function(c){
             if (c.offsetHeight <= 0) return;  // skip hidden (Vue ghost DOM)
             var id = c.id || "";
-            var parts = id.split("_");
-            var qid = parts.slice(0, -1).join("_");
+            // Extract qid: strip trailing _N (option index like _1, _2, _3, _4)
+            var qid = id.replace(/_\d+$/, '');
             if (!groups[qid]) groups[qid] = {qid: qid, choices: [], anySelected: false, inReview: false};
             var sel = c.classList.contains("choose_selected") || c.classList.contains("on");
             var isWrong = c.classList.contains("choose_wrong");
@@ -656,6 +656,9 @@ class ETSAutoAnswer(ETSBase):
         closed = [False]
         def on_close():
             closed[0] = True
+            # Signal stop_event so worker thread exits cleanly
+            if self.stop_event:
+                self.stop_event.set()
             root.destroy()
 
         btn = tk.Button(bar, text='✅ 关闭并停止脚本', command=on_close,

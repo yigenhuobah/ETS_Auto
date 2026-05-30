@@ -231,16 +231,14 @@ class ETSWordPK(ETSBase):
     # ── Matching ────────────────────────────────────────────
 
     def get_stems(self, word):
-        """Try to strip suffixes to find base form in dictionary"""
+        """Try to strip suffixes to find base form in dictionary.
+        Order: stem first, then British→American conversion on each candidate.
+        This avoids 'organising' → 'organizing' → strip 'ing' → 'organiz' (wrong)
+        instead: 'organising' → strip 'ing' → 'organis' → Brit→US → 'organiz' → 'organize'."""
         w = word.lower().strip()
         candidates = [w]
-        
-        # British → American spelling conversion (longest suffix first!)
-        for brit, us in [('isation', 'ization'), ('ising', 'izing'), ('ogue', 'og'),
-                         ('ence', 'ense'), ('ise', 'ize'), ('yse', 'yze'),
-                         ('our', 'or'), ('re', 'er')]:
-            if w.endswith(brit) and len(w) > len(brit) + 1:
-                candidates.append(w[:-len(brit)] + us)
+
+        # ── Step 1: Suffix stripping (on original form) ──
         if w.endswith('ly') and len(w) > 4:
             candidates.append(w[:-2])           # mentally → mental
             if w[:-2].endswith('al'):            # musically → music → musical → music
@@ -267,6 +265,19 @@ class ETSWordPK(ETSBase):
             candidates.append(w[:-2])            # faster → fast
         if w.endswith('est') and len(w) > 5:
             candidates.append(w[:-3])            # fastest → fast
+
+        # ── Step 2: British → American conversion (applied to ALL candidates) ──
+        # After stemming, so 'organising' → stem → 'organis' → Brit→US → 'organize'
+        expanded = []
+        brit_us = [('isation', 'ization'), ('ising', 'izing'), ('ogue', 'og'),
+                   ('ence', 'ense'), ('ise', 'ize'), ('yse', 'yze'),
+                   ('our', 'or'), ('re', 'er')]
+        for c in candidates:
+            for brit, us in brit_us:
+                if c.endswith(brit) and len(c) > len(brit) + 1:
+                    expanded.append(c[:-len(brit)] + us)
+        candidates.extend(expanded)
+
         return list(set(c for c in candidates if c))
 
     def get_opt_trans(self, opt):
@@ -720,7 +731,7 @@ class ETSWordPK(ETSBase):
         answered = 0
         no_match = 0
         last_progress = ''
-        last_title = ''
+        last_question_hash = ''
         same_count = 0
         no_q_count = 0
 
@@ -741,13 +752,18 @@ class ETSWordPK(ETSBase):
                 options = [opt for opt in state.get('options', []) if opt]
                 progress = state.get('progress', '')
 
+                # Compound question hash: title + sorted options
+                # Prevents false "same question" detection when different questions share same title
+                import hashlib as _hl
+                question_hash = _hl.md5((title + '|' + '|'.join(sorted(options))).encode()).hexdigest()[:12]
+
                 if progress:
                     last_progress = progress
                 elif title == '' and not progress:
                     self.interruptible_sleep(0.3)
                     continue
 
-                if same_count != 0 and title == last_title and title != '':
+                if same_count != 0 and question_hash == last_question_hash and title != '':
                     # same_count > 0: counting repeats; same_count < 0: cooling down
                     same_count += 1
                     if same_count >= 5:
@@ -761,13 +777,13 @@ class ETSWordPK(ETSBase):
                         same_count += 1  # count towards zero
                         if same_count >= 0:
                             same_count = 0  # cooldown done, reset for re-check
-                            last_title = ''  # force re-evaluate next cycle
+                            last_question_hash = ''  # force re-evaluate next cycle
                         self.interruptible_sleep(0.4)
                     continue
 
                 # New or different question — reset tracker
                 same_count = 1
-                last_title = title
+                last_question_hash = question_hash
                 if not title or len(options) < 2:
                     self.interruptible_sleep(0.3)
                     continue

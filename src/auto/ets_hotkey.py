@@ -81,17 +81,20 @@ class ETSHotkey:
     @property
     def is_paused(self):
         """True when F9 has toggled pause on."""
-        return self._paused
+        with self._lock:
+            return self._paused
 
     @property
     def should_skip(self):
         """True when F10 has been pressed (one-shot)."""
-        return self._skip
+        with self._lock:
+            return self._skip
 
     @property
     def should_stop(self):
         """True when F12 has been pressed (emergency stop)."""
-        return self._stop
+        with self._lock:
+            return self._stop
 
     def clear_skip(self):
         """Acknowledge skip signal — reset to False."""
@@ -170,9 +173,21 @@ class ETSHotkey:
         """Background thread: message pump for WM_HOTKEY."""
         self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
 
+        # Cold-start: force-initialize message queue before RegisterHotKey
+        # Without this, the queue may not exist when PostThreadMessage arrives
+        peek_msg = ctypes.wintypes.MSG()
+        ctypes.windll.user32.PeekMessageW(ctypes.byref(peek_msg), 0, 0, 0, 0)
+
         # Wait for signal to register
         msg = ctypes.wintypes.MSG()
-        while GetMessage(ctypes.byref(msg), 0, 0, 0) != 0:
+        while True:
+            ret = GetMessage(ctypes.byref(msg), 0, 0, 0)
+            if ret == 0:
+                # WM_QUIT received
+                break
+            if ret == -1:
+                # GetLastError — fatal; break to avoid infinite loop
+                break
             if msg.message == 0x0401:
                 # Custom message: do register
                 self._do_register()

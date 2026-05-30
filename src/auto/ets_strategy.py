@@ -63,11 +63,15 @@ def _html_to_text(html_str):
         return ''
     import html
     text = html_str
-    text = re.sub(r'<br\s*/?>', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'<p\s*/?>', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'</p>', '', text, flags=re.IGNORECASE)
+    # Replace block-level break tags with space (not empty string)
+    # to prevent word gluing: "word1<br>word2" → "word1 word2", not "word1word2"
+    text = re.sub(r'<br\s*/?>', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'<p\s*/?>', ' ', text, flags=re.IGNORECASE)
+    text = re.sub(r'</p>', ' ', text, flags=re.IGNORECASE)
     text = re.sub(r'<[^>]+>', '', text)
     text = html.unescape(text)
+    # Collapse multiple spaces introduced by tag replacement
+    text = re.sub(r' +', ' ', text)
     return text.strip()
 
 
@@ -181,6 +185,8 @@ class ETSStrategy:
             return {'type': structure_type.split('.')[-1],
                      'answer': dom_answer, 'source': 'dom'}
 
+        # 4) Cold-start: no cache data loaded — return None gracefully
+        # Caller (ets_auto) should handle None by skipping strategy lookup
         return None
 
     def get_recording_answers(self, stype=None):
@@ -305,15 +311,24 @@ class ETSStrategy:
     # ── Text similarity (for fuzzy matching) ────────────────
 
     def _text_similarity(self, a, b):
-        """Simple character-level Jaccard similarity for short texts."""
+        """Word-level similarity using difflib.SequenceMatcher.
+
+        Uses word-level comparison (not character-level) to avoid
+        anagram blindspots where 'bad credit' == 'credit bad'.
+        Falls back to character-level for very short strings (<3 words)."""
         if not a or not b:
             return 0.0
-        a_chars = set(a.lower())
-        b_chars = set(b.lower())
-        union = a_chars | b_chars
-        if not union:
-            return 1.0
-        return len(a_chars & b_chars) / len(union)
+        import difflib
+        a_lower = a.lower().strip()
+        b_lower = b.lower().strip()
+        a_words = a_lower.split()
+        b_words = b_lower.split()
+        if len(a_words) >= 3 or len(b_words) >= 3:
+            # Word-level: preserves word order, resists anagram tricks
+            return difflib.SequenceMatcher(None, a_words, b_words).ratio()
+        else:
+            # Short strings: character-level SequenceMatcher (order-aware, not Jaccard)
+            return difflib.SequenceMatcher(None, a_lower, b_lower).ratio()
 
 
 # ── Standalone test ──────────────────────────────────────────

@@ -1,5 +1,14 @@
 ﻿# Changelog
 
+## [0.5.1] - 2026-05-31
+
+### Fixed
+- **ets_parser.py**: scan_sets() 读取 template res.json 获取分数和题型名称，按分数降序排列（大卷在前）；填空题题号优先读 xth 字段
+- **ets_strategy.py**: _html_to_text() 中 `<br>`/`<p>` 替换为空格而非空字符串，防止单词粘连；_text_similarity() 从字符级 Jaccard 改为词级 SequenceMatcher，抵抗字谜盲区
+- **ets_hotkey.py**: is_paused/should_skip/should_stop 属性加线程锁；消息泵启动前 PeekMessageW 强制初始化队列；GetMessage 返回 -1 时跳出循环
+- **ets_auto.py**: 选择题 qid 提取改用正则 `/_\d+$/` 替代 split，修复 ID 含多个下划线时的截断问题；关闭弹窗时设置 stop_event 通知工作线程退出
+- **ets_word_pk.py**: get_stems() 先做词干剥离再做英美拼写转换，避免 'organising'→'organizing'→'organiz' 错误路径；同题检测改用 title+options 的复合哈希，防止不同题目共享标题时误判
+
 ## [0.5.0] - 2026-05-30
 
 ### Added
