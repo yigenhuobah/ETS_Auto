@@ -38,6 +38,9 @@ if sys.platform == 'win32':
 
 import customtkinter as ctk
 
+# Version constant — bump on each release
+APP_VERSION = "0.5.2"
+
 
 # ── Queue-based stdout bridge ────────────────────────────────
 class QueueWriter:
@@ -103,8 +106,14 @@ class ETSApp(ctk.CTk):
         # Clean shutdown on window close
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Remote info state
+        self._remote_info = None
+
         self._build_ui()
         self._poll_log()
+
+        # Background remote check (non-blocking)
+        self._check_remote_async()
 
     # ── UI Construction ──────────────────────────────────────
     def _build_ui(self):
@@ -246,6 +255,61 @@ class ETSApp(ctk.CTk):
             daemon=True
         )
         self._worker.start()
+
+    # ── Remote Check ────────────────────────────────────
+    def _check_remote_async(self):
+        """Start background thread to check remote info.
+        Network failures are logged but never crash the GUI."""
+        def _worker():
+            try:
+                from ets_remote import ETSRemote, should_block_start, format_update_message
+                remote = ETSRemote(current_version=APP_VERSION)
+                info = remote.check()
+                self._remote_info = info
+                if info is not None:
+                    self.after(0, self._on_remote_checked, info)
+            except Exception as e:
+                # Log to terminal but don't crash GUI — remote check is non-critical
+                print("[Remote] Check failed: %s" % e)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_remote_checked(self, info):
+        """Handle remote check result on main thread."""
+        from ets_remote import should_block_start, format_update_message
+
+        # Check if app should be blocked
+        blocked, reason = should_block_start(info)
+        if blocked:
+            self._status_var.set("⛔ %s" % reason)
+            self._start_btn.configure(state="disabled")
+            self._append_log("[远程] ⛔ %s\n" % reason)
+            if info.download_url:
+                self._append_log("[远程] 下载地址：%s\n" % info.download_url)
+            return
+
+        # Show announcement / update info
+        msg = format_update_message(info)
+        if msg:
+            self._append_log("[远程] %s\n" % msg.replace('\n', '\n[远程] '))
+
+        # Auto-download pk_extra.json update if URL available
+        if info.pk_extra_url:
+            self._try_update_pk_extra(info.pk_extra_url)
+
+    def _try_update_pk_extra(self, url):
+        """Attempt silent pk_extra.json update in background."""
+        def _worker():
+            try:
+                from ets_remote import ETSRemote
+                remote = ETSRemote(current_version=APP_VERSION)
+                success, msg = remote.download_pk_extra()
+                if success:
+                    self.after(0, lambda: self._append_log("[远程] %s\n" % msg))
+            except Exception:
+                pass  # Silent update failure is non-critical
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_stop(self):
         if not self._running:

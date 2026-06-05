@@ -13,6 +13,9 @@ Usage:
 import json, os, time, sys, threading
 from urllib.parse import urlparse, parse_qs
 from urllib.error import URLError
+
+# Version constant — keep in sync with ets_gui.py APP_VERSION
+__version__ = "0.5.2"
 from ets_common import ETSBase
 from ets_strategy import ETSStrategy
 
@@ -30,6 +33,8 @@ class ETSAutoAnswer(ETSBase):
         self.total_questions = 0
         self.recording_answers = []   # list of dicts for picture/dialogue
         self.strategy = ETSStrategy()  # strategy layer for local answer lookup
+        self.rw_mode = False  # read-write (读写同步) mode flag
+        self.rw_show_data = None  # cached showData from iframe
         # Callback hooks (set via on_* methods or direct assignment)
         self._on_connect = None           # fn(ets_base, set_id, mode, total_questions)
         self._on_question_answered = None # fn(qid, answer, qtype) where qtype='choose'|'fill'
@@ -95,14 +100,22 @@ class ETSAutoAnswer(ETSBase):
             self.ets_base = os.path.join(os.path.expandvars(r'%APPDATA%'), 'ETS')
             self.debug("ets_base (default): " + self.ets_base)
 
+        # Detect read-write (读写同步) mode from URL hash
+        self._detect_rw_mode()
+
     def _get_url_set_id(self):
+        """Extract set_id from URL fragment query string.
+        Supports both snake_case 'set_id' and camelCase 'setId' (ETS uses both)."""
         try:
             parsed = urlparse(self.tab['url'])
             fragment = parsed.fragment
             if '?' in fragment:
                 qs = parse_qs(fragment.split('?', 1)[1])
-                return qs.get('set_id', [None])[0]
-        except:
+                # Try snake_case first, then camelCase
+                for key in ('set_id', 'setId'):
+                    if key in qs:
+                        return qs[key][0]
+        except Exception:
             pass
         return None
 
@@ -157,7 +170,9 @@ class ETSAutoAnswer(ETSBase):
         Guards against re-wrapping: checks __ets_hooked flag so repeated
         calls on the same iframe don't nest wrappers."""
         js = '''(function(){
-        var win = document.querySelector("iframe").contentWindow;
+        %s;
+        if (!iframe) return JSON.stringify({nativeChoose: false, nativeFill: false, error: "no iframe"});
+        var win = iframe.contentWindow;
         window.top.__ets_recorded = window.top.__ets_recorded || [];
         window.top.__ets_recorded_fill = window.top.__ets_recorded_fill || [];
         /* Idempotent guard: skip if already hooked on this iframe */
@@ -203,7 +218,7 @@ class ETSAutoAnswer(ETSBase):
             nativeChoose: hadNativeChoose,
             nativeFill: hadNativeFill
         });
-        })()'''
+        })()''' % self._IFRAME_FINDER
         result = self.eval_js(js)
         try:
             info = json.loads(result) if result else {}
@@ -213,6 +228,163 @@ class ETSAutoAnswer(ETSBase):
         except:
             self.debug("Bridge result: " + str(result))
             return {}
+
+    # ── RW iframe helper ────────────────────────────────────
+
+    # Shared JS snippet: find read-write iframe with fallback
+    _RW_IFRAME_FINDER = r'''
+    var iframe = document.querySelector("iframe[src*=read-write]");
+    if (!iframe) {
+        var iframes = document.querySelectorAll("iframe");
+        for (var _i = 0; _i < iframes.length; _i++) {
+            var _src = iframes[_i].getAttribute("src") || "";
+            if (_src && _src !== "about:blank") { iframe = iframes[_i]; break; }
+        }
+    }'''
+
+    # Shared JS snippet: find first content iframe (normal mode)
+    _IFRAME_FINDER = r'''
+    var iframe = document.querySelector("iframe");
+    if (!iframe) {
+        var iframes = document.querySelectorAll("iframe");
+        for (var _i = 0; _i < iframes.length; _i++) {
+            var _src = iframes[_i].getAttribute("src") || "";
+            if (_src && _src !== "about:blank") { iframe = iframes[_i]; break; }
+        }
+    }'''
+
+    # ── Read-Write (读写同步) Mode ──────────────────────────
+
+    def _detect_rw_mode(self):
+        """Detect if current page is read-write (读写同步) mode via URL hash.
+        Sets self.rw_mode = True if on #/readingWritingDetails page."""
+        try:
+            url = self.tab.get('url', '')
+            if 'readingWritingDetails' in url or 'readingWriting' in url:
+                self.rw_mode = True
+                self.debug("Read-Write mode detected (读写同步)")
+                return True
+        except Exception as e:
+            self.debug("RW mode detection error: " + str(e))
+        self.rw_mode = False
+        return False
+
+    def get_rw_show_data(self):
+        """Get showData from read-write iframe. Contains all questions + answers."""
+        if self.rw_show_data:
+            return self.rw_show_data
+        js = '(function(){\n        try {\n        %s;\n            if (!iframe) return JSON.stringify({error: "no read-write iframe"});\n            var data = iframe.contentWindow.showData;\n            if (!data) return JSON.stringify({error: "no showData"});\n            return JSON.stringify(data);\n        } catch(e) { return JSON.stringify({error: e.message}); }\n        })()' % self._RW_IFRAME_FINDER
+        result = self.eval_js(js)
+        if result:
+            try:
+                self.rw_show_data = json.loads(result)
+                return self.rw_show_data
+            except:
+                pass
+        return None
+
+    def get_rw_page_state(self):
+        """Get state from read-write page: li.pointer options grouped by question.
+        Returns: {questions: [{qid, options: [{option, text, selected}], any_selected}]}"""
+        js = '(function(){\n        try {\n        %s;\n            if (!iframe) return JSON.stringify({error: "no iframe"});\n            var doc = iframe.contentDocument;\n            if (!doc) return JSON.stringify({error: "no contentDocument"});\n            var result = {questions: []};\n            var uls = doc.querySelectorAll("ul[data-id]");\n            uls.forEach(function(ul){\n                var qid = ul.getAttribute("data-id").split("-").slice(1).join("-");\n                var opts = ul.querySelectorAll("li.pointer");\n                var qInfo = {qid: qid, options: [], any_selected: false};\n                opts.forEach(function(li){\n                    var opt = li.getAttribute("data-option") || "";\n                    var txt = (li.innerText || "").trim().substring(0, 50);\n                    var sel = li.classList.contains("on") || li.classList.contains("selected") || li.classList.contains("active");\n                    qInfo.options.push({option: opt, text: txt, selected: sel});\n                    if (sel) qInfo.any_selected = true;\n                });\n                result.questions.push(qInfo);\n            });\n            return JSON.stringify(result);\n        } catch(e) { return JSON.stringify({error: e.message}); }\n        })()' % self._RW_IFRAME_FINDER
+        result = self.eval_js(js)
+        if result:
+            try:
+                return json.loads(result)
+            except:
+                pass
+        return {"error": str(result)}
+
+    def answer_rw_choose(self):
+        """Answer all visible choice questions in read-write mode.
+        Uses showData for answers, clicks li.pointer[data-option].
+        Matches questions by index (page order == showData order)."""
+        show_data = self.get_rw_show_data()
+        if not show_data or show_data.get('error'):
+            self.debug("RW: No showData available")
+            return False, False
+
+        questions = show_data.get('question', [])
+        if not questions:
+            self.debug("RW: No questions in showData")
+            return False, False
+
+        state = self.get_rw_page_state()
+        if state.get('error'):
+            self.debug("RW state error: " + str(state.get('error')))
+            return False, False
+
+        page_questions = state.get('questions', [])
+        if not page_questions:
+            return False, False
+
+        # Build flat answer list from showData: each question has info[].answer
+        # A question may have multiple sub-questions (info items)
+        answer_list = []  # [(qid, answer_letter)]
+        for q in questions:
+            qid = q.get('id', '')
+            info_list = q.get('info', [])
+            if info_list:
+                for info_item in info_list:
+                    ans = info_item.get('answer', '')
+                    if ans:
+                        answer_list.append((qid, ans.upper()))
+
+        any_new = False
+        all_done = True
+
+        # Match by index: page_questions[i] ↔ answer_list[i]
+        for i, pq in enumerate(page_questions):
+            if pq.get('any_selected'):
+                self.debug("RW Q#%d already selected" % (i + 1))
+                continue
+            all_done = False
+
+            if i >= len(answer_list):
+                self.debug("RW Q#%d: no answer in showData (only %d answers)" % (i + 1, len(answer_list)))
+                continue
+
+            qid, answer = answer_list[i]
+
+            # Click the option matching the answer letter
+            js_click = '(function(){\n            try {\n            %s;\n                if (!iframe) return "no iframe";\n                var doc = iframe.contentDocument;\n                var uls = doc.querySelectorAll("ul[data-id]");\n                var ul = uls[%d];\n                if (!ul) return "no ul at index %d";\n                var li = ul.querySelector("li.pointer[data-option=\'%s\']");\n                if (!li) return "no li for option %s";\n                li.click();\n                return "clicked %s";\n            } catch(e) { return "error: " + e.message; }\n            })()' % (self._RW_IFRAME_FINDER, i, i, answer, answer, answer)
+            result = self.eval_js(js_click)
+            self.debug("RW click Q#%d: %s" % (i + 1, str(result)))
+            if 'clicked' in str(result):
+                any_new = True
+                self.stats['choose_answered'] += 1
+                print("  RW Q#%d (id:%s) → %s" % (i + 1, qid, answer))
+                if self._on_question_answered:
+                    try:
+                        self._on_question_answered(str(qid), answer, 'choose')
+                    except:
+                        pass
+
+        return any_new, all_done
+
+    def click_rw_next(self):
+        """Click '下一步' or '提交' button in read-write mode (outer page, not iframe)."""
+        js = '''(function(){
+        var btns = document.querySelectorAll("button.el-button");
+        for (var i = 0; i < btns.length; i++) {
+            var txt = (btns[i].innerText || "").trim();
+            if (txt === "下一步" || txt === "提交") {
+                if (btns[i].disabled) return JSON.stringify({success: false, reason: "disabled"});
+                btns[i].click();
+                return JSON.stringify({success: true, method: txt});
+            }
+        }
+        return JSON.stringify({success: false, reason: "not found"});
+        })()'''
+        result = self.eval_js(js)
+        try:
+            r = json.loads(result) if result else {}
+            if r.get('success'):
+                self.stats['next_click'] += 1
+                self.debug("RW Next: 下一步 clicked")
+            return r
+        except:
+            return {"success": False, "reason": str(result)}
 
     # ── Answer Loading ────────────────────────────────────────
 
@@ -328,7 +500,9 @@ class ETSAutoAnswer(ETSBase):
     def get_page_state(self):
         """Get current iframe state: choices grouped by question, fill inputs."""
         js = r'''(function(){
-        var doc = document.querySelector("iframe").contentDocument || document.querySelector("iframe").contentWindow.document;
+        %s;
+        if (!iframe) return JSON.stringify({error: "no iframe"});
+        var doc = iframe.contentDocument || iframe.contentWindow.document;
         if (!doc) return JSON.stringify({error: "no doc"});
         var choices = doc.querySelectorAll(".choose2");
         var groups = {};
@@ -365,7 +539,7 @@ class ETSAutoAnswer(ETSBase):
             hasChoice: choices.length > 0, hasInput: inputs.length > 0,
             inReviewMode: hasReviewMode
         });
-        })()'''
+        })()''' % self._IFRAME_FINDER
         result = self.eval_js(js)
         try:
             return json.loads(result) if result else {}
@@ -426,7 +600,9 @@ class ETSAutoAnswer(ETSBase):
 
             # Click via setPCChoose2 → jQuery → native
             js_click = r'''(function(){
-            var win = document.querySelector("iframe").contentWindow;
+            ''' + self._IFRAME_FINDER + r''';
+            if (!iframe) return JSON.stringify({error: "no iframe"});
+            var win = iframe.contentWindow;
             var el = win.document.getElementById("%s");
             if (!el) return JSON.stringify({error: "not found"});
             if (typeof win.setPCChoose2 === 'function') {
@@ -445,7 +621,9 @@ class ETSAutoAnswer(ETSBase):
             selected = False
             for _ in range(12):
                 js_check = r'''(function(){
-                var doc = document.querySelector("iframe").contentDocument || document.querySelector("iframe").contentWindow.document;
+                ''' + self._IFRAME_FINDER + r''';
+                if (!iframe) return false;
+                var doc = iframe.contentDocument || iframe.contentWindow.document;
                 var el = doc.getElementById("%s");
                 return el ? el.classList.contains("choose_selected") : false;
                 })()''' % (target_id)
@@ -456,7 +634,9 @@ class ETSAutoAnswer(ETSBase):
 
             if selected:
                 js_collect = r'''(function(){
-                var win = document.querySelector("iframe").contentWindow;
+                ''' + self._IFRAME_FINDER + r''';
+                if (!iframe) return 0;
+                var win = iframe.contentWindow;
                 if(typeof win.kttb_getPcChoise === 'function'){
                     try { win.kttb_getPcChoise(); } catch(e){}
                 }
@@ -521,7 +701,9 @@ class ETSAutoAnswer(ETSBase):
             safe_val = self.js_escape(value)
 
             js_fill = '''(function(){
-            var doc = document.querySelector("iframe").contentDocument || document.querySelector("iframe").contentWindow.document;
+            %s;
+            if (!iframe) return JSON.stringify({error: "no iframe"});
+            var doc = iframe.contentDocument || iframe.contentWindow.document;
             var inp = doc.getElementById("%s") || doc.querySelector(".fill_word_input[id='%s']") || doc.querySelector("input[type='text'][id='%s']");
             if (!inp) return JSON.stringify({error: "not found"});
             var target = inp;
@@ -543,7 +725,7 @@ class ETSAutoAnswer(ETSBase):
                 } catch(e) {}
             }
             return JSON.stringify({filled: true, value: target.value, shadow: !!inp.shadowRoot});
-            })()''' % (inp_id, inp_id, inp_id, safe_val)
+            })()''' % (self._IFRAME_FINDER, inp_id, inp_id, inp_id, safe_val)
             r1 = json.loads(self.eval_js(js_fill) or "{}")
             self.debug("Fill result: " + str(r1))
 
@@ -557,12 +739,14 @@ class ETSAutoAnswer(ETSBase):
 
         if any_new:
             js_collect = '''(function(){
-            var win = document.querySelector("iframe").contentWindow;
+            %s;
+            if (!iframe) return 0;
+            var win = iframe.contentWindow;
             if(typeof win.kttb_getPcBlank === 'function'){
                 try { win.kttb_getPcBlank(); } catch(e){}
             }
             return (window.top.__ets_recorded_fill || []).length;
-            })()'''
+            })()''' % self._IFRAME_FINDER
             total = self.eval_js(js_collect) or 0
             self.debug("Fill recorded: %d" % total)
 
@@ -688,12 +872,12 @@ class ETSAutoAnswer(ETSBase):
         then .icon-nextQuestion in main frame."""
         # 1. Try iframe.next() (older ETS versions)
         js_iframe_next = '''(function(){
-        var iframe = document.querySelector("iframe");
+        %s;
         if (iframe && iframe.contentWindow && typeof iframe.contentWindow.next === 'function') {
             try { iframe.contentWindow.next(); return true; } catch(e) {}
         }
         return false;
-        })()'''
+        })()''' % self._IFRAME_FINDER
         if self.eval_js(js_iframe_next):
             self.stats['next_click'] += 1
             self.debug("Next: iframe.next()")
@@ -701,7 +885,7 @@ class ETSAutoAnswer(ETSBase):
 
         # 2. Try .next_icon inside iframe (listen-say choose2 pages)
         js_iframe_next_icon = r'''(function(){
-        var iframe = document.querySelector("iframe");
+        ''' + self._IFRAME_FINDER + r''';
         if (!iframe) return JSON.stringify({success: false, reason: "no iframe"});
         var iDoc = iframe.contentDocument || iframe.contentWindow.document;
         var ni = iDoc.querySelector(".next_icon");
@@ -809,6 +993,163 @@ class ETSAutoAnswer(ETSBase):
                 return False
         # Exhausted wait — exam likely complete
         return False
+
+    def _run_rw_loop(self, max_steps=999):
+        """Read-Write (读写同步) mode loop. Different DOM, different navigation."""
+
+        # Get showData for answers
+        show_data = self.get_rw_show_data()
+        if not show_data or show_data.get('error'):
+            print("ERROR: Cannot read showData from iframe: %s" % (show_data or {}).get('error', 'unknown'))
+            print("Make sure the read-write page is fully loaded.")
+            return {'total_answered': 0, 'mode': 'read-write', 'errors': 1}
+
+        questions = show_data.get('question', [])
+        print("Questions in showData: %d" % len(questions))
+
+        # Build answer summary from showData
+        for q in questions:
+            qid = q.get('id', '')
+            info_list = q.get('info', [])
+            if info_list:
+                ans = info_list[0].get('answer', '')
+                if ans:
+                    self.answers['rw_' + str(qid)] = {'type': 'choose', 'answer': ans.upper()}
+                    print("  Q:%s → %s" % (qid, ans.upper()))
+
+        self.total_questions = len(self.answers)
+        print("Total answers: %d" % self.total_questions)
+
+        step = 0
+        consecutive_empty = 0
+        consecutive_no_progress = 0  # pages where we couldn't answer anything
+
+        while True:
+            if self.stop_event and self.stop_event.is_set():
+                break
+
+            step += 1
+            if step > max_steps:
+                print("Safety limit reached (%d steps)" % max_steps)
+                break
+
+            # Read current page state
+            state = self.get_rw_page_state()
+            if state.get('error'):
+                self.debug("RW step %d: state error: %s" % (step, state.get('error')))
+                consecutive_empty += 1
+                if consecutive_empty >= 10:
+                    print("Too many errors, stopping.")
+                    break
+                self.interruptible_sleep(1)
+                continue
+
+            page_qs = state.get('questions', [])
+            if not page_qs:
+                consecutive_empty += 1
+                if consecutive_empty >= 5:
+                    self.debug("RW: No questions visible for %d steps" % consecutive_empty)
+                    nr = self.click_rw_next()
+                    if nr.get('success'):
+                        consecutive_empty = 0
+                        self.rw_show_data = None  # clear cache for next page group
+                        self.interruptible_sleep(1)
+                        continue
+                    print("RW: No more questions visible.")
+                    break
+                self.interruptible_sleep(1)
+                continue
+
+            consecutive_empty = 0
+            any_new, all_done = self.answer_rw_choose()
+
+            if any_new:
+                consecutive_no_progress = 0
+                self.interruptible_sleep(0.5)
+
+            # Only try to advance when all visible questions are answered
+            if not all_done:
+                # Some questions not yet answerable — wait and retry
+                consecutive_no_progress += 1
+                if consecutive_no_progress >= 20:
+                    print("RW: No progress after %d attempts, stopping." % consecutive_no_progress)
+                    break
+                self.interruptible_sleep(1)
+                continue
+
+            # All questions on this page are done — advance
+            consecutive_no_progress = 0
+            nr = self.click_rw_next()
+            if nr.get('success'):
+                method = nr.get('method', '')
+                if method == '提交':
+                    print("RW: 提交 clicked, task complete.")
+                    break
+                self.rw_show_data = None  # clear cache for next page group
+                self.interruptible_sleep(1)
+            elif nr.get('reason') == 'disabled':
+                # Still processing current step
+                self.debug("RW: Next disabled, waiting...")
+                for _ in range(15):
+                    self.interruptible_sleep(1)
+                    if self._all_sidebar_correct():
+                        print("RW: All sidebar items correct, exam complete.")
+                        break
+                    nr2 = self.click_rw_next()
+                    if nr2.get('success'):
+                        method = nr2.get('method', '')
+                        if method == '提交':
+                            print("RW: 提交 clicked, task complete.")
+                            break
+                        self.rw_show_data = None
+                        break
+                else:
+                    # Final sidebar check before giving up
+                    if self._all_sidebar_correct():
+                        print("RW: All sidebar items correct, exam complete.")
+                    else:
+                        print("RW: Next button disabled too long, may be complete.")
+                    break
+                if nr2.get('method') == '提交':
+                    break
+            elif nr.get('reason') == 'not found':
+                # Maybe on last step or page changed
+                self.debug("RW: Next button not found")
+                # Check sidebar first
+                if self._all_sidebar_correct():
+                    print("RW: All sidebar items correct, exam complete.")
+                    break
+                self.interruptible_sleep(2)
+                # Check if still on rw page
+                try:
+                    url = self.eval_js('document.location.hash')
+                    if not url or 'readingWriting' not in (url or ''):
+                        print("RW: Page changed, task may be complete.")
+                        break
+                except:
+                    pass
+
+        # Summary
+        choose_count = self.stats['choose_answered']
+        result = {
+            'mode': 'read-write',
+            'total_questions': self.total_questions,
+            'choose_answered': choose_count,
+            'total_answered': choose_count,
+            'errors': self.stats['errors']
+        }
+        print("\n" + "=" * 40)
+        print("Done: %d questions answered" % choose_count)
+        if self.total_questions:
+            print("Coverage: %d/%d (%.0f%%)" % (choose_count, self.total_questions, choose_count / self.total_questions * 100))
+
+        if self.ws:
+            try:
+                self.ws.close()
+            except:
+                pass
+
+        return result
 
     def _run_loop(self, max_steps=999):
         """Inner business-logic loop. Called by run(); separated so that
@@ -1055,6 +1396,12 @@ class ETSAutoAnswer(ETSBase):
         if 'Result' in self.tab.get('url', ''):
             print("Already on a result page — open a mock exam to auto-answer")
             return
+
+        # Read-Write mode: answers come from iframe showData, not local cache
+        if self.rw_mode:
+            print("Mode: 读写同步 (Read-Write)")
+            print("=" * 40)
+            return self._run_rw_loop(max_steps)
 
         if not self.load_answers():
             print("Failed to load answers, aborting")
