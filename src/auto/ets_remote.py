@@ -345,7 +345,7 @@ class ETSRemote:
 #  CLI helpers (for GUI integration)
 # ═══════════════════════════════════════════════════════════
 
-def format_update_message(info):
+def format_update_message(info, current_version=""):
     """Format a human-readable update/announcement message for GUI display.
 
     Returns None if there's nothing to show.
@@ -357,12 +357,12 @@ def format_update_message(info):
 
     if info.force_update:
         lines.append("⚠️ 版本过低，必须更新！")
-        lines.append("当前版本：%s → 最新版本：%s" % (info.latest_version, info.latest_version))
+        lines.append("当前版本：%s → 最新版本：%s" % (current_version or "?", info.latest_version))
         if info.download_url:
             lines.append("下载地址：%s" % info.download_url)
 
     elif info.update_available:
-        lines.append("🔄 发现新版本：%s（当前 %s）" % (info.latest_version, info.latest_version))
+        lines.append("🔄 发现新版本：%s（当前 %s）" % (info.latest_version, current_version or "?"))
         if info.download_url:
             lines.append("下载地址：%s" % info.download_url)
 

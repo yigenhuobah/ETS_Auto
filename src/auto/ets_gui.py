@@ -191,6 +191,13 @@ class ETSApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"))
         self._status_label.pack(fill="x", padx=16, pady=(0, 4))
 
+        # Hotkey hint
+        self._hotkey_var = ctk.StringVar(value="")
+        self._hotkey_label = ctk.CTkLabel(
+            parent, textvariable=self._hotkey_var, anchor="w",
+            font=ctk.CTkFont(size=11), text_color="gray")
+        self._hotkey_label.pack(fill="x", padx=16, pady=(0, 4))
+
         # Log output
         self._log_text = ctk.CTkTextbox(
             parent, wrap="word", state="disabled",
@@ -252,6 +259,7 @@ class ETSApp(ctk.CTk):
         self._start_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
         self._status_var.set("运行中...")
+        self._hotkey_var.set("⌨ F9暂停/恢复  F10跳过  F12停止")
 
         # Redirect stdout/stderr to queue
         self._queue_writer_out = QueueWriter(self._log_queue, original=sys.stdout)
@@ -302,7 +310,7 @@ class ETSApp(ctk.CTk):
             return
 
         # Show announcement / update info
-        msg = format_update_message(info)
+        msg = format_update_message(info, APP_VERSION)
         if msg:
             self._append_log("[远程] %s\n" % msg.replace('\n', '\n[远程] '))
 
@@ -314,13 +322,40 @@ class ETSApp(ctk.CTk):
         """Attempt silent pk_extra.json update in background."""
         def _worker():
             try:
-                from ets_remote import ETSRemote
-                remote = ETSRemote(current_version=APP_VERSION)
-                success, msg = remote.download_pk_extra()
-                if success:
-                    self.after(0, lambda: self._append_log("[远程] %s\n" % msg))
+                import urllib.request, json, os, sys, shutil
+                target = os.path.join(
+                    os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
+                    else os.path.dirname(os.path.abspath(__file__)),
+                    'pk_extra.json')
+                # Backup
+                if os.path.exists(target):
+                    try:
+                        shutil.copy2(target, target + '.bak')
+                    except OSError:
+                        pass
+                # Download with ghproxy fallback
+                urls = [url]
+                if 'raw.githubusercontent.com' in url:
+                    urls.insert(0, url.replace(
+                        'https://raw.githubusercontent.com',
+                        'https://ghfast.top/https://raw.githubusercontent.com'))
+                for u in urls:
+                    try:
+                        req = urllib.request.Request(u, headers={
+                            'User-Agent': 'ETS_Auto/%s' % APP_VERSION})
+                        with urllib.request.urlopen(req, timeout=8) as resp:
+                            if resp.status == 200:
+                                raw = resp.read()
+                                json.loads(raw)
+                                with open(target, 'wb') as f:
+                                    f.write(raw)
+                                self.after(0, lambda: self._append_log(
+                                    "[远程] pk_extra.json 已更新 (%d bytes)\n" % len(raw)))
+                                return
+                    except Exception:
+                        continue
             except Exception:
-                pass  # Silent update failure is non-critical
+                pass
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -364,6 +399,7 @@ class ETSApp(ctk.CTk):
         self._restore_streams()
 
         self._running = False
+        self._hotkey_var.set("")
         self._start_btn.configure(state="normal")
         self._stop_btn.configure(state="disabled")
         if self._stop_event.is_set():
