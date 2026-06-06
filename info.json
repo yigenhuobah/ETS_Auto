@@ -1,0 +1,7 @@
+{
+  "version": "0.6.0",
+  "minVer": "0.4.0",
+  "allowStart": true,
+  "announcement": "v0.6.0 发布：远程配置系统 + 读写同步模式 + 多项修复",
+  "downloadUrl": "https://github.com/yigenhuobah/ETS_Auto/releases/latest"
+}

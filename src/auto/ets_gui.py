@@ -39,7 +39,7 @@ if sys.platform == 'win32':
 import customtkinter as ctk
 
 # Version constant — bump on each release
-APP_VERSION = "0.5.2"
+APP_VERSION = "0.6.0"
 
 
 # ── Queue-based stdout bridge ────────────────────────────────
@@ -217,6 +217,19 @@ class ETSApp(ctk.CTk):
     def _on_start(self):
         if self._running:
             return
+
+        # Guard: check remote info before starting (may block start)
+        if self._remote_info is not None:
+            try:
+                from ets_remote import should_block_start
+                blocked, reason = should_block_start(self._remote_info)
+                if blocked:
+                    self._append_log("[远程] ⛔ %s\n" % reason)
+                    if self._remote_info.download_url:
+                        self._append_log("[远程] 下载地址：%s\n" % self._remote_info.download_url)
+                    return
+            except ImportError:
+                pass  # ets_remote not available — allow start
 
         # Validate port
         try:
