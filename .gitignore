@@ -56,3 +56,6 @@ ecdict_lite.json
 ecdict_pk.json
 pk_extra.json
 pk_misses.json
+
+# Internal docs (dev-only)
+HANDOVER.md

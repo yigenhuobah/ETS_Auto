@@ -39,7 +39,7 @@ if sys.platform == 'win32':
 import customtkinter as ctk
 
 # Version constant — bump on each release
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.6.1"
 
 
 # ── Queue-based stdout bridge ────────────────────────────────
