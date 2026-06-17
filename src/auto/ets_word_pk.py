@@ -83,6 +83,7 @@ class ETSWordPK(ETSBase):
         self.misses_path = _exe_dir_path('pk_misses.jsonl')
         self.word_trans = {}      # word.lower() -> full_trans
         self.trans_index = {}     # chinese_segment -> [word1, word2, ...]
+        self.cn_seg_index = {}    # chinese_sub_phrase -> [word1, word2, ...] (finer-grained)
         self.pk_extra = {}        # question_text -> correct_option (self-learned)
         self.stats = {'answered': 0, 'no_match': 0, 'errors': 0, 'learned': 0}
 
@@ -226,7 +227,81 @@ class ETSWordPK(ETSBase):
 
         print("Dictionary: %d base + %d ecdict + %d deriv + %d compound + %d extra = %d total (%.1fs)" % (
             base_count, ecdict_count, len(new_deriv), compound_count, extra_count, len(self.word_trans), time.time() - t0))
+
+        # ── Build cn_seg_index (sub-phrase index for Chinese→English lookup) ──
+        seg_count = self._build_cn_seg_index()
+        print("  CN sub-phrase index: %d segments" % seg_count)
+
         return True
+
+    def _cn_split(self, cn_text):
+        """Split a Chinese translation line into meaningful sub-phrases.
+        Handles formats like: '分析，剖析', '在押/入狱', '彻底的;完全的', etc."""
+        segs = []
+        # Split on Chinese/English punctuation and slashes
+        parts = re.split(r'[，,、；;/／]', cn_text)
+        for p in parts:
+            p = p.strip().strip('〔【(（·〕】)）').strip()
+            # Skip noise: too short, pure digits, pure English, HTML fragments
+            if len(p) < 2:
+                continue
+            if re.match(r'^[0-9.]+$', p):
+                continue
+            if re.match(r'^[a-zA-Z.\-/]+$', p):
+                continue
+            # Must contain at least one CJK character
+            if not any('\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf' for c in p):
+                continue
+            segs.append(p)
+        return segs
+
+    def _build_cn_seg_index(self):
+        """Build a finer-grained Chinese→English index by splitting translation lines
+        into sub-phrases. This enables matching '监禁' → 'behind bars' even when the
+        trans_index key is '在押/入狱'."""
+        count = 0
+        seen = set()  # avoid duplicate entries
+        MAX_PER_KEY = 10  # limit candidates per sub-phrase to control memory
+        for word, trans in self.word_trans.items():
+            wl = word  # word_trans keys are already lowercased for single words
+            # Handle Chinese→English entries from pk_extra (word is Chinese, trans is English)
+            word_is_cn = any('\u4e00' <= c <= '\u9fff' for c in word)
+            if word_is_cn:
+                # word=Chinese key, trans=English answer
+                # Split the Chinese key into sub-phrases and map each to the English word
+                segs = self._cn_split(word)
+                for seg in segs:
+                    key = (seg, trans)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    lst = self.cn_seg_index.setdefault(seg, [])
+                    if len(lst) < MAX_PER_KEY:
+                        lst.append(trans)
+                        count += 1
+                continue
+            for line in trans.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                cn = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', line).strip()
+                if not cn:
+                    continue
+                segs = self._cn_split(cn)
+                for seg in segs:
+                    # Skip if seg == cn (already in trans_index)
+                    if seg == cn:
+                        continue
+                    key = (seg, wl)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    lst = self.cn_seg_index.setdefault(seg, [])
+                    if len(lst) < MAX_PER_KEY:
+                        lst.append(word)
+                        count += 1
+        return count
+
 
     # ── Matching ────────────────────────────────────────────
 
@@ -451,6 +526,66 @@ class ETSWordPK(ETSBase):
             matches.sort(key=lambda x: -x[2])
             return matches[0][0]
 
+        # ── Strategy 1.5: CN sub-phrase index (Chinese question → English options) ──
+        # Handles cases like: question='监禁', trans_index key='在押/入狱',
+        # cn_seg_index has '在押'→['behind bars'], '入狱'→['behind bars']
+        if self._is_chinese(q):
+            seg_candidates = []
+            # O(1) exact lookup — no full-table scan
+            if q_clean in self.cn_seg_index:
+                seg_candidates.extend(self.cn_seg_index[q_clean])
+                self.debug("CNSeg(exact): '%s' -> %s" % (q_clean, self.cn_seg_index[q_clean][:5]))
+            elif q in self.cn_seg_index:
+                seg_candidates.extend(self.cn_seg_index[q])
+                self.debug("CNSeg(exact-q): '%s' -> %s" % (q, self.cn_seg_index[q][:5]))
+            # Try each question term against sub-phrase index
+            if not seg_candidates:
+                for term in q_terms:
+                    if len(term) >= 2 and term in self.cn_seg_index:
+                        seg_candidates.extend(self.cn_seg_index[term])
+                        self.debug("CNSeg(term): '%s' -> %s" % (term, self.cn_seg_index[term][:5]))
+            # Try substring match: only if still no candidates
+            # Uses a bounded scan with early exit
+            if not seg_candidates:
+                for term in q_terms:
+                    if len(term) >= 3:  # require longer term to reduce false positives
+                        found = False
+                        for seg_key in self.cn_seg_index:
+                            if term in seg_key or seg_key in term:
+                                seg_candidates.extend(self.cn_seg_index[seg_key])
+                                self.debug("CNSeg(sub): '%s' ~ '%s'" % (term, seg_key))
+                                found = True
+                                break
+                        if found:
+                            break
+            if seg_candidates:
+                # Deduplicate while preserving order
+                seen = set()
+                unique = []
+                for w in seg_candidates:
+                    wl = w.lower().strip()
+                    if wl not in seen:
+                        seen.add(wl)
+                        unique.append(wl)
+                # Match unique candidates against options
+                for i, opt in enumerate(options):
+                    if opt.lower().strip() in unique:
+                        self.debug("CNSeg hit: opt[%d]='%s'" % (i, opt))
+                        return i
+                # Stem match
+                for i, opt in enumerate(options):
+                    stems = self.get_stems(opt)
+                    for s in stems:
+                        if s in unique:
+                            self.debug("CNSeg stem: opt[%d]='%s' stem=%s" % (i, opt, s))
+                            return i
+                # Partial match: option word in candidates
+                for i, opt in enumerate(options):
+                    opt_words = set(w.lower().strip() for w in re.split(r'[-\s]+', opt) if len(w) >= 3)
+                    if opt_words & set(unique):
+                        self.debug("CNSeg partial: opt[%d]='%s'" % (i, opt))
+                        return i
+
         # ── Strategy 2: trans_index ──
         candidates = []
         if q_clean in self.trans_index:
@@ -524,7 +659,7 @@ class ETSWordPK(ETSBase):
                         best_combined = combined
                         self.debug("CharOverlap: '%s' overlap=%d score=%d -> '%s'" % (
                             opt, len(overlap), score, combined[:40]))
-                if best_idx >= 0 and best_score >= 5:
+                if best_idx >= 0 and best_score >= 20:
                     return best_idx
 
         # ── Strategy 2.8: Reverse-translation check ──
@@ -542,7 +677,7 @@ class ETSWordPK(ETSBase):
                 if any('\u4e00' <= c <= '\u9fff' for c in q):
                     q_cn_chars = set(c for c in q if '\u4e00' <= c <= '\u9fff')
                     overlap = q_cn_chars & opt_cn_chars
-                    if len(overlap) >= 1 and len(q_cn_chars) <= 3:
+                    if len(overlap) >= 2 or (len(overlap) >= 1 and len(q_cn_chars) <= 2):
                         self.debug("RevTrans: '%s' char-overlap=%d shared=%s" % (
                             opt, len(overlap), ''.join(overlap)))
                         return i
@@ -663,7 +798,7 @@ class ETSWordPK(ETSBase):
 
     def learn_miss(self, question, correct_answer):
         """Record a learned mapping: question -> correct_answer
-        Also updates trans_index in the correct direction (cn -> [en_words])."""
+        Also updates trans_index and cn_seg_index in the correct direction."""
         q = question.strip()
         if not q or not correct_answer:
             return
@@ -673,16 +808,45 @@ class ETSWordPK(ETSBase):
             # Determine which is Chinese and insert in the correct direction
             if self._is_chinese(q):
                 # q=Chinese, correct_answer=English → correct direction
-                self.trans_index.setdefault(q, []).insert(0, correct_answer)
+                _idx_list = self.trans_index.setdefault(q, [])
+                if correct_answer not in _idx_list:
+                    _idx_list.insert(0, correct_answer)
+                # Also update cn_seg_index for sub-phrase matching
+                _seg_list = self.cn_seg_index.setdefault(q, [])
+                if correct_answer not in _seg_list:
+                    _seg_list.insert(0, correct_answer)
                 q_clean = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', q).strip()
                 if q_clean != q:
-                    self.trans_index.setdefault(q_clean, []).insert(0, correct_answer)
+                    _idx_list2 = self.trans_index.setdefault(q_clean, [])
+                    if correct_answer not in _idx_list2:
+                        _idx_list2.insert(0, correct_answer)
+                    _seg_list2 = self.cn_seg_index.setdefault(q_clean, [])
+                    if correct_answer not in _seg_list2:
+                        _seg_list2.insert(0, correct_answer)
+                # Also split q_clean into sub-phrases and add to cn_seg_index
+                for seg in self._cn_split(q_clean):
+                    if seg not in self.cn_seg_index or correct_answer not in self.cn_seg_index[seg]:
+                        self.cn_seg_index.setdefault(seg, []).insert(0, correct_answer)
             else:
                 # q=English, correct_answer=Chinese → reverse: cn_key -> [en_word]
-                self.trans_index.setdefault(correct_answer, []).insert(0, q)
+                _idx_list = self.trans_index.setdefault(correct_answer, [])
+                if q not in _idx_list:
+                    _idx_list.insert(0, q)
+                _seg_list = self.cn_seg_index.setdefault(correct_answer, [])
+                if q not in _seg_list:
+                    _seg_list.insert(0, q)
                 cn_clean = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', correct_answer).strip()
                 if cn_clean != correct_answer:
-                    self.trans_index.setdefault(cn_clean, []).insert(0, q)
+                    _idx_list2 = self.trans_index.setdefault(cn_clean, [])
+                    if q not in _idx_list2:
+                        _idx_list2.insert(0, q)
+                    _seg_list2 = self.cn_seg_index.setdefault(cn_clean, [])
+                    if q not in _seg_list2:
+                        _seg_list2.insert(0, q)
+                # Split cn_clean into sub-phrases
+                for seg in self._cn_split(cn_clean):
+                    if seg not in self.cn_seg_index or q not in self.cn_seg_index[seg]:
+                        self.cn_seg_index.setdefault(seg, []).insert(0, q)
             # Atomic write: temp file + os.replace() — never leaves a 0-byte file on crash
             import tempfile
             dir_name = os.path.dirname(self.extra_path) or '.'
@@ -720,9 +884,19 @@ class ETSWordPK(ETSBase):
         print("=" * 45)
         try:
             self.connect()
+        except urllib.error.URLError as e:
+            print("\n❌ 连接失败: %s" % e)
+            print("诊断：")
+            print("  1. e听说PC端是否已启动？")
+            print("  2. 调试端口 %d 是否正确？" % self.port)
+            return
+        except ConnectionRefusedError:
+            print("\n❌ 连接被拒绝 (端口 %d)" % self.port)
+            print("诊断：e听说PC端可能未启动，或端口不匹配")
+            return
         except Exception as e:
-            print("\n连接失败: %s" % e)
-            print("请检查: 1) e听说PC端已启动  2) 调试端口 %d 正确" % self.port)
+            print("\n❌ 连接失败: %s" % e)
+            print("诊断：请确认 e听说PC端已启动且调试端口 %d 正确" % self.port)
             return
         if not self.load_dictionary():
             return

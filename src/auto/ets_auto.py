@@ -10,7 +10,7 @@ Usage:
   python ets_auto.py --show-answers  # 仅查看答案
   python ets_auto.py --json       # JSON 输出
 """
-import json, os, time, sys, threading
+import json, os, time, sys, threading, re
 from urllib.parse import urlparse, parse_qs
 from urllib.error import URLError
 
@@ -60,7 +60,7 @@ class ETSAutoAnswer(ETSBase):
             return
         print("\nAnswers for set_id=%s:\n" % (self.set_id or "?"))
         for key, val in sorted(self.answers.items()):
-            tag = "[CHS]" if val['type'] == 'choose' else "[FIL]"
+            tag = {'choose': '[CHS]', 'fill': '[FIL]', 'dialogue': '[DLG]', 'picture': '[PIC]', 'read': '[RD]'}.get(val['type'], '[??]')
             print("  %s %s → %s" % (tag, key, val['answer']))
         print("\n%d total answers" % len(self.answers))
 
@@ -390,6 +390,13 @@ class ETSAutoAnswer(ETSBase):
 
     def load_answers(self):
         """Load answers from local ETS cache (content.json per content_* dir)."""
+        import re as _html_re
+        def _strip_html(t):
+            if not t: return ''
+            t = _html_re.sub(r'</p>\s*<p[^>]*>', '\n', t)
+            t = _html_re.sub(r'<br\s*/?>', '\n', t)
+            t = _html_re.sub(r'<[^>]+>', '', t)
+            return t.strip()
         if not self.set_id:
             print("ERROR: No set_id available (not in Pinia, not in URL)")
             return False
@@ -436,20 +443,20 @@ class ETSAutoAnswer(ETSBase):
                             self.answers[key] = {'type': 'fill', 'answer': ans}
                 elif stype == 'collector.read':
                     key = stid
-                    ref_text = info.get('value', '')
+                    ref_text = _strip_html(info.get('value', ''))
                     symbol = info.get('symbol', '')
                     if ref_text:
                         self.answers[key] = {'type': 'read', 'answer': ref_text, 'symbol': symbol}
                         self.recording_answers.append({'stid': stid, 'type': 'read', 'answer': ref_text, 'symbol': symbol})
                 elif stype == 'collector.picture':
                     key = stid
-                    ref_text = info.get('value', '')
+                    ref_text = _strip_html(info.get('value', ''))
                     topic = info.get('topic', '')
                     if not ref_text:
                         ref_text = info.get('keypoint', '')
                     if not ref_text:
                         ref_text = '\n\n'.join([
-                            s.get('value', '') for s in info.get('std', []) if s.get('value', '')
+                            _strip_html(s.get('value', '')) for s in info.get('std', []) if s.get('value', '')
                         ])
                     if ref_text:
                         self.answers[key] = {'type': 'picture', 'answer': ref_text, 'topic': topic}
@@ -457,27 +464,35 @@ class ETSAutoAnswer(ETSBase):
                 elif stype == 'collector.dialogue':
                     key = stid
                     questions = info.get('question', [])
-                    ref_text = info.get('value', '')
-                    if not ref_text:
-                        parts = []
-                        for q in questions:
-                            parts.append(q.get('ask', ''))
-                            kw = q.get('keywords', '')
-                            if kw:
-                                parts.append('  Keywords: ' + kw.replace('|', ' / '))
-                        ref_text = '\n\n'.join(parts)
-                    if ref_text:
-                        q_texts = [q.get('ask', '') for q in questions]
-                        self.answers[key] = {'type': 'dialogue', 'answer': ref_text, 'questions': q_texts}
-                        self.recording_answers.append({'stid': stid, 'type': 'dialogue', 'questions': q_texts, 'answer': ref_text})
-                    for std in info.get('std', []):
-                        key = stid + '_' + std['xth']
-                        ans = std.get('value', '')
-                        if ans:
-                            if '/' in ans:
-                                self.debug("Fill '%s' split -> '%s'" % (ans, ans.split('/')[0].strip()))
-                                ans = ans.split('/')[0].strip()
-                            self.answers[key] = {'type': 'fill', 'answer': ans}
+                    # Build per-question reference answers from std[0] (shortest standard variant)
+                    q_answers = []
+                    for qi, q in enumerate(questions):
+                        q_ask = q.get('ask', '')
+                        q_std_list = q.get('std', [])
+                        # std is a list of acceptable answer variants; pick shortest clean one
+                        best_ans = ''
+                        if q_std_list:
+                            candidates = []
+                            for s in q_std_list:
+                                v = s.get('value', '') if isinstance(s, dict) else str(s)
+                                v = _strip_html(v)
+                                if v:
+                                    candidates.append(v)
+                            if candidates:
+                                best_ans = min(candidates, key=len)
+                        q_answers.append({'ask': q_ask, 'answer': best_ans})
+
+                    # Also store full material text for reference
+                    material_plain = _strip_html(info.get('value', ''))
+
+                    if q_answers:
+                        q_texts = [qa['ask'] for qa in q_answers]
+                        self.answers[key] = {'type': 'dialogue', 'answer': material_plain, 'questions': q_texts, 'q_answers': q_answers}
+                        self.recording_answers.append({'stid': stid, 'type': 'dialogue', 'questions': q_texts, 'answer': material_plain, 'q_answers': q_answers})
+                    elif material_plain:
+                        # Fallback: no per-question answers, use material text only
+                        self.answers[key] = {'type': 'dialogue', 'answer': material_plain, 'questions': [], 'q_answers': []}
+                        self.recording_answers.append({'stid': stid, 'type': 'dialogue', 'questions': [], 'answer': material_plain, 'q_answers': []})
             except Exception as e:
                 self.debug("Error loading %s: %s" % (d, e))
 
@@ -808,17 +823,30 @@ class ETSAutoAnswer(ETSBase):
             all_text.append('%s %s %s' % (icon, label, ('— ' + topic) if topic else ''))
             all_text.append('=' * 40)
 
-            answer_text = rec['answer']
-            answer_text = re.sub(r'<[^>]+>', '', answer_text)
-
-            all_text.append(answer_text)
-
-            # Add questions for dialogue type
-            if rtype == 'dialogue' and rec.get('questions'):
-                all_text.append('')
-                all_text.append('参考问题：')
-                for qi, q in enumerate(rec['questions']):
-                    all_text.append('  %d. %s' % (qi + 1, q))
+            # Dialogue: show per-question answers (question + reference answer)
+            if rtype == 'dialogue' and rec.get('q_answers'):
+                for qi, qa in enumerate(rec['q_answers']):
+                    all_text.append('Q%d: %s' % (qi + 1, qa.get('ask', '')))
+                    ref = qa.get('answer', '')
+                    if ref:
+                        all_text.append('  → %s' % ref)
+                    else:
+                        all_text.append('  → (无参考答案)')
+                    all_text.append('')
+                # Also show material text as context
+                material = rec.get('answer', '')
+                if material:
+                    all_text.append('📝 原文材料：')
+                    all_text.append(material)
+            else:
+                answer_text = rec['answer']
+                all_text.append(answer_text)
+                # Add questions for dialogue type (fallback, no q_answers)
+                if rtype == 'dialogue' and rec.get('questions'):
+                    all_text.append('')
+                    all_text.append('参考问题：')
+                    for qi, q in enumerate(rec['questions']):
+                        all_text.append('  %d. %s' % (qi + 1, q))
 
             if idx_r < len(self.recording_answers) - 1:
                 all_text.append('')
@@ -1500,11 +1528,11 @@ class TeeOutput:
 
 
 if __name__ == "__main__":
-    # Force UTF-8 on Windows terminals (GBK can't encode IPA/special chars)
+    # Force unbuffered output on Windows (subprocess/pipe detection hides prints)
     if sys.platform == 'win32':
         try:
-            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
         except (AttributeError, LookupError):
             pass
 

@@ -27,13 +27,14 @@ Usage:
   from ets_remote import ETSRemote
   remote = ETSRemote(current_version="0.5.1")
   info = remote.check()
-  if info and not info['allow_start']:
+  if info and not info.allow_start:
       print("远程已关闭，程序无法启动")
-  if info and info['force_update']:
-      print("版本过低，请更新到 %s" % info['latest_version'])
+  if info and info.force_update:
+      print("版本过低，请更新到 %s" % info.latest_version)
 """
 import json
 import os
+import shutil
 import sys
 import time
 import urllib.request
@@ -92,8 +93,13 @@ def compare_versions(v1, v2):
         compare_versions("1.0", "0.9.9")    →  1
     """
     def _parse(v):
+        if not v or not v.strip():
+            return [0]
         parts = []
         for p in v.strip().split('.'):
+            if not p:
+                parts.append(0)
+                continue
             try:
                 parts.append(int(p))
             except ValueError:
@@ -105,7 +111,7 @@ def compare_versions(v1, v2):
                     else:
                         break
                 parts.append(int(num) if num else 0)
-        return parts
+        return parts if parts else [0]
 
     a = _parse(v1)
     b = _parse(v2)
@@ -119,6 +125,26 @@ def compare_versions(v1, v2):
         if x > y:
             return 1
     return 0
+
+
+def classify_info(info):
+    """Unified decision: classify RemoteInfo into block / warn / normal.
+
+    Returns:
+        (level: str, reason: str)
+        level: "block" | "warn" | "normal"
+        reason: human-readable explanation (empty for normal)
+    """
+    if info is None:
+        return "normal", ""
+
+    if not info.allow_start:
+        return "block", "程序已被远程关闭"
+
+    if info.force_update:
+        return "block", "版本过低，请更新到 %s" % info.latest_version
+
+    return "normal", ""
 
 
 class ETSRemote:
@@ -141,6 +167,7 @@ class ETSRemote:
         self.repo = repo
         self.timeout = timeout
         self._cache_path = self._resolve_cache_path()
+        self._last_info = None  # Cache last check result for download_pk_extra
 
     def _resolve_cache_path(self):
         """Resolve cache file path: beside exe (PyInstaller) or beside script."""
@@ -178,7 +205,11 @@ class ETSRemote:
             return None
 
     def _save_cache(self, data):
-        """Save fetched data to local cache file."""
+        """Save fetched data to local cache file.
+
+        Uses a wrapper structure to keep internal metadata (_fetched_at, _source)
+        separate from the raw remote JSON data.
+        """
         try:
             with open(self._cache_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -190,17 +221,33 @@ class ETSRemote:
 
         Returns parsed dict or None if cache is missing/invalid/expired.
         Cache is considered valid for 24 hours.
+        Supports both the new wrapper format and the legacy flat format.
         """
         try:
             if not os.path.exists(self._cache_path):
                 return None
             with open(self._cache_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            # Check cache age (24h max)
-            fetched = data.get('_fetched_at', 0)
+                raw = json.load(f)
+
+            # New wrapper format: {"data": {...}, "_fetched_at": ..., "_source": ...}
+            if 'data' in raw and isinstance(raw.get('data'), dict):
+                fetched = raw.get('_fetched_at', 0)
+                if time.time() - fetched > 86400:
+                    return None
+                # Return in wrapper format so _parse_remote_info can extract
+                return raw
+
+            # Legacy flat format (migrate on read)
+            fetched = raw.get('_fetched_at', 0)
             if time.time() - fetched > 86400:
                 return None
-            return data
+            # Convert to wrapper format
+            data = {k: v for k, v in raw.items() if not k.startswith('_')}
+            return {
+                'data': data,
+                '_fetched_at': fetched,
+                '_source': raw.get('_source', 'cache'),
+            }
         except (OSError, json.JSONDecodeError, ValueError):
             return None
 
@@ -227,21 +274,31 @@ class ETSRemote:
                 source = name
                 break
 
-        if data is None and use_cache:
-            data = self._load_cache()
-            source = "cache"
+        now = time.time()
 
-        if data is None:
+        if data is not None:
+            # Fresh data from mirror — wrap and cache
+            cache_entry = {
+                'data': data,
+                '_fetched_at': now,
+                '_source': source,
+            }
+            self._save_cache(cache_entry)
+        elif use_cache:
+            cache_entry = self._load_cache()
+            if cache_entry is None:
+                return None
+            data = cache_entry.get('data', {})
+            source = cache_entry.get('_source', 'cache')
+            now = cache_entry.get('_fetched_at', now)
+        else:
             return None
 
-        # Save to cache with timestamp
-        data['_fetched_at'] = time.time()
-        data['_source'] = source
-        self._save_cache(data)
+        info = self._parse_remote_info(data, source, now)
+        self._last_info = info
+        return info
 
-        return self._parse_remote_info(data, source)
-
-    def _parse_remote_info(self, data, source):
+    def _parse_remote_info(self, data, source, fetched_at):
         """Parse raw JSON dict into RemoteInfo with version logic applied."""
         latest = data.get('version', '0.0.0')
         min_ver = data.get('minVer', '0.0.0')
@@ -264,27 +321,27 @@ class ETSRemote:
             pk_extra_url=pk_extra_url,
             download_url=download_url,
             source=source,
-            fetched_at=data.get('_fetched_at', time.time()),
+            fetched_at=fetched_at,
         )
 
-    def download_pk_extra(self, target_path=None):
+    def download_pk_extra(self, url=None, target_path=None):
         """Download updated pk_extra.json from remote URL.
 
-        Uses the pkExtraUrl from the last successful check().
-        Falls back to default path (beside exe/script) if target_path is None.
+        Args:
+            url: Direct URL to pk_extra.json. If None, uses the pkExtraUrl
+                 from the last successful check().
+            target_path: Local file path. If None, defaults to pk_extra.json
+                         beside the exe or script.
 
         Returns:
             (success: bool, message: str)
         """
-        # Try to get URL from latest remote info
-        info = self.check()
-        if info is None:
-            # Fall back to cache
-            info = self.check(use_cache=True)
-        if info is None or not info.pk_extra_url:
-            return False, "无法获取 pk_extra.json 下载地址"
-
-        url = info.pk_extra_url
+        if url is None:
+            # Use cached info from last check (no extra network call)
+            if self._last_info is not None and self._last_info.pk_extra_url:
+                url = self._last_info.pk_extra_url
+            else:
+                return False, "无法获取 pk_extra.json 下载地址"
 
         # Resolve target path
         if target_path is None:
@@ -298,18 +355,21 @@ class ETSRemote:
         backup_path = target_path + '.bak'
         if os.path.exists(target_path):
             try:
-                import shutil
                 shutil.copy2(target_path, backup_path)
             except OSError:
                 pass  # Backup failure is non-critical
 
-        # Download with same mirror fallback pattern
-        # If pkExtraUrl is a GitHub raw URL, try ghproxy first
+        # Build download URL list with mirror fallback
         download_urls = [url]
         if 'raw.githubusercontent.com' in url:
             download_urls.insert(0, url.replace(
                 'https://raw.githubusercontent.com',
                 'https://ghfast.top/https://raw.githubusercontent.com'))
+            # Also try gitee mirror (same pattern as info.json)
+            gitee_url = url.replace(
+                'https://raw.githubusercontent.com',
+                'https://gitee.com').replace('/main/', '/raw/main/')
+            download_urls.append(gitee_url)
 
         for dl_url in download_urls:
             try:
@@ -333,7 +393,6 @@ class ETSRemote:
         # Restore backup if download failed
         if os.path.exists(backup_path):
             try:
-                import shutil
                 shutil.copy2(backup_path, target_path)
             except OSError:
                 pass
@@ -349,15 +408,20 @@ def format_update_message(info, current_version=""):
     """Format a human-readable update/announcement message for GUI display.
 
     Returns None if there's nothing to show.
+    Uses classify_info() to avoid duplicating block-logic.
     """
     if info is None:
         return None
 
+    level, reason = classify_info(info)
     lines = []
 
-    if info.force_update:
-        lines.append("⚠️ 版本过低，必须更新！")
-        lines.append("当前版本：%s → 最新版本：%s" % (current_version or "?", info.latest_version))
+    if level == "block":
+        if info.force_update:
+            lines.append("⚠️ 版本过低，必须更新！")
+            lines.append("当前版本：%s → 最新版本：%s" % (current_version or "?", info.latest_version))
+        else:
+            lines.append("🚫 %s" % reason)
         if info.download_url:
             lines.append("下载地址：%s" % info.download_url)
 
@@ -370,9 +434,7 @@ def format_update_message(info, current_version=""):
         lines.append("")
         lines.append("📢 %s" % info.announcement)
 
-    if not info.allow_start:
-        lines.append("")
-        lines.append("🚫 程序已被远程关闭，暂时无法使用")
+    # Don't duplicate block reason in message — classify_info already handles it
 
     return '\n'.join(lines) if lines else None
 
@@ -381,15 +443,9 @@ def should_block_start(info):
     """Check if the app should be blocked from starting.
 
     Returns (blocked: bool, reason: str).
+    Delegates to classify_info() for unified decision logic.
     """
-    if info is None:
-        # Can't reach remote and no cache — allow start (fail-open)
-        return False, ""
-
-    if not info.allow_start:
-        return True, "程序已被远程关闭"
-
-    if info.force_update:
-        return True, "版本过低，请更新到 %s" % info.latest_version
-
+    level, reason = classify_info(info)
+    if level == "block":
+        return True, reason
     return False, ""

@@ -1,4 +1,33 @@
-﻿# Changelog
+# Changelog
+
+## [0.6.1] - 2026-06-15
+
+### Added
+- **dialogue 逐题参考答案** — load_answers() 不再将全文材料当作每题答案，改为从 `question[].std` 提取每道题的最短标准参考答案；新增 `q_answers` 字段 (`[{ask, answer}, ...]`)
+- **答案类型标签** — show_answers() 区分 CHS/FIL/PIC/RD/DLG 五种标签，不再将 picture/read/dialogue 全部标为 `[FIL]`
+- **顶层 import re** — 修复展示窗口中 `re.sub()` 缺少 re 模块导致的潜在 NameError
+
+### Changed
+- **HTML 标签统一清理** — 新增 `_strip_html()` 工具函数，保留段落换行（`</p><p>` → `\n`，`<br>` → `\n`），适用于 read/picture/dialogue 三种题型
+- **展示窗口冗余清理移除** — show_recording_answers_window() 不再对已清理的 answer 重复执行 `re.sub` 去 HTML
+- **docstring 位置修正** — load_answers() 的 docstring 从 `_strip_html` 定义后移回函数体开头
+
+### Fixed
+- **dialogue 答案错位** — 旧逻辑将全文 material value 当作每题答案，实际答案在 `question[].std[].value` 中
+- **picture/read 答案含 HTML 残留** — `<p>`、`<br>` 标签未清理，现已统一通过 `_strip_html()` 处理
+- **stdout 无输出** — Windows 下 Python 默认缓冲导致 print 不及时，`__main__` 入口添加 `line_buffering=True`
+- **show_answers 类型标签** — picture 标为 `[FIL]`，dialogue 标为 `[FIL]`，read 标为 `[FIL]`，现已正确区分
+
+## [0.6.0] - 2026-06-01
+
+### Added
+- **远程配置 ets_remote.py** — 版本比较(semantic versioning)、强制更新(minVer阈值)、远程开关(allowStart杀开关)、公告推送、pk_extra.json静默热更新
+- **多源容灾** — 三级CDN回退：ghproxy → gitee → github，每源8s超时
+- **GUI集成** — 启动时后台检查远程配置，版本过低或远程关闭时禁用开始按钮，有公告时日志提示
+- **pk_extra.json 自动更新** — 检测到远程URL后后台静默下载覆盖，自动备份旧文件
+- **本地缓存** — remote_info_cache.json 24小时缓存，断网时回退
+- **ets_auto.py __version__** — 新增版本常量，与 GUI APP_VERSION 同步
+- **info.json 示例** — GitHub仓库根目录配置文件模板
 
 ## [0.5.1] - 2026-05-31
 

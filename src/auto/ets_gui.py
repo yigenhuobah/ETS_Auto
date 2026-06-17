@@ -228,9 +228,9 @@ class ETSApp(ctk.CTk):
         # Guard: check remote info before starting (may block start)
         if self._remote_info is not None:
             try:
-                from ets_remote import should_block_start
-                blocked, reason = should_block_start(self._remote_info)
-                if blocked:
+                from ets_remote import classify_info
+                level, reason = classify_info(self._remote_info)
+                if level == "block":
                     self._append_log("[远程] ⛔ %s\n" % reason)
                     if self._remote_info.download_url:
                         self._append_log("[远程] 下载地址：%s\n" % self._remote_info.download_url)
@@ -297,11 +297,11 @@ class ETSApp(ctk.CTk):
 
     def _on_remote_checked(self, info):
         """Handle remote check result on main thread."""
-        from ets_remote import should_block_start, format_update_message
+        from ets_remote import classify_info, format_update_message
 
-        # Check if app should be blocked
-        blocked, reason = should_block_start(info)
-        if blocked:
+        # Unified block/normal decision
+        level, reason = classify_info(info)
+        if level == "block":
             self._status_var.set("⛔ %s" % reason)
             self._start_btn.configure(state="disabled")
             self._append_log("[远程] ⛔ %s\n" % reason)
@@ -316,46 +316,29 @@ class ETSApp(ctk.CTk):
 
         # Auto-download pk_extra.json update if URL available
         if info.pk_extra_url:
-            self._try_update_pk_extra(info.pk_extra_url)
+            self._try_update_pk_extra()
 
-    def _try_update_pk_extra(self, url):
-        """Attempt silent pk_extra.json update in background."""
+    def _try_update_pk_extra(self):
+        """Attempt silent pk_extra.json update in background.
+
+        Delegates to ETSRemote.download_pk_extra() for mirror fallback,
+        backup/restore, and JSON validation.
+        """
         def _worker():
             try:
-                import urllib.request, json, os, sys, shutil
-                target = os.path.join(
-                    os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
-                    else os.path.dirname(os.path.abspath(__file__)),
-                    'pk_extra.json')
-                # Backup
-                if os.path.exists(target):
-                    try:
-                        shutil.copy2(target, target + '.bak')
-                    except OSError:
-                        pass
-                # Download with ghproxy fallback
-                urls = [url]
-                if 'raw.githubusercontent.com' in url:
-                    urls.insert(0, url.replace(
-                        'https://raw.githubusercontent.com',
-                        'https://ghfast.top/https://raw.githubusercontent.com'))
-                for u in urls:
-                    try:
-                        req = urllib.request.Request(u, headers={
-                            'User-Agent': 'ETS_Auto/%s' % APP_VERSION})
-                        with urllib.request.urlopen(req, timeout=8) as resp:
-                            if resp.status == 200:
-                                raw = resp.read()
-                                json.loads(raw)
-                                with open(target, 'wb') as f:
-                                    f.write(raw)
-                                self.after(0, lambda: self._append_log(
-                                    "[远程] pk_extra.json 已更新 (%d bytes)\n" % len(raw)))
-                                return
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+                from ets_remote import ETSRemote
+                remote = ETSRemote(current_version=APP_VERSION)
+                # Use the URL from last check (stored in remote._last_info)
+                # Pass url=None so download_pk_extra uses cached info
+                success, message = remote.download_pk_extra(url=None)
+                if success:
+                    self.after(0, lambda: self._append_log(
+                        "[远程] %s\n" % message))
+                else:
+                    self.after(0, lambda: self._append_log(
+                        "[远程] ⚠️ %s\n" % message))
+            except Exception as e:
+                pass  # pk_extra update is non-critical
 
         threading.Thread(target=_worker, daemon=True).start()
 
