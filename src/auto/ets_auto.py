@@ -15,8 +15,8 @@ from urllib.parse import urlparse, parse_qs
 from urllib.error import URLError
 
 # Version constant — keep in sync with ets_gui.py APP_VERSION
-__version__ = "0.6.1"
-from ets_common import ETSBase
+__version__ = "0.6.2"
+from ets_common import ETSBase, force_utf8_stdio
 from ets_strategy import ETSStrategy
 
 
@@ -35,11 +35,9 @@ class ETSAutoAnswer(ETSBase):
         self.strategy = ETSStrategy()  # strategy layer for local answer lookup
         self.rw_mode = False  # read-write (读写同步) mode flag
         self.rw_show_data = None  # cached showData from iframe
-        # Callback hooks (set via on_* methods or direct assignment)
-        self._on_connect = None           # fn(ets_base, set_id, mode, total_questions)
+        self._rw_cache_time = 0   # timestamp when rw_show_data was fetched
+        # Legacy callback (not in base — specific to exam mode)
         self._on_question_answered = None # fn(qid, answer, qtype) where qtype='choose'|'fill'
-        self._on_complete = None          # fn(stats_dict)
-        self._on_error = None             # fn(error_msg)
         self.stats = {
             'choose_answered': 0, 'choose_skip': 0,
             'fill_answered': 0, 'fill_skip': 0,
@@ -64,21 +62,9 @@ class ETSAutoAnswer(ETSBase):
             print("  %s %s → %s" % (tag, key, val['answer']))
         print("\n%d total answers" % len(self.answers))
 
-    def on_connect(self, fn):
-        """Register callback: fn(ets_base, set_id, mode, total_questions)."""
-        self._on_connect = fn
-
     def on_question_answered(self, fn):
-        """Register callback: fn(qid, answer, qtype). Called per question."""
+        """Register callback: fn(qid, answer, qtype). Called per question (exam-specific)."""
         self._on_question_answered = fn
-
-    def on_complete(self, fn):
-        """Register callback: fn(stats_dict). Called when exam ends."""
-        self._on_complete = fn
-
-    def on_error(self, fn):
-        """Register callback: fn(error_msg). Called on non-fatal errors."""
-        self._on_error = fn
 
     # ── Connection ────────────────────────────────────────────
 
@@ -225,7 +211,7 @@ class ETSAutoAnswer(ETSBase):
             mode = "HOMEWORK" if info.get('nativeChoose') else "PRACTICE"
             self.debug("Bridge: " + mode)
             return info
-        except:
+        except Exception:
             self.debug("Bridge result: " + str(result))
             return {}
 
@@ -269,17 +255,25 @@ class ETSAutoAnswer(ETSBase):
         self.rw_mode = False
         return False
 
+    _RW_CACHE_TTL = 30  # seconds before rw_show_data cache expires
+
     def get_rw_show_data(self):
-        """Get showData from read-write iframe. Contains all questions + answers."""
-        if self.rw_show_data:
+        """Get showData from read-write iframe. Contains all questions + answers.
+        Cached with 30s TTL to avoid stale data on AJAX page updates."""
+        if self.rw_show_data and (time.time() - self._rw_cache_time < self._RW_CACHE_TTL):
             return self.rw_show_data
         js = '(function(){\n        try {\n        %s;\n            if (!iframe) return JSON.stringify({error: "no read-write iframe"});\n            var data = iframe.contentWindow.showData;\n            if (!data) return JSON.stringify({error: "no showData"});\n            return JSON.stringify(data);\n        } catch(e) { return JSON.stringify({error: e.message}); }\n        })()' % self._RW_IFRAME_FINDER
         result = self.eval_js(js)
         if result:
             try:
-                self.rw_show_data = json.loads(result)
+                parsed = json.loads(result)
+                # Don't cache error responses — they must be retried
+                if isinstance(parsed, dict) and parsed.get('error'):
+                    return None
+                self.rw_show_data = parsed
+                self._rw_cache_time = time.time()
                 return self.rw_show_data
-            except:
+            except Exception:
                 pass
         return None
 
@@ -291,14 +285,14 @@ class ETSAutoAnswer(ETSBase):
         if result:
             try:
                 return json.loads(result)
-            except:
+            except Exception:
                 pass
         return {"error": str(result)}
 
     def answer_rw_choose(self):
         """Answer all visible choice questions in read-write mode.
         Uses showData for answers, clicks li.pointer[data-option].
-        Matches questions by index (page order == showData order)."""
+        Matches questions by qid (data-id attribute) instead of index."""
         show_data = self.get_rw_show_data()
         if not show_data or show_data.get('error'):
             self.debug("RW: No showData available")
@@ -318,46 +312,69 @@ class ETSAutoAnswer(ETSBase):
         if not page_questions:
             return False, False
 
-        # Build flat answer list from showData: each question has info[].answer
-        # A question may have multiple sub-questions (info items)
-        answer_list = []  # [(qid, answer_letter)]
+        # Build answer dict from showData: qid → [answer_letter, ...]
+        # Each question may have multiple sub-questions (info items)
+        answer_dict = {}  # {qid: [letter1, letter2, ...]}
         for q in questions:
             qid = q.get('id', '')
             info_list = q.get('info', [])
-            if info_list:
-                for info_item in info_list:
-                    ans = info_item.get('answer', '')
-                    if ans:
-                        answer_list.append((qid, ans.upper()))
+            letters = []
+            for info_item in info_list:
+                ans = info_item.get('answer', '')
+                if ans:
+                    letters.append(ans.upper())
+            if letters:
+                answer_dict[qid] = letters
 
         any_new = False
         all_done = True
 
-        # Match by index: page_questions[i] ↔ answer_list[i]
+        # Match by qid: page_questions → answer_dict
         for i, pq in enumerate(page_questions):
             if pq.get('any_selected'):
                 self.debug("RW Q#%d already selected" % (i + 1))
                 continue
             all_done = False
 
-            if i >= len(answer_list):
-                self.debug("RW Q#%d: no answer in showData (only %d answers)" % (i + 1, len(answer_list)))
+            pqid = pq.get('qid', '')
+            letters = answer_dict.get(pqid)
+            if not letters:
+                self.debug("RW Q#%d (qid:%s): no answer in showData" % (i + 1, pqid))
                 continue
 
-            qid, answer = answer_list[i]
+            # Use the first unselected sub-question's answer
+            # (determine which sub-question index this is by counting already-answered
+            #  siblings — for single-answer questions, just use letters[0])
+            answer = letters[0] if letters else None
+            if not answer:
+                continue
 
-            # Click the option matching the answer letter
-            js_click = '(function(){\n            try {\n            %s;\n                if (!iframe) return "no iframe";\n                var doc = iframe.contentDocument;\n                var uls = doc.querySelectorAll("ul[data-id]");\n                var ul = uls[%d];\n                if (!ul) return "no ul at index %d";\n                var li = ul.querySelector("li.pointer[data-option=\'%s\']");\n                if (!li) return "no li for option %s";\n                li.click();\n                return "clicked %s";\n            } catch(e) { return "error: " + e.message; }\n            })()' % (self._RW_IFRAME_FINDER, i, i, answer, answer, answer)
+            # Validate: answer must be a single letter A-Z
+            if not re.match(r'^[A-Z]$', answer):
+                self.debug("RW Q#%d: invalid answer '%s', skipping" % (i + 1, answer))
+                continue
+
+            # Click the option matching the answer letter (escape for JS safety)
+            safe_answer = self.js_escape(answer)
+            js_click = '(function(){\n            try {\n            %s;\n                if (!iframe) return "no iframe";\n                var doc = iframe.contentDocument;\n                var uls = doc.querySelectorAll("ul[data-id]");\n                var ul = uls[%d];\n                if (!ul) return "no ul at index %d";\n                var li = ul.querySelector("li.pointer[data-option=\'%s\']");\n                if (!li) return "no li for option %s";\n                li.click();\n                return "clicked %s";\n            } catch(e) { return "error: " + e.message; }\n            })()' % (self._RW_IFRAME_FINDER, i, i, safe_answer, safe_answer, safe_answer)
             result = self.eval_js(js_click)
-            self.debug("RW click Q#%d: %s" % (i + 1, str(result)))
+            self.debug("RW click Q#%d (qid:%s): %s" % (i + 1, pqid, str(result)))
             if 'clicked' in str(result):
                 any_new = True
                 self.stats['choose_answered'] += 1
-                print("  RW Q#%d (id:%s) → %s" % (i + 1, qid, answer))
+                print("  RW Q#%d (id:%s) → %s" % (i + 1, pqid, answer))
                 if self._on_question_answered:
                     try:
-                        self._on_question_answered(str(qid), answer, 'choose')
-                    except:
+                        self._on_question_answered(str(pqid), answer, 'choose')
+                    except Exception:
+                        pass
+                if self._on_question:
+                    try:
+                        self._on_question({'type': 'choose', 'type_label': '选择题(RW)',
+                                           'qid': str(pqid), 'answer': answer,
+                                           'answered': self.stats['choose_answered'],
+                                           'total_questions': self.total_questions})
+                    except Exception:
                         pass
 
         return any_new, all_done
@@ -383,7 +400,7 @@ class ETSAutoAnswer(ETSBase):
                 self.stats['next_click'] += 1
                 self.debug("RW Next: 下一步 clicked")
             return r
-        except:
+        except Exception:
             return {"success": False, "reason": str(result)}
 
     # ── Answer Loading ────────────────────────────────────────
@@ -396,6 +413,8 @@ class ETSAutoAnswer(ETSBase):
             t = _html_re.sub(r'</p>\s*<p[^>]*>', '\n', t)
             t = _html_re.sub(r'<br\s*/?>', '\n', t)
             t = _html_re.sub(r'<[^>]+>', '', t)
+            t = _html_re.sub(r' {2,}', ' ', t)      # collapse multiple spaces
+            t = _html_re.sub(r'\n{3,}', '\n\n', t)  # collapse 3+ newlines to 2
             return t.strip()
         if not self.set_id:
             print("ERROR: No set_id available (not in Pinia, not in URL)")
@@ -437,10 +456,16 @@ class ETSAutoAnswer(ETSBase):
                         key = stid + '_' + std['xth']
                         ans = std.get('value', '')
                         if ans:
+                            alternatives = []
                             if '/' in ans:
-                                self.debug("Fill '%s' split -> '%s'" % (ans, ans.split('/')[0].strip()))
-                                ans = ans.split('/')[0].strip()
+                                parts = [p.strip() for p in ans.split('/') if p.strip()]
+                                ans = parts[0]
+                                alternatives = parts[1:]
+                                self.debug("Fill split '%s' -> '%s' + alts %s" % (
+                                    '/'.join(parts), ans, alternatives))
                             self.answers[key] = {'type': 'fill', 'answer': ans}
+                            if alternatives:
+                                self.answers[key]['alternatives'] = alternatives
                 elif stype == 'collector.read':
                     key = stid
                     ref_text = _strip_html(info.get('value', ''))
@@ -558,7 +583,7 @@ class ETSAutoAnswer(ETSBase):
         result = self.eval_js(js)
         try:
             return json.loads(result) if result else {}
-        except:
+        except Exception:
             return {"error": str(result)}
 
     # ── Choose Answer ─────────────────────────────────────────
@@ -609,7 +634,10 @@ class ETSAutoAnswer(ETSBase):
 
             answer_letter = ans['answer'].upper()
             answer_map = {'A': '1', 'B': '2', 'C': '3', 'D': '4', 'E': '5', 'F': '6', 'G': '7'}
-            target_idx = answer_map.get(answer_letter, '1')
+            target_idx = answer_map.get(answer_letter)
+            if target_idx is None:
+                self.debug("Q:%s invalid answer letter '%s', skipping" % (qid, answer_letter))
+                continue
             target_id = qid + '_' + target_idx
             print("  Choose Q:%s -> %s" % (qid, answer_letter))
 
@@ -666,6 +694,10 @@ class ETSAutoAnswer(ETSBase):
                         self._on_question_answered(qid, answer_letter, 'choose')
                     except Exception as e:
                         self.debug("on_question_answered error: " + str(e))
+                self._fire_question({'type': 'choose', 'type_label': '选择题',
+                                           'qid': qid, 'answer': answer_letter,
+                                           'answered': self.stats['choose_answered'],
+                                           'total_questions': self.total_questions})
                 any_new = True
             else:
                 self.debug("Q:%s polling failed" % qid)
@@ -705,6 +737,7 @@ class ETSAutoAnswer(ETSBase):
                     ans = strat_ans
 
             value = ans['answer']
+            alternatives = ans.get('alternatives', [])
 
             if inp.get('value') and inp['value'].strip():
                 if inp['value'].strip().lower() == value.strip().lower():
@@ -712,7 +745,10 @@ class ETSAutoAnswer(ETSBase):
                     self.stats['fill_skip'] += 1
                     continue
 
-            print("  Fill %s = %s" % (inp_id, value))
+            print("  Fill %s = %s" % (inp_id, value), end='')
+            if alternatives:
+                print(" (alts: %s)" % ', '.join(alternatives), end='')
+            print()
             safe_val = self.js_escape(value)
 
             js_fill = '''(function(){
@@ -750,6 +786,10 @@ class ETSAutoAnswer(ETSBase):
                     self._on_question_answered(inp_id, value, 'fill')
                 except Exception as e:
                     self.debug("on_question_answered error: " + str(e))
+            self._fire_question({'type': 'fill', 'type_label': '填空题',
+                                       'qid': inp_id, 'answer': value,
+                                       'answered': self.stats['fill_answered'],
+                                       'total_questions': self.total_questions})
             any_new = True
 
         if any_new:
@@ -973,8 +1013,9 @@ class ETSAutoAnswer(ETSBase):
 
     def _all_sidebar_correct(self):
         """Check if all sidebar question items are marked is-correct (exam/homework complete).
-        Returns True only if sidebar exists, all items are is-correct,
-        AND we have answered at least as many questions as total_questions."""
+        Returns True if sidebar exists and all items are is-correct.
+        Note: does NOT require answered >= total_questions because sidebar may include
+        recording questions (picture/dialogue/read) that we don't track in choose/fill stats."""
         js = '''(function(){
         var orders = document.querySelectorAll('.question-order');
         if (!orders || orders.length === 0) return JSON.stringify({hasSidebar: false});
@@ -987,13 +1028,10 @@ class ETSAutoAnswer(ETSBase):
         })()'''
         try:
             result = json.loads(self.eval_js(js) or '{}')
-            # Only declare complete if sidebar all correct AND we've answered enough
             if result.get('allCorrect'):
-                answered = self.stats['choose_answered'] + self.stats['fill_answered']
-                if answered >= self.total_questions:
-                    return True
+                return True
             return False
-        except:
+        except Exception:
             return False
 
     # ── Main Loop ─────────────────────────────────────────────
@@ -1036,17 +1074,20 @@ class ETSAutoAnswer(ETSBase):
         print("Questions in showData: %d" % len(questions))
 
         # Build answer summary from showData
+        rw_count = 0
         for q in questions:
             qid = q.get('id', '')
             info_list = q.get('info', [])
-            if info_list:
-                ans = info_list[0].get('answer', '')
+            for idx_i, info_item in enumerate(info_list):
+                ans = info_item.get('answer', '')
                 if ans:
-                    self.answers['rw_' + str(qid)] = {'type': 'choose', 'answer': ans.upper()}
-                    print("  Q:%s → %s" % (qid, ans.upper()))
+                    key = 'rw_' + str(qid) + ('_%d' % idx_i if len(info_list) > 1 else '')
+                    self.answers[key] = {'type': 'choose', 'answer': ans.upper()}
+                    print("  Q:%s [%d] → %s" % (qid, idx_i, ans.upper()))
+                    rw_count += 1
 
-        self.total_questions = len(self.answers)
-        print("Total answers: %d" % self.total_questions)
+        self.total_questions = rw_count
+        print("Total RW answers: %d" % self.total_questions)
 
         step = 0
         consecutive_empty = 0
@@ -1154,7 +1195,7 @@ class ETSAutoAnswer(ETSBase):
                     if not url or 'readingWriting' not in (url or ''):
                         print("RW: Page changed, task may be complete.")
                         break
-                except:
+                except Exception:
                     pass
 
         # Summary
@@ -1174,7 +1215,7 @@ class ETSAutoAnswer(ETSBase):
         if self.ws:
             try:
                 self.ws.close()
-            except:
+            except Exception:
                 pass
 
         return result
@@ -1197,7 +1238,21 @@ class ETSAutoAnswer(ETSBase):
         consecutive_empty = 0
         step = 0
 
+        # ── Adaptive thresholds ──────────────────────────────────────────
+        # Hardcoded thresholds (5/10) cause premature termination on jittery
+        # networks.  Instead, scale with exam size and use exponential backoff.
+        consecutive_choose_empty = 0   # Empty after choose section
+        consecutive_unreachable = 0    # iframe not ready
+        # Adaptive max: more questions → more tolerance
+        max_empty = min(5 + max(self.total_questions, 1) // 5, 15)
+        max_unreachable = min(8 + max(self.total_questions, 1) // 3, 25)
+        self.debug("Thresholds: max_empty=%d, max_unreachable=%d" % (max_empty, max_unreachable))
+
         while True:
+            # ── Stop check (GUI button / external signal) ──
+            if self.stop_event and self.stop_event.is_set():
+                break
+
             # ── Hotkey checks ──
             if hotkey and hotkey.should_stop:
                 print("\n🛑 Emergency stop (F12)")
@@ -1217,11 +1272,13 @@ class ETSAutoAnswer(ETSBase):
             # Check if recording window was closed (user signal to stop)
             if self._recording_window_closed:
                 print("\nRecording window closed - stopping script")
+                self.stop_event.set()
                 break
 
             step += 1
             if step > max_steps:
                 print("\nSafety limit reached (%d steps)" % max_steps)
+                self.stop_event.set()
                 break
 
             ready, _ = self.wait_iframe_ready()
@@ -1240,16 +1297,39 @@ class ETSAutoAnswer(ETSBase):
                     if ready2:
                         break
                 else:
-                    consecutive_empty += 1
-                    if consecutive_empty >= 10:
-                        print("Too many unreachable pages, stopping.")
+                    consecutive_unreachable += 1
+                    if consecutive_unreachable >= max_unreachable:
+                        print("Too many unreachable pages (%d), stopping." % consecutive_unreachable)
                         break
+                    # Exponential backoff: 2s, 4s, 8s (cap at 8s)
+                    backoff = min(2 * (2 ** (consecutive_unreachable - 1)), 8)
+                    self.debug("  Unreachable page %d, backoff %.0fs" % (consecutive_unreachable, backoff))
+                    self.interruptible_sleep(backoff)
                     continue
                 state = self.get_page_state()
+                consecutive_unreachable = 0
                 consecutive_empty = 0
             else:
+                consecutive_unreachable = 0
                 consecutive_empty = 0
                 state = self.get_page_state()
+
+            # ── Real-time question info for GUI ──
+            if self._on_question:
+                try:
+                    q_info = {'step': step, 'total_questions': self.total_questions}
+                    if state.get('hasChoice'):
+                        q_info['type'] = 'choose'
+                        q_info['type_label'] = '选择题'
+                    elif state.get('hasInput'):
+                        q_info['type'] = 'fill'
+                        q_info['type_label'] = '填空题'
+                    else:
+                        q_info['type'] = 'transition'
+                        q_info['type_label'] = '过渡页'
+                    self._on_question(q_info)
+                except Exception:
+                    pass
 
             if state.get('hasChoice'):
                 any_new, likely_done = self.answer_choose()
@@ -1283,7 +1363,11 @@ class ETSAutoAnswer(ETSBase):
                         print("Exam completed")
                         break
                 if not any_new:
+                    consecutive_choose_empty += 1
                     consecutive_empty += 1
+                    if consecutive_choose_empty >= 3 and self._all_sidebar_correct():
+                        print("All choices correct but next not advancing — exam may be complete")
+                        break
                     nr = self.click_next()
                     if nr.get('success'):
                         self.interruptible_sleep(0.6)
@@ -1293,18 +1377,24 @@ class ETSAutoAnswer(ETSBase):
                         self.debug("  Next disabled/hidden (no choice answer), waiting...")
                         if self._wait_for_next(max_wait_loops=30, wait_sec=2, label="choice-no-answer"):
                             consecutive_empty = 0
+                            consecutive_choose_empty = 0
                             continue
                         print("Exam completed (next disabled/hidden, no answer)")
                         break
                     elif nr.get('reason') == 'not found':
                         if self._wait_for_next(max_wait_loops=10, wait_sec=2, label="choice-no-ans-load"):
                             consecutive_empty = 0
+                            consecutive_choose_empty = 0
                             continue
-                        consecutive_empty = 10
+                        consecutive_empty = max_empty
+                        consecutive_choose_empty = max_empty
                     else:
-                        consecutive_empty = 10
+                        consecutive_empty = max_empty
+                        consecutive_choose_empty = max_empty
             elif state.get('hasInput'):
                 any_new, has_fills = self.answer_fill()
+                if any_new:
+                    consecutive_empty = 0
                 if has_fills and not any_new:
                     nr = self.click_next()
                     if nr.get('success'):
@@ -1326,11 +1416,18 @@ class ETSAutoAnswer(ETSBase):
             else:
                 # No choices AND no inputs — section transition
                 consecutive_empty += 1
-                self.debug("Section transition, waiting... (empty %d)" % consecutive_empty)
-                if consecutive_empty >= 5:
-                    print("Too many empty pages, stopping.")
+                self.debug("Section transition, waiting... (empty %d/%d)" % (consecutive_empty, max_empty))
+                if consecutive_empty >= max_empty:
+                    # Before stopping, do one last check — maybe we're on result page
+                    url = self.tab.get('url', '')
+                    if 'Result' in url or 'mockExamResult' in url:
+                        print("Exam completed (result page reached)")
+                        break
+                    print("Too many empty pages (%d), stopping." % consecutive_empty)
                     break
-                self.interruptible_sleep(2)
+                # Gentle backoff for section transitions: 2s, 2.5s, 3s...
+                backoff = min(2 + consecutive_empty * 0.5, 6)
+                self.interruptible_sleep(backoff)
                 continue
 
             self.interruptible_sleep(0.3)
@@ -1382,12 +1479,18 @@ class ETSAutoAnswer(ETSBase):
         if self.stats['errors']:
             print("Errors: %d" % self.stats['errors'])
 
+        # Recovery hint for early termination
+        if 0 < total_done < self.total_questions:
+            pct_val = total_done / self.total_questions * 100 if self.total_questions else 0
+            if pct_val < 90:
+                print("\n💡 Tip: Script stopped early. Possible causes:")
+                print("   - Network jitter (try again)")
+                print("   - Page loaded slowly (increase wait with F9 pause)")
+                print("   - Exam already completed (check result page)")
+                print("   Re-run the script to resume from where it left off.")
+
         # Fire on_complete callback
-        if self._on_complete:
-            try:
-                self._on_complete(result)
-            except Exception as e:
-                self.debug("on_complete callback error: " + str(e))
+        self._fire_complete(result)
 
         # Cleanup WebSocket
         if self.ws:
@@ -1413,12 +1516,20 @@ class ETSAutoAnswer(ETSBase):
 
         try:
             self.connect()
-        except urllib.error.URLError as e:
-            print("\n连接失败: %s" % e)
-            print("请检查: 1) e听说PC端已启动  2) 调试端口 %d 正确" % self.port)
+        except URLError as e:
+            print("\n❌ 连接失败: %s" % e)
+            print("诊断：")
+            print("  1. e听说PC端是否已启动？")
+            print("  2. 调试端口 %d 是否正确？")
+            print("  3. Chrome --remote-debugging-port=%d 是否开启？" % self.port)
+            return
+        except ConnectionRefusedError:
+            print("\n❌ 连接被拒绝 (端口 %d)" % self.port)
+            print("诊断：e听说PC端可能未启动，或端口不匹配")
             return
         except Exception as e:
-            print("\n连接失败: %s" % e)
+            print("\n❌ 连接失败: %s" % e)
+            print("诊断：请确认 e听说PC端已启动且调试端口 %d 正确" % self.port)
             return
 
         if 'Result' in self.tab.get('url', ''):
@@ -1439,6 +1550,8 @@ class ETSAutoAnswer(ETSBase):
         print("Mode: %s | Questions: %d" % (mode_str, self.total_questions))
 
         # Fire on_connect callback AFTER load_answers so total_questions is populated
+        # Note: exam mode passes extra args (ets_base, set_id, homework_mode, total_questions)
+        # The base _fire_connect only passes self; for backward compat, call directly
         if self._on_connect:
             try:
                 self._on_connect(self.ets_base, self.set_id, self.homework_mode, self.total_questions)
@@ -1463,10 +1576,17 @@ class ETSAutoAnswer(ETSBase):
             def _poll_worker():
                 if not t.is_alive():
                     # Worker finished — destroy window to exit mainloop
-                    if self._tk_root and self._tk_root.winfo_exists():
-                        self._tk_root.destroy()
+                    try:
+                        if self._tk_root and self._tk_root.winfo_exists():
+                            self._tk_root.destroy()
+                    except Exception:
+                        pass
                     return
-                self._tk_root.after(500, _poll_worker)
+                try:
+                    if self._tk_root and self._tk_root.winfo_exists():
+                        self._tk_root.after(500, _poll_worker)
+                except Exception:
+                    pass  # root destroyed by user closing window
             # _poll_worker is registered inside show_recording_answers_window
             # after self._tk_root is created, avoiding AttributeError
             self.show_recording_answers_window(poll_worker_fn=_poll_worker)  # blocks on mainloop
@@ -1529,12 +1649,7 @@ class TeeOutput:
 
 if __name__ == "__main__":
     # Force unbuffered output on Windows (subprocess/pipe detection hides prints)
-    if sys.platform == 'win32':
-        try:
-            sys.stdout.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
-            sys.stderr.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
-        except (AttributeError, LookupError):
-            pass
+    force_utf8_stdio(line_buffering=True)
 
     import argparse
     parser = argparse.ArgumentParser(description="ETS Exam Auto — e听说PC端套卷自动答题")

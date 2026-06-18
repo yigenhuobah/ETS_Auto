@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.6.2] - 2026-06-19
+
+### Added
+- **回调钩子系统** — ETSBase 新增 on_connect/on_question/on_complete/on_error 回调，支持外部监听答题进度
+- **force_utf8_stdio()** — ets_common 新增统一 UTF-8 输出设置函数，支持 line_buffering 参数
+- **导出MD文件存在确认** — 桌面已存在同名文件时弹窗询问是否覆盖
+- **导出成功反馈** — MD导出后弹窗显示保存路径
+- **HTML图片嵌入** — 图片题在打印/预览HTML中嵌入base64图片，打印时可见
+- **MD图片引用** — 图片题在导出Markdown中引用本地图片绝对路径
+- **pre_release_test 扩展** — 新增 ets_browser_ui 导入、force_utf8_stdio、回调钩子测试，共20项
+
+### Changed
+- **UI 代码分离** — ets_parser.py 的浏览器 UI 代码提取到 ets_browser_ui.py，create_browser_tab 委托调用
+- **UTF-8 去重** — ets_auto/ets_word_pk/ets_gui 中的重复 stdout reconfigure 代码统一为 force_utf8_stdio() 调用
+- **并发控制** — ets_auto.py 的 `_run_loop` 添加 `threading.Event`，异常终止设 stop_event，正常完成不设
+- **策略层缓存** — ETSStrategy 添加类级 `_set_cache`，`load_set()` 先查缓存避免重复加载
+
+### Fixed
+- **ets_remote 缓存防御** — _load_cache 添加 `isinstance(raw, dict)` 检查，防止缓存文件格式异常时崩溃
+
 ## [0.6.1] - 2026-06-15
 
 ### Added

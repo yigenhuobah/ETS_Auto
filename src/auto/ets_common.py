@@ -8,7 +8,28 @@ Provides ETSBase class with:
   - Debug logging helper
   - JS string escaping utility
 """
-import json, time, urllib.request, websocket, os, threading
+import json, time, urllib.request, websocket, os, sys, threading
+
+
+def force_utf8_stdio(line_buffering=False):
+    """Force stdout/stderr to UTF-8 on Windows to avoid GBK encoding errors.
+
+    Call this at module level or in __main__ to ensure IPA, CJK and other
+    non-ASCII characters print correctly in Windows terminals.
+
+    Args:
+        line_buffering: If True, use line-buffered stdout (for subprocess pipes).
+    """
+    if sys.platform != 'win32':
+        return
+    os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace',
+                               line_buffering=line_buffering)
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace',
+                               line_buffering=line_buffering)
+    except (AttributeError, LookupError):
+        pass
 
 
 class ETSBase:
@@ -16,6 +37,12 @@ class ETSBase:
 
     Handles Chrome DevTools Protocol (CDP) connection to the ETS PC client
     and provides common utilities shared by exam and PK scripts.
+
+    Callback hooks (set via on_* methods):
+      on_connect   — fn(instance) after CDP connection established
+      on_question  — fn(info_dict) real-time question/answer display
+      on_complete  — fn(stats_dict) when automation finishes
+      on_error     — fn(error_msg) on non-fatal errors
     """
 
     def __init__(self, port=10086, debug_mode=False, stop_event=None):
@@ -26,6 +53,66 @@ class ETSBase:
         self.tab = None
         # Optional threading.Event: when set, interruptible_sleep raises InterruptedError
         self.stop_event = stop_event
+        # Callback hooks
+        self._on_connect = None
+        self._on_question = None
+        self._on_complete = None
+        self._on_error = None
+
+    # ── Callback registration ─────────────────────────────────
+
+    def on_connect(self, fn):
+        """Register callback: fn(instance). Called after CDP connection established."""
+        self._on_connect = fn
+
+    def on_question(self, fn):
+        """Register callback: fn(info_dict). Called per question for real-time display.
+
+        info_dict typically contains: type, type_label, qid, answer, answered, total.
+        """
+        self._on_question = fn
+
+    def on_complete(self, fn):
+        """Register callback: fn(stats_dict). Called when automation finishes."""
+        self._on_complete = fn
+
+    def on_error(self, fn):
+        """Register callback: fn(error_msg). Called on non-fatal errors."""
+        self._on_error = fn
+
+    def _fire_connect(self):
+        """Fire on_connect callback if registered."""
+        if self._on_connect:
+            try:
+                self._on_connect(self)
+            except Exception:
+                pass
+
+    def _fire_question(self, info):
+        """Fire on_question callback if registered."""
+        if self._on_question:
+            try:
+                self._on_question(info)
+            except Exception:
+                pass
+
+    def _fire_complete(self, stats):
+        """Fire on_complete callback if registered."""
+        if self._on_complete:
+            try:
+                self._on_complete(stats)
+            except Exception:
+                pass
+
+    def _fire_error(self, msg):
+        """Fire on_error callback if registered."""
+        if self._on_error:
+            try:
+                self._on_error(msg)
+            except Exception:
+                pass
+
+    # ── Utilities ──────────────────────────────────────────────
 
     def debug(self, msg):
         """Print debug message if debug_mode is enabled."""

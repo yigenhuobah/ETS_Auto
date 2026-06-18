@@ -229,6 +229,9 @@ class ETSRemote:
             with open(self._cache_path, 'r', encoding='utf-8') as f:
                 raw = json.load(f)
 
+            if not isinstance(raw, dict):
+                return None
+
             # New wrapper format: {"data": {...}, "_fetched_at": ..., "_source": ...}
             if 'data' in raw and isinstance(raw.get('data'), dict):
                 fetched = raw.get('_fetched_at', 0)

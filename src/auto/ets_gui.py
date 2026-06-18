@@ -28,18 +28,13 @@ else:
 sys.path.insert(0, os.path.join(_BASE, 'src', 'auto'))
 
 # ── Force UTF-8 on Windows ──────────────────────────────────
-if sys.platform == 'win32':
-    os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
-    try:
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-    except (AttributeError, LookupError):
-        pass
+from ets_common import force_utf8_stdio
+force_utf8_stdio()
 
 import customtkinter as ctk
 
 # Version constant — bump on each release
-APP_VERSION = "0.6.1"
+APP_VERSION = "0.6.2"
 
 
 # ── Queue-based stdout bridge ────────────────────────────────
@@ -202,7 +197,107 @@ class ETSApp(ctk.CTk):
         self._log_text = ctk.CTkTextbox(
             parent, wrap="word", state="disabled",
             font=ctk.CTkFont(family="Consolas", size=12))
-        self._log_text.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        self._log_text.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+
+        # ── Collapsible answer preview bar ──────────────
+        self._preview_expanded = False
+        self._preview_frame = ctk.CTkFrame(parent, fg_color="transparent", height=28)
+        self._preview_frame.pack(fill="x", padx=16, pady=(0, 12))
+        self._preview_frame.pack_propagate(False)
+
+        # Toggle button
+        self._preview_toggle_btn = ctk.CTkButton(
+            self._preview_frame,
+            text="📋 答案预览 ▸", width=140, height=24,
+            font=ctk.CTkFont(size=11),
+            fg_color="transparent", hover_color=("#e0e0e0", "#3a3a3a"),
+            text_color=("#555555", "#aaaaaa"),
+            anchor="w",
+            command=self._toggle_preview)
+        self._preview_toggle_btn.pack(side="left", padx=(0, 8))
+
+        # Inline answer text (shown when collapsed)
+        self._preview_inline = ctk.CTkLabel(
+            self._preview_frame,
+            text="", anchor="w",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#2ecc71")
+        self._preview_inline.pack(side="left", fill="x", expand=True)
+
+        # Expanded preview panel (hidden by default)
+        self._preview_panel = None
+
+    def _toggle_preview(self):
+        """Toggle the answer preview panel."""
+        self._preview_expanded = not self._preview_expanded
+        if self._preview_expanded:
+            self._preview_toggle_btn.configure(text="📋 答案预览 ▾")
+            # Create expanded panel
+            self._preview_frame.pack_propagate(True)
+            self._preview_frame.configure(height=160)
+            self._preview_panel = ctk.CTkTextbox(
+                self._preview_frame, wrap="word", state="disabled",
+                font=ctk.CTkFont(family="Microsoft YaHei UI", size=12),
+                height=120, corner_radius=6)
+            self._preview_panel.pack(fill="both", expand=True, pady=(28, 0))
+            # Move toggle btn and inline label to top of frame
+            self._preview_toggle_btn.pack_forget()
+            self._preview_inline.pack_forget()
+            self._preview_toggle_btn.pack(side="top", anchor="w", padx=(0, 8), pady=(0, 2))
+            self._preview_inline.pack_forget()  # hide inline when expanded
+        else:
+            self._preview_toggle_btn.configure(text="📋 答案预览 ▸")
+            if self._preview_panel:
+                self._preview_panel.destroy()
+                self._preview_panel = None
+            self._preview_frame.configure(height=28)
+            self._preview_frame.pack_propagate(False)
+            # Restore layout
+            self._preview_toggle_btn.pack_forget()
+            self._preview_inline.pack_forget()
+            self._preview_toggle_btn.pack(side="left", padx=(0, 8))
+            self._preview_inline.pack(side="left", fill="x", expand=True)
+
+    def _update_answer_preview(self, info):
+        """Called from on_question callback to update preview display.
+
+        info dict keys: type, type_label, qid, answer, answered, total_questions
+        Thread-safe: schedules UI update on main thread via after().
+        """
+        # Schedule on main thread — callback may fire from worker thread
+        self.after(0, lambda: self._do_update_answer_preview(info))
+
+    def _do_update_answer_preview(self, info):
+        """Actual UI update — always runs on main thread."""
+        # Guard: widget may have been destroyed if window closed
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        try:
+            qtype = info.get('type_label', '')
+            answer = info.get('answer', '')
+            qid = info.get('qid', '')
+            answered = info.get('answered', 0)
+            total = info.get('total_questions', 0)
+
+            # Update inline text (always visible)
+            inline_text = "%s %s → %s" % (qtype, qid, answer) if qid else qtype
+            if total:
+                inline_text += "  (%d/%d)" % (answered, total)
+            self._preview_inline.configure(text=inline_text)
+
+            # Update expanded panel if open
+            if self._preview_expanded and self._preview_panel:
+                self._preview_panel.configure(state="normal")
+                # Append new answer line
+                line = "[%s] %s → %s" % (qtype, qid, answer) if qid else "[%s]" % qtype
+                self._preview_panel.insert("end", line + "\n")
+                self._preview_panel.configure(state="disabled")
+                self._preview_panel.see("end")
+        except Exception:
+            pass  # Widget destroyed or not ready
 
     def _build_browser_tab(self, parent):
         """Build the offline paper browser tab using ets_parser."""
@@ -225,7 +320,12 @@ class ETSApp(ctk.CTk):
         if self._running:
             return
 
-        # Guard: check remote info before starting (may block start)
+        # Re-check remote info before starting (may have changed since GUI launch)
+        self._check_remote_async()
+        # Give the remote check a moment to complete (it's non-blocking otherwise)
+        import time as _time
+        _time.sleep(0.3)
+
         if self._remote_info is not None:
             try:
                 from ets_remote import classify_info
@@ -327,10 +427,12 @@ class ETSApp(ctk.CTk):
         def _worker():
             try:
                 from ets_remote import ETSRemote
+                # Use the pk_extra_url from the remote info already fetched in _on_remote_checked
+                pk_url = getattr(self._remote_info, 'pk_extra_url', None) if self._remote_info else None
+                if not pk_url:
+                    return  # no URL available, skip silently
                 remote = ETSRemote(current_version=APP_VERSION)
-                # Use the URL from last check (stored in remote._last_info)
-                # Pass url=None so download_pk_extra uses cached info
-                success, message = remote.download_pk_extra(url=None)
+                success, message = remote.download_pk_extra(url=pk_url)
                 if success:
                     self.after(0, lambda: self._append_log(
                         "[远程] %s\n" % message))
@@ -361,16 +463,14 @@ class ETSApp(ctk.CTk):
         self.destroy()
 
     def _restore_streams(self):
-        """Restore stdout/stderr to original, flush any remaining log queue."""
-        # Flush remaining log messages before restoring streams
+        """Restore stdout/stderr to original, drain remaining log queue.
+        Note: QueueWriter already wrote to self.original synchronously,
+        so we only drain the queue to prevent stale messages leaking
+        into the next run — we do NOT re-write them to _original_stdout."""
+        # Drain remaining log messages (already written to original by QueueWriter)
         while not self._log_queue.empty():
             try:
-                msg = self._log_queue.get_nowait()
-                if self._original_stdout:
-                    try:
-                        self._original_stdout.write(msg)
-                    except Exception:
-                        pass
+                self._log_queue.get_nowait()
             except queue.Empty:
                 break
 
@@ -400,6 +500,8 @@ class ETSApp(ctk.CTk):
                 from ets_auto import ETSAutoAnswer
                 auto = ETSAutoAnswer(port=port, debug_mode=debug,
                                      stop_event=self._stop_event)
+                # Register on_question callback for real-time answer preview
+                auto.on_question(self._update_answer_preview)
                 try:
                     auto.run(max_steps=max_val)
                 except InterruptedError:
@@ -413,6 +515,8 @@ class ETSApp(ctk.CTk):
                 from ets_word_pk import ETSWordPK
                 pk = ETSWordPK(port=port, debug_mode=debug,
                                stop_event=self._stop_event)
+                # Register on_question callback for real-time answer preview
+                pk.on_question(self._update_answer_preview)
                 try:
                     pk.run(max_q=max_val)
                 except InterruptedError:
@@ -425,8 +529,12 @@ class ETSApp(ctk.CTk):
         except ImportError as e:
             print("[错误] 导入失败: %s" % e)
             print("请确保 ets_auto.py / ets_word_pk.py / ets_common.py 在正确路径")
+            self.after(0, lambda: self._show_error(
+                "导入失败",
+                "找不到必要模块：%s\n\n请确保 ets_auto.py / ets_word_pk.py / ets_common.py 在正确路径" % e))
         except Exception as e:
             print("[错误] %s" % e)
+            self.after(0, lambda: self._show_error("运行错误", str(e)))
         finally:
             # Schedule UI update on main thread
             self.after(0, self._run_finished)
@@ -450,6 +558,14 @@ class ETSApp(ctk.CTk):
         self._log_text.configure(state="disabled")
         # Auto-scroll to bottom
         self._log_text.see("end")
+
+    def _show_error(self, title, message):
+        """Show error messagebox on main thread (call via self.after)."""
+        try:
+            from tkinter import messagebox
+            messagebox.showerror(title, message)
+        except Exception:
+            pass  # Don't crash if messagebox itself fails
 
 
 # ── Entry point ──────────────────────────────────────────────

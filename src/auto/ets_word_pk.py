@@ -4,7 +4,12 @@ ETS Word PK Auto Answer v5 — e听说单词PK自动答题
 改进: 派生词自动生成 + 短语提取 + 选项反查(含词根回退)
 """
 import json, os, time, re, sys
-from ets_common import ETSBase
+from urllib.error import URLError
+from ets_common import ETSBase, force_utf8_stdio
+from ets_hotkey import ETSHotkey
+
+# Version constant — keep in sync with ets_gui.py APP_VERSION
+__version__ = "0.6.2"
 
 
 def _edit_dist(a, b):
@@ -719,7 +724,7 @@ class ETSWordPK(ETSBase):
         result = self.eval_js(js)
         try:
             return json.loads(result) if result else {}
-        except:
+        except Exception:
             return {}
 
     def click_option(self, index):
@@ -732,7 +737,7 @@ class ETSWordPK(ETSBase):
         result = self.eval_js(js)
         try:
             return json.loads(result or "{}")
-        except:
+        except Exception:
             return {"error": str(result)}
 
     # ── Self-Learning ─────────────────────────────────────────
@@ -784,7 +789,7 @@ class ETSWordPK(ETSBase):
                         self.debug("capture_wrong_answer: DOM option content mismatch, page likely transitioned, skipping")
                         return ''
                 return captured
-        except:
+        except Exception:
             pass
         return ''
 
@@ -884,7 +889,7 @@ class ETSWordPK(ETSBase):
         print("=" * 45)
         try:
             self.connect()
-        except urllib.error.URLError as e:
+        except URLError as e:
             print("\n❌ 连接失败: %s" % e)
             print("诊断：")
             print("  1. e听说PC端是否已启动？")
@@ -900,6 +905,11 @@ class ETSWordPK(ETSBase):
             return
         if not self.load_dictionary():
             return
+
+        # Register global hotkeys (F9=Pause, F10=Skip, F12=Emergency Stop)
+        self._hotkey = ETSHotkey()
+        self._hotkey.register()
+
         print("-" * 45)
 
         answered = 0
@@ -911,6 +921,16 @@ class ETSWordPK(ETSBase):
 
         try:
             while answered + no_match < max_q:
+                # Check stop signal (hotkey F12 or external stop_event)
+                if (self.stop_event and self.stop_event.is_set()) or (self._hotkey and self._hotkey.should_stop):
+                    print("\n  🛑 Stopped by user")
+                    break
+
+                # Check pause (F9)
+                if self._hotkey and self._hotkey.is_paused:
+                    self.interruptible_sleep(0.3)
+                    continue
+
                 state = self.get_pk_state()
 
                 if not state.get('hasQuestion'):
@@ -968,6 +988,9 @@ class ETSWordPK(ETSBase):
                 if idx >= 0:
                     source = 'learned' if (title in self.pk_extra and options[idx].strip() == self.pk_extra[title].strip()) else 'dict'
                     print("  #%s -> %s [%s]" % (progress or n, options[idx], source))
+                    self._fire_question({'type': 'pk', 'type_label': '单词PK',
+                                         'index': n, 'answer': options[idx],
+                                         'source': source, 'title': title})
                     r = self.click_option(idx)
                     if r.get('ok'):
                         answered += 1
@@ -982,6 +1005,9 @@ class ETSWordPK(ETSBase):
                         self.learn_miss(title, correct)
                 else:
                     print("  #%s -> ??? [%s]" % (progress or n, ' / '.join(options)))
+                    self._fire_question({'type': 'pk', 'type_label': '单词PK',
+                                         'index': n, 'answer': None,
+                                         'source': 'miss', 'title': title})
                     no_match += 1
                     self.record_miss(title, options)
 
@@ -990,6 +1016,10 @@ class ETSWordPK(ETSBase):
         except (ConnectionError, TimeoutError) as e:
             print("\nConnection lost: %s" % e)
 
+        # Cleanup hotkey
+        if hasattr(self, '_hotkey') and self._hotkey:
+            self._hotkey.unregister()
+
         total = answered + no_match
         rate = (answered * 100 / total) if total > 0 else 0
         print("\n" + "=" * 45)
@@ -997,6 +1027,12 @@ class ETSWordPK(ETSBase):
             answered, total, rate, no_match, self.stats['errors'], self.stats['learned']))
         if self.stats['learned'] > 0:
             print("Self-learned hits: %d" % self.stats['learned'])
+
+        # Fire on_complete callback
+        self._fire_complete({'answered': answered, 'total': total,
+                             'rate': rate, 'miss': no_match,
+                             'errors': self.stats.get('errors', 0),
+                             'learned': self.stats.get('learned', 0)})
 
         # Cleanup WebSocket
         if self.ws:
@@ -1008,12 +1044,7 @@ class ETSWordPK(ETSBase):
 
 if __name__ == "__main__":
     # Force UTF-8 on Windows terminals (GBK can't encode IPA/special chars)
-    if sys.platform == 'win32':
-        try:
-            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-        except (AttributeError, LookupError):
-            pass
+    force_utf8_stdio()
 
     import argparse
     p = argparse.ArgumentParser(description="ETS Word PK Auto v5")

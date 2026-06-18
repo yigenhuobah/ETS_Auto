@@ -56,6 +56,16 @@ def t_import_gui():
     assert hasattr(ets_gui, 'ETSApp'), "ETSApp not found in ets_gui"
 test("import ets_gui + ETSApp exists", t_import_gui)
 
+def t_import_browser_ui():
+    import ets_browser_ui
+    assert hasattr(ets_browser_ui, 'create_browser_tab'), "create_browser_tab not found in ets_browser_ui"
+test("import ets_browser_ui + create_browser_tab exists", t_import_browser_ui)
+
+def t_import_remote():
+    import ets_remote
+    assert hasattr(ets_remote, 'ETSRemote'), "ETSRemote not found in ets_remote"
+test("import ets_remote + ETSRemote exists", t_import_remote)
+
 # ── 2. Dependency tests ─────────────────────────────────────
 print("\n=== Dependency Tests ===")
 
@@ -75,6 +85,34 @@ test("import psutil", t_dep_psutil)
 # ── 3. Inheritance & interface tests ────────────────────────
 print("\n=== Interface Tests ===")
 
+def t_force_utf8_stdio():
+    from ets_common import force_utf8_stdio
+    # Should not raise even if called multiple times
+    force_utf8_stdio()
+    force_utf8_stdio(line_buffering=True)
+test("force_utf8_stdio() callable without error", t_force_utf8_stdio)
+
+def t_callback_hooks():
+    from ets_common import ETSBase
+    base = ETSBase()
+    # Verify hooks start as None
+    assert base._on_connect is None
+    assert base._on_question is None
+    assert base._on_complete is None
+    assert base._on_error is None
+    # Register and fire
+    results = []
+    base.on_connect(lambda inst: results.append('connect'))
+    base.on_question(lambda info: results.append(info.get('type', '?')))
+    base.on_complete(lambda stats: results.append('complete'))
+    base.on_error(lambda msg: results.append(msg))
+    base._fire_connect()
+    base._fire_question({'type': 'choose'})
+    base._fire_complete({'total': 10})
+    base._fire_error('test error')
+    assert results == ['connect', 'choose', 'complete', 'test error'], f"Callbacks fired out of order: {results}"
+test("ETSBase callback hooks register + fire", t_callback_hooks)
+
 def t_inheritance():
     from ets_common import ETSBase
     from ets_auto import ETSAutoAnswer
@@ -85,10 +123,12 @@ test("ETSAutoAnswer/ETSWordPK inherit ETSBase", t_inheritance)
 
 def t_parser_scan():
     from ets_parser import scan_sets
-    sets = scan_sets()
-    # scan_sets returns a list, even if empty (no ETS data on CI)
-    assert isinstance(sets, list), f"scan_sets should return list, got {type(sets)}"
-test("ets_parser.scan_sets() returns list", t_parser_scan)
+    result = scan_sets()
+    # scan_sets returns (list, error_msg_or_None), even if empty (no ETS data on CI)
+    assert isinstance(result, tuple) and len(result) == 2, f"scan_sets should return (list, str|None), got {type(result)}"
+    assert isinstance(result[0], list), f"scan_sets[0] should be list, got {type(result[0])}"
+    assert result[1] is None or isinstance(result[1], str), f"scan_sets[1] should be str|None, got {type(result[1])}"
+test("ets_parser.scan_sets() returns (list, error_msg)", t_parser_scan)
 
 def t_parser_render():
     from ets_parser import render_section
@@ -161,7 +201,7 @@ print("\n=== Syntax Check ===")
 def t_syntax_all():
     import py_compile
     py_files = []
-    for name in ['ets_common.py', 'ets_auto.py', 'ets_word_pk.py', 'ets_parser.py', 'ets_gui.py', 'run.py']:
+    for name in ['ets_common.py', 'ets_auto.py', 'ets_word_pk.py', 'ets_parser.py', 'ets_browser_ui.py', 'ets_remote.py', 'ets_gui.py', 'run.py']:
         fpath = os.path.join(SRC, name)
         if os.path.exists(fpath):
             py_files.append((name, fpath))
