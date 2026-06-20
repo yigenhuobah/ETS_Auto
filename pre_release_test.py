@@ -6,6 +6,7 @@ Exit code 0 = all pass, non-zero = fail (CI should abort).
 """
 import sys
 import os
+import re
 
 # Add src/auto to path so imports work like they do in production
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src', 'auto')
@@ -208,6 +209,566 @@ def t_syntax_all():
     for name, fpath in py_files:
         py_compile.compile(fpath, doraise=True)
 test("all .py files pass py_compile", t_syntax_all)
+
+# ── 7. Strategy layer tests ────────────────────────────────
+print("\n=== Strategy Layer Tests ===")
+
+def t_strategy_import():
+    from ets_strategy import ETSStrategy, ETS_DATA_DIR
+    assert os.path.isdir(ETS_DATA_DIR) or not sys.platform.startswith('win'), \
+        f"ETS_DATA_DIR not found: {ETS_DATA_DIR}"
+test("import ETSStrategy + ETS_DATA_DIR exists", t_strategy_import)
+
+# Find a real set_id with choose data for tests below
+_STRATEGY_TEST_SET = None
+_STRATEGY_TEST_STID = None
+_STRATEGY_TEST_QID = None
+_STRATEGY_TEST_ANSWER = None
+
+def _find_test_set():
+    """Scan ETS cache for a set with collector.choose data."""
+    global _STRATEGY_TEST_SET, _STRATEGY_TEST_STID, _STRATEGY_TEST_QID, _STRATEGY_TEST_ANSWER
+    if _STRATEGY_TEST_SET is not None:
+        return True
+    from ets_strategy import ETS_DATA_DIR
+    if not os.path.isdir(ETS_DATA_DIR):
+        return False
+    for set_id in os.listdir(ETS_DATA_DIR):
+        exam_dir = os.path.join(ETS_DATA_DIR, set_id)
+        if not os.path.isdir(exam_dir):
+            continue
+        for d in sorted(os.listdir(exam_dir)):
+            if not d.startswith('content_'):
+                continue
+            cj = os.path.join(exam_dir, d, 'content.json')
+            if not os.path.exists(cj):
+                continue
+            try:
+                import json
+                with open(cj, encoding='utf-8') as f:
+                    data = json.load(f)
+                if data.get('structure_type') == 'collector.choose':
+                    info = data.get('info', {})
+                    xtlist = info.get('xtlist', [])
+                    if xtlist and xtlist[0].get('answer'):
+                        _STRATEGY_TEST_SET = set_id
+                        _STRATEGY_TEST_STID = str(info.get('stid', ''))
+                        _STRATEGY_TEST_QID = str(xtlist[0].get('xt_xh', ''))
+                        _STRATEGY_TEST_ANSWER = xtlist[0]['answer']
+                        return True
+            except Exception:
+                continue
+    return False
+
+def t_strategy_load_set():
+    if not _find_test_set():
+        # No ETS data on this machine — skip gracefully
+        import pytest
+        pytest.skip("No ETS cache data available")
+    from ets_strategy import ETSStrategy
+    s = ETSStrategy()
+    ok = s.load_set(_STRATEGY_TEST_SET)
+    assert ok, f"load_set({set_id}) returned False"
+    assert len(s.sections) > 0, "No sections loaded"
+    assert len(s.answer_index) > 0, "answer_index is empty after load_set"
+test("strategy.load_set() loads sections + answer_index", t_strategy_load_set)
+
+def t_strategy_lookup_choose():
+    if not _find_test_set():
+        return  # skip if no data
+    from ets_strategy import ETSStrategy
+    s = ETSStrategy()
+    s.load_set(_STRATEGY_TEST_SET)
+    result = s.lookup('collector.choose', _STRATEGY_TEST_STID, qid=_STRATEGY_TEST_QID)
+    assert result is not None, f"lookup returned None for stid={_STRATEGY_TEST_STID} qid={_STRATEGY_TEST_QID}"
+    assert result.get('type') == 'choose', f"Expected type=choose, got {result.get('type')}"
+    assert result.get('answer', '').upper() == _STRATEGY_TEST_ANSWER.upper(), \
+        f"Expected answer={_STRATEGY_TEST_ANSWER}, got {result.get('answer')}"
+    assert result.get('source') == 'local', f"Expected source=local, got {result.get('source')}"
+test("strategy.lookup() returns correct choose answer", t_strategy_lookup_choose)
+
+def t_strategy_lookup_missing():
+    """lookup with non-existent stid should return None."""
+    from ets_strategy import ETSStrategy
+    s = ETSStrategy()
+    result = s.lookup('collector.choose', 'nonexistent_stid_99999', qid='999')
+    assert result is None, f"Expected None for non-existent key, got {result}"
+test("strategy.lookup() returns None for missing key", t_strategy_lookup_missing)
+
+def t_strategy_text_similarity():
+    from ets_strategy import ETSStrategy
+    s = ETSStrategy()
+    # Identical strings → high score
+    score = s._text_similarity("hello world foo bar", "hello world foo bar")
+    assert score == 1.0, f"Identical strings should score 1.0, got {score}"
+    # Completely different → low score
+    score = s._text_similarity("apple banana orange", "xyz123 abc456")
+    assert score < 0.3, f"Unrelated strings should score <0.3, got {score}"
+    # Empty → 0
+    assert s._text_similarity("", "hello") == 0.0
+    assert s._text_similarity(None, "hello") == 0.0
+    # Similar but reordered → should be high but not 1.0
+    score = s._text_similarity("the quick brown fox", "the brown quick fox")
+    assert 0.3 < score < 1.0, f"Reordered words should score 0.3-1.0, got {score}"
+test("strategy._text_similarity() returns expected scores", t_strategy_text_similarity)
+
+def t_strategy_list_sections():
+    if not _find_test_set():
+        return
+    from ets_strategy import ETSStrategy
+    s = ETSStrategy()
+    s.load_set(_STRATEGY_TEST_SET)
+    sections = s.list_sections()
+    assert isinstance(sections, list), f"list_sections should return list, got {type(sections)}"
+    if sections:
+        first = sections[0] if isinstance(sections, list) else None
+        assert first is not None
+test("strategy.list_sections() returns list", t_strategy_list_sections)
+
+def t_strategy_get_recording_answers():
+    """get_recording_answers should return list (may be empty if no recording data)."""
+    if not _find_test_set():
+        return
+    from ets_strategy import ETSStrategy
+    s = ETSStrategy()
+    s.load_set(_STRATEGY_TEST_SET)
+    result = s.get_recording_answers()
+    assert isinstance(result, list), f"Expected list, got {type(result)}"
+    # If non-empty, each item should have a 'type' field
+    for item in result:
+        assert isinstance(item, dict), f"Each recording answer should be dict, got {type(item)}"
+        assert 'type' in item, f"Recording answer missing 'type' field: {item}"
+test("strategy.get_recording_answers() returns list with type field", t_strategy_get_recording_answers)
+
+# ── 8. Answer parsing tests (load_answers for 6 types) ─────
+print("\n=== Answer Parsing Tests ===")
+
+import tempfile, shutil, json as _json
+
+def _make_content_json(structure_type, info):
+    """Build a minimal content.json dict."""
+    return {'structure_type': structure_type, 'info': info}
+
+def _make_bare_auto(ets_base, set_id):
+    """Create a minimal ETSAutoAnswer without __init__ (for offline testing)."""
+    from ets_auto import ETSAutoAnswer
+    from ets_strategy import ETSStrategy
+    auto = ETSAutoAnswer.__new__(ETSAutoAnswer)
+    auto.ets_base = ets_base
+    auto.set_id = set_id
+    auto.answers = {}
+    auto.recording_answers = []
+    auto._recording_window_closed = False
+    auto.strategy = ETSStrategy()
+    auto.debug = lambda *a: None
+    return auto
+
+def t_load_answers_choose():
+    """Test load_answers parses collector.choose correctly."""
+    tmp_base = tempfile.mkdtemp(prefix='ets_test_')
+    set_id = 'test_set_choose'
+    content_dir = os.path.join(tmp_base, set_id, 'content_001')
+    os.makedirs(content_dir)
+    data = _make_content_json('collector.choose', {
+        'stid': '1001',
+        'xtlist': [
+            {'xt_xh': '1', 'answer': 'A', 'xt_nr': 'Q1', 'xxlist': []},
+            {'xt_xh': '2', 'answer': 'C', 'xt_nr': 'Q2', 'xxlist': []},
+        ]
+    })
+    with open(os.path.join(content_dir, 'content.json'), 'w', encoding='utf-8') as f:
+        _json.dump(data, f, ensure_ascii=False)
+    auto = _make_bare_auto(tmp_base, set_id)
+    ok = auto.load_answers()
+    assert ok, "load_answers returned False"
+    assert '1001_1' in auto.answers, f"Missing key 1001_1, keys={list(auto.answers.keys())}"
+    assert auto.answers['1001_1']['answer'] == 'A'
+    assert auto.answers['1001_2']['answer'] == 'C'
+    shutil.rmtree(tmp_base)
+test("load_answers parses collector.choose", t_load_answers_choose)
+
+def t_load_answers_fill():
+    """Test load_answers parses collector.fill with slash-separated alternatives."""
+    from ets_auto import ETSAutoAnswer
+    tmp_base = tempfile.mkdtemp(prefix='ets_test_')
+    set_id = 'test_set_fill'
+    content_dir = os.path.join(tmp_base, set_id, 'content_001')
+    os.makedirs(content_dir)
+    data = _make_content_json('collector.fill', {
+        'stid': '2001',
+        'std': [
+            {'xth': '1', 'value': 'Organise/Organize'},
+            {'xth': '2', 'value': 'apple'},
+        ]
+    })
+    with open(os.path.join(content_dir, 'content.json'), 'w', encoding='utf-8') as f:
+        _json.dump(data, f, ensure_ascii=False)
+    auto = _make_bare_auto(tmp_base, set_id)
+    ok = auto.load_answers()
+    assert ok
+    assert auto.answers['2001_1']['answer'] == 'Organise'
+    assert 'Organize' in auto.answers['2001_1'].get('alternatives', [])
+    assert auto.answers['2001_2']['answer'] == 'apple'
+    shutil.rmtree(tmp_base)
+test("load_answers parses collector.fill (with alternatives)", t_load_answers_fill)
+
+def t_strategy_index_role():
+    """Test strategy layer indexes collector.role correctly.
+    role questions are NOT parsed by load_answers (which handles choose/fill/read/picture/dialogue).
+    They are indexed by strategy._index_section with key format: collector.role_{stid}_q{qi+1}.
+    """
+    if not _find_test_set():
+        return
+    from ets_strategy import ETSStrategy, ETS_DATA_DIR
+    # Find a set that contains role data
+    role_set = None
+    role_stid = None
+    for sid in os.listdir(ETS_DATA_DIR):
+        exam_dir = os.path.join(ETS_DATA_DIR, sid)
+        if not os.path.isdir(exam_dir):
+            continue
+        for d in os.listdir(exam_dir):
+            if not d.startswith('content_'):
+                continue
+            cj = os.path.join(exam_dir, d, 'content.json')
+            if not os.path.exists(cj):
+                continue
+            try:
+                with open(cj, encoding='utf-8') as f:
+                    data = _json.load(f)
+                if data.get('structure_type') == 'collector.role':
+                    role_set = sid
+                    role_stid = str(data['info']['stid'])
+                    break
+            except Exception:
+                continue
+        if role_set:
+            break
+    if not role_set:
+        return  # no role data, skip
+    s = ETSStrategy()
+    s.load_set(role_set)
+    # Verify role key exists in answer_index with q1 format
+    expected_key = 'collector.role_%s_q1' % role_stid
+    assert expected_key in s.answer_index, \
+        f"Key {expected_key} not in answer_index. Keys: {[k for k in s.answer_index if 'role' in k][:5]}"
+    entry = s.answer_index[expected_key]
+    assert entry.get('type') == 'oral', f"Expected type=oral, got {entry.get('type')}"
+    assert 'variants' in entry, f"Missing 'variants' in role entry: {entry}"
+    assert len(entry['variants']) > 0, f"Empty variants list in role entry"
+test("strategy._index_section indexes collector.role with q1 key", t_strategy_index_role)
+
+def t_load_answers_empty_answer():
+    """load_answers should skip empty answers gracefully."""
+    from ets_auto import ETSAutoAnswer
+    tmp_base = tempfile.mkdtemp(prefix='ets_test_')
+    set_id = 'test_set_empty'
+    content_dir = os.path.join(tmp_base, set_id, 'content_001')
+    os.makedirs(content_dir)
+    data = _make_content_json('collector.choose', {
+        'stid': '4001',
+        'xtlist': [
+            {'xt_xh': '1', 'answer': '', 'xt_nr': '', 'xxlist': []},
+            {'xt_xh': '2', 'answer': 'B', 'xt_nr': '', 'xxlist': []},
+        ]
+    })
+    with open(os.path.join(content_dir, 'content.json'), 'w', encoding='utf-8') as f:
+        _json.dump(data, f, ensure_ascii=False)
+    auto = _make_bare_auto(tmp_base, set_id)
+    ok = auto.load_answers()
+    assert ok
+    assert '4001_2' in auto.answers
+    assert '4001_1' not in auto.answers, "Empty answer should be skipped"
+    shutil.rmtree(tmp_base)
+test("load_answers skips empty answers", t_load_answers_empty_answer)
+
+def t_load_answers_missing_dir():
+    """load_answers returns False when exam dir doesn't exist."""
+    from ets_auto import ETSAutoAnswer
+    auto = _make_bare_auto(tempfile.gettempdir(), 'nonexistent_set_99999')
+    ok = auto.load_answers()
+    assert not ok, "load_answers should return False for missing dir"
+test("load_answers returns False for missing directory", t_load_answers_missing_dir)
+
+# ── 9. ETS data structure validation ───────────────────────
+print("\n=== ETS Data Structure Validation ===")
+
+KNOWN_STRUCTURE_TYPES = {
+    'collector.choose', 'collector.fill', 'collector.role',
+    'collector.picture', 'collector.read', 'collector.dialogue',
+    'collector.repeat_dialogue'  # repeat/follow-along dialogue (no answer needed)
+}
+
+def t_ets_data_structure_types():
+    """Scan all local content.json files — verify structure_type is known."""
+    from ets_strategy import ETS_DATA_DIR
+    if not os.path.isdir(ETS_DATA_DIR):
+        return  # skip if no ETS data
+    unknown_types = set()
+    count = 0
+    for set_id in os.listdir(ETS_DATA_DIR):
+        exam_dir = os.path.join(ETS_DATA_DIR, set_id)
+        if not os.path.isdir(exam_dir):
+            continue
+        for d in os.listdir(exam_dir):
+            if not d.startswith('content_'):
+                continue
+            cj = os.path.join(exam_dir, d, 'content.json')
+            if not os.path.exists(cj):
+                continue
+            try:
+                with open(cj, encoding='utf-8') as f:
+                    data = _json.load(f)
+                stype = data.get('structure_type', '')
+                if stype not in KNOWN_STRUCTURE_TYPES:
+                    unknown_types.add(stype)
+                count += 1
+            except Exception:
+                pass
+    assert count > 0, "No content.json files found in ETS cache"
+    assert not unknown_types, \
+        f"Unknown structure_type(s) found: {unknown_types}. " \
+        f"If ETS added a new question type, update load_answers + strategy._index_section."
+test("All local content.json have known structure_type", t_ets_data_structure_types)
+
+def t_ets_data_choose_format():
+    """Verify all collector.choose content.json have valid xtlist with answers."""
+    from ets_strategy import ETS_DATA_DIR
+    if not os.path.isdir(ETS_DATA_DIR):
+        return
+    issues = []
+    count = 0
+    for set_id in os.listdir(ETS_DATA_DIR):
+        exam_dir = os.path.join(ETS_DATA_DIR, set_id)
+        if not os.path.isdir(exam_dir):
+            continue
+        for d in os.listdir(exam_dir):
+            if not d.startswith('content_'):
+                continue
+            cj = os.path.join(exam_dir, d, 'content.json')
+            if not os.path.exists(cj):
+                continue
+            try:
+                with open(cj, encoding='utf-8') as f:
+                    data = _json.load(f)
+                if data.get('structure_type') != 'collector.choose':
+                    continue
+                count += 1
+                info = data.get('info', {})
+                stid = info.get('stid', '')
+                if not stid:
+                    issues.append(f"{set_id}/{d}: missing stid")
+                    continue
+                xtlist = info.get('xtlist', [])
+                if not xtlist:
+                    issues.append(f"{set_id}/{d}: empty xtlist")
+                    continue
+                for i, xt in enumerate(xtlist):
+                    ans = xt.get('answer', '')
+                    if not ans:
+                        issues.append(f"{set_id}/{d} xt[{i}]: empty answer")
+                    elif not re.match(r'^[A-Z]$', ans):
+                        issues.append(f"{set_id}/{d} xt[{i}]: invalid answer '{ans}'")
+            except Exception as e:
+                issues.append(f"{set_id}/{d}: parse error: {e}")
+    assert count > 0, "No collector.choose data found"
+    if issues:
+        # Report first 5 issues
+        msg = '; '.join(issues[:5])
+        if len(issues) > 5:
+            msg += f' ... and {len(issues) - 5} more'
+        raise AssertionError(f"Choose data issues ({len(issues)}): {msg}")
+test("All collector.choose data has valid stid + xtlist + answer", t_ets_data_choose_format)
+
+def t_ets_data_fill_format():
+    """Verify all collector.fill content.json have valid std with values."""
+    from ets_strategy import ETS_DATA_DIR
+    if not os.path.isdir(ETS_DATA_DIR):
+        return
+    import re as _re
+    issues = []
+    count = 0
+    for set_id in os.listdir(ETS_DATA_DIR):
+        exam_dir = os.path.join(ETS_DATA_DIR, set_id)
+        if not os.path.isdir(exam_dir):
+            continue
+        for d in os.listdir(exam_dir):
+            if not d.startswith('content_'):
+                continue
+            cj = os.path.join(exam_dir, d, 'content.json')
+            if not os.path.exists(cj):
+                continue
+            try:
+                with open(cj, encoding='utf-8') as f:
+                    data = _json.load(f)
+                if data.get('structure_type') != 'collector.fill':
+                    continue
+                count += 1
+                info = data.get('info', {})
+                stid = info.get('stid', '')
+                if not stid:
+                    issues.append(f"{set_id}/{d}: missing stid")
+                    continue
+                std = info.get('std', [])
+                if not std:
+                    issues.append(f"{set_id}/{d}: empty std")
+                    continue
+                for i, s in enumerate(std):
+                    val = s.get('value', '')
+                    if not val:
+                        issues.append(f"{set_id}/{d} std[{i}]: empty value")
+            except Exception as e:
+                issues.append(f"{set_id}/{d}: parse error: {e}")
+    if count == 0:
+        return  # no fill data, skip
+    if issues:
+        msg = '; '.join(issues[:5])
+        if len(issues) > 5:
+            msg += f' ... and {len(issues) - 5} more'
+        raise AssertionError(f"Fill data issues ({len(issues)}): {msg}")
+test("All collector.fill data has valid stid + std + value", t_ets_data_fill_format)
+
+# ── 10. Remote module logic tests ───────────────────────────
+print("\n=== Remote Module Logic Tests ===")
+
+def t_compare_versions():
+    from ets_remote import compare_versions
+    assert compare_versions('0.6.1', '0.6.2') == -1
+    assert compare_versions('0.6.2', '0.6.1') == 1
+    assert compare_versions('0.6.1', '0.6.1') == 0
+    assert compare_versions('1.0.0', '0.9.9') == 1
+    assert compare_versions('0.9.9', '1.0.0') == -1
+    assert compare_versions('0.10.0', '0.9.0') == 1, "0.10.0 > 0.9.0"
+    assert compare_versions('0.6.1', '0.6.10') == -1, "0.6.1 < 0.6.10"
+test("compare_versions() handles semver correctly", t_compare_versions)
+
+def t_classify_info_block():
+    from ets_remote import RemoteInfo, classify_info
+    # allow_start=False → block
+    info = RemoteInfo(allow_start=False)
+    level, reason = classify_info(info)
+    assert level == 'block', f"Expected block, got {level}"
+    assert reason, f"Expected non-empty reason"
+test("classify_info() blocks when allow_start=False", t_classify_info_block)
+
+def t_classify_info_force_update():
+    from ets_remote import RemoteInfo, classify_info
+    info = RemoteInfo(allow_start=True, force_update=True, latest_version='0.7.0')
+    level, reason = classify_info(info)
+    assert level == 'block', f"Expected block, got {level}"
+test("classify_info() blocks when force_update=True", t_classify_info_force_update)
+
+def t_classify_info_normal():
+    from ets_remote import RemoteInfo, classify_info
+    info = RemoteInfo(allow_start=True)
+    level, reason = classify_info(info)
+    assert level == 'normal', f"Expected normal, got {level}"
+test("classify_info() returns normal for allow_start=True", t_classify_info_normal)
+
+def t_classify_info_none():
+    from ets_remote import classify_info
+    level, reason = classify_info(None)
+    assert level == 'normal', f"Expected normal for None, got {level}"
+test("classify_info() returns normal for None", t_classify_info_none)
+
+def t_should_block_start():
+    from ets_remote import RemoteInfo, should_block_start
+    blocked, reason = should_block_start(RemoteInfo(allow_start=False))
+    assert blocked is True
+    assert reason
+    blocked, reason = should_block_start(RemoteInfo(allow_start=True))
+    assert blocked is False
+    assert reason == ''
+test("should_block_start() matches classify_info", t_should_block_start)
+
+def t_remote_info_to_dict():
+    from ets_remote import RemoteInfo
+    info = RemoteInfo(latest_version='0.6.2', allow_start=True)
+    d = info.to_dict()
+    assert isinstance(d, dict)
+    assert d['latest_version'] == '0.6.2'
+    assert d['allow_start'] is True
+    assert 'pk_extra_url' in d
+test("RemoteInfo.to_dict() returns all slots", t_remote_info_to_dict)
+
+# ── 11. Hotkey module tests ────────────────────────────────
+print("\n=== Hotkey Module Tests ===")
+
+def t_hotkey_import():
+    from ets_hotkey import ETSHotkey
+    hk = ETSHotkey()
+    assert hk is not None
+test("ETSHotkey can be instantiated", t_hotkey_import)
+
+def t_hotkey_initial_state():
+    from ets_hotkey import ETSHotkey
+    hk = ETSHotkey()
+    assert hk.is_paused is False, "is_paused should start False"
+    assert hk.should_skip is False, "should_skip should start False"
+    assert hk.should_stop is False, "should_stop should start False"
+test("ETSHotkey initial state all False", t_hotkey_initial_state)
+
+def t_hotkey_clear_skip():
+    from ets_hotkey import ETSHotkey
+    hk = ETSHotkey()
+    hk.clear_skip()
+    assert hk.should_skip is False
+test("ETSHotkey.clear_skip() works", t_hotkey_clear_skip)
+
+def t_hotkey_clear_stop():
+    from ets_hotkey import ETSHotkey
+    hk = ETSHotkey()
+    # clear_stop may or may not exist — test if available
+    if hasattr(hk, 'clear_stop'):
+        hk.clear_stop()
+        assert hk.should_stop is False
+test("ETSHotkey.clear_stop() works", t_hotkey_clear_stop)
+
+# ── 12. Method signature stability ─────────────────────────
+print("\n=== Method Signature Tests ===")
+
+def t_sig_auto_run():
+    import inspect
+    from ets_auto import ETSAutoAnswer
+    sig = inspect.signature(ETSAutoAnswer.run)
+    assert 'max_steps' in sig.parameters, f"run() missing max_steps param: {sig}"
+test("ETSAutoAnswer.run(max_steps) signature stable", t_sig_auto_run)
+
+def t_sig_auto_init():
+    import inspect
+    from ets_auto import ETSAutoAnswer
+    sig = inspect.signature(ETSAutoAnswer.__init__)
+    assert 'port' in sig.parameters, f"__init__ missing port: {sig}"
+    assert 'debug_mode' in sig.parameters, f"__init__ missing debug_mode: {sig}"
+    assert 'stop_event' in sig.parameters, f"__init__ missing stop_event: {sig}"
+test("ETSAutoAnswer.__init__(port, debug_mode, stop_event) signature stable", t_sig_auto_init)
+
+def t_sig_strategy_lookup():
+    import inspect
+    from ets_strategy import ETSStrategy
+    sig = inspect.signature(ETSStrategy.lookup)
+    assert 'structure_type' in sig.parameters
+    assert 'stid' in sig.parameters
+    assert 'qid' in sig.parameters
+    assert 'title_text' in sig.parameters
+    assert 'dom_answer' in sig.parameters
+test("ETSStrategy.lookup() signature stable", t_sig_strategy_lookup)
+
+def t_sig_remote_init():
+    import inspect
+    from ets_remote import ETSRemote
+    sig = inspect.signature(ETSRemote.__init__)
+    assert 'current_version' in sig.parameters
+    assert 'owner' in sig.parameters
+    assert 'repo' in sig.parameters
+test("ETSRemote.__init__() signature stable", t_sig_remote_init)
+
+def t_sig_base_connect():
+    import inspect
+    from ets_common import ETSBase
+    sig = inspect.signature(ETSBase.connect)
+    assert sig.parameters, f"connect() should have parameters"
+test("ETSBase.connect() signature stable", t_sig_base_connect)
 
 # ── Summary ────────────────────────────────────────────────
 print(f"\n{'='*40}")

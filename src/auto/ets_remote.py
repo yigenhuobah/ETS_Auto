@@ -86,35 +86,37 @@ def compare_versions(v1, v2):
          0 if v1 == v2
          1 if v1 > v2
 
+    Pre-release versions (e.g. "0.5.1-beta") are ranked lower than
+    the corresponding release version ("0.5.1"), following SemVer spec.
+
     Examples:
-        compare_versions("0.5.0", "0.5.1")  → -1
-        compare_versions("0.5.1", "0.5.0")  →  1
-        compare_versions("0.5.1", "0.5.1")  →  0
-        compare_versions("1.0", "0.9.9")    →  1
+        compare_versions("0.5.0", "0.5.1")         → -1
+        compare_versions("0.5.1", "0.5.0")         →  1
+        compare_versions("0.5.1", "0.5.1")         →  0
+        compare_versions("1.0", "0.9.9")           →  1
+        compare_versions("0.5.1-beta", "0.5.1")    → -1
+        compare_versions("0.5.1", "0.5.1-beta")    →  1
+        compare_versions("0.5.1-beta", "0.5.0")    →  1
     """
+    import re as _re
+
     def _parse(v):
         if not v or not v.strip():
-            return [0]
+            return ([0], False)
+        # Split numeric version from pre-release suffix
+        m = _re.match(r'^(\d+(?:\.\d+)*)', v.strip())
+        if not m:
+            return ([0], False)
+        numeric_str = m.group(1)
+        suffix = v.strip()[len(m.group(0)):].strip()
+        is_prerelease = bool(suffix)
         parts = []
-        for p in v.strip().split('.'):
-            if not p:
-                parts.append(0)
-                continue
-            try:
-                parts.append(int(p))
-            except ValueError:
-                # Handle pre-release tags like "0.5.1-beta" → treat suffix as 0
-                num = ''
-                for ch in p:
-                    if ch.isdigit():
-                        num += ch
-                    else:
-                        break
-                parts.append(int(num) if num else 0)
-        return parts if parts else [0]
+        for p in numeric_str.split('.'):
+            parts.append(int(p) if p.isdigit() else 0)
+        return (parts if parts else [0], is_prerelease)
 
-    a = _parse(v1)
-    b = _parse(v2)
+    a, a_pre = _parse(v1)
+    b, b_pre = _parse(v2)
     # Pad shorter list with zeros
     max_len = max(len(a), len(b))
     a += [0] * (max_len - len(a))
@@ -124,6 +126,11 @@ def compare_versions(v1, v2):
             return -1
         if x > y:
             return 1
+    # Numeric parts equal — prerelease < release
+    if a_pre and not b_pre:
+        return -1
+    if not a_pre and b_pre:
+        return 1
     return 0
 
 

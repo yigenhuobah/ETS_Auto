@@ -15,7 +15,7 @@ from urllib.parse import urlparse, parse_qs
 from urllib.error import URLError
 
 # Version constant — keep in sync with ets_gui.py APP_VERSION
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 from ets_common import ETSBase, force_utf8_stdio
 from ets_strategy import ETSStrategy
 
@@ -81,10 +81,16 @@ class ETSAutoAnswer(ETSBase):
             if self.set_id:
                 self.debug("set_id from URL: " + self.set_id)
 
-        # Last-resort fallback for ets_base
+        # Last-resort fallback for ets_base (must be before _find_latest_set_id)
         if not self.ets_base:
             self.ets_base = os.path.join(os.path.expandvars(r'%APPDATA%'), 'ETS')
             self.debug("ets_base (default): " + self.ets_base)
+
+        # #5: Last-resort fallback — scan ETS data dir for most recent set
+        if not self.set_id and self.ets_base:
+            self.set_id = self._find_latest_set_id()
+            if self.set_id:
+                self.debug("set_id from latest scan: " + self.set_id)
 
         # Detect read-write (读写同步) mode from URL hash
         self._detect_rw_mode()
@@ -104,6 +110,38 @@ class ETSAutoAnswer(ETSBase):
         except Exception:
             pass
         return None
+
+    def _find_latest_set_id(self):
+        """#5: Scan ETS data dir for the most recently modified set directory.
+
+        Used as a last-resort fallback when neither Pinia nor URL provide
+        a set_id. Returns the directory name (set_id) or None.
+        """
+        if not self.ets_base or not os.path.isdir(self.ets_base):
+            return None
+        try:
+            candidates = []
+            for entry in os.listdir(self.ets_base):
+                full = os.path.join(self.ets_base, entry)
+                if not os.path.isdir(full):
+                    continue
+                # Set dirs contain content_* subdirectories
+                has_content = any(
+                    d.startswith('content_') for d in os.listdir(full)
+                    if os.path.isdir(os.path.join(full, d))
+                )
+                if has_content:
+                    mtime = os.path.getmtime(full)
+                    candidates.append((mtime, entry))
+            if not candidates:
+                return None
+            candidates.sort(reverse=True)  # newest first
+            self.debug("Latest set_id scan found %d candidates, newest: %s" %
+                       (len(candidates), candidates[0][1]))
+            return candidates[0][1]
+        except Exception as e:
+            self.debug("_find_latest_set_id error: %s" % e)
+            return None
 
     def _read_pinia_config(self):
         """Read ETS config + homework mode from main-frame Pinia stores."""
@@ -329,10 +367,19 @@ class ETSAutoAnswer(ETSBase):
         any_new = False
         all_done = True
 
+        # Track per-qid sub-question index: how many siblings with same qid
+        # have already been answered on this page.  Each ul[data-id] with the
+        # same qid is a different sub-question, so we advance through letters[]
+        # as we encounter repeats.
+        qid_seen = {}  # {qid: count_of_occurrences_processed}
+
         # Match by qid: page_questions → answer_dict
         for i, pq in enumerate(page_questions):
             if pq.get('any_selected'):
                 self.debug("RW Q#%d already selected" % (i + 1))
+                # Still count it so sub-question index stays aligned
+                pqid_seen = pq.get('qid', '')
+                qid_seen[pqid_seen] = qid_seen.get(pqid_seen, 0) + 1
                 continue
             all_done = False
 
@@ -340,12 +387,22 @@ class ETSAutoAnswer(ETSBase):
             letters = answer_dict.get(pqid)
             if not letters:
                 self.debug("RW Q#%d (qid:%s): no answer in showData" % (i + 1, pqid))
+                # Count this occurrence so later sub-questions stay aligned
+                qid_seen[pqid] = qid_seen.get(pqid, 0) + 1
                 continue
 
-            # Use the first unselected sub-question's answer
-            # (determine which sub-question index this is by counting already-answered
-            #  siblings — for single-answer questions, just use letters[0])
-            answer = letters[0] if letters else None
+            # Determine which sub-question index this is by counting
+            # already-processed siblings with the same qid on this page.
+            sub_idx = qid_seen.get(pqid, 0)
+            qid_seen[pqid] = sub_idx + 1
+
+            # Use the sub-question's answer; fall back to last if index out of range
+            if sub_idx < len(letters):
+                answer = letters[sub_idx]
+            else:
+                answer = letters[-1]
+                self.debug("RW Q#%d (qid:%s): sub_idx %d out of range (%d letters), using last" %
+                           (i + 1, pqid, sub_idx, len(letters)))
             if not answer:
                 continue
 
@@ -586,6 +643,91 @@ class ETSAutoAnswer(ETSBase):
         except Exception:
             return {"error": str(result)}
 
+    # ── Recording Page Detection ────────────────────────────
+
+    def is_recording_page(self):
+        """Check if current page is a recording question (btn-stopRecord visible)."""
+        js = r'''(function(){
+            var btn = document.querySelector('.btn-stopRecord');
+            if (!btn) return JSON.stringify({is_recording: false});
+            var visible = btn.offsetHeight > 0;
+            var nextBtn = null;
+            var btns = document.querySelectorAll('button');
+            for (var i = 0; i < btns.length; i++) {
+                if (btns[i].textContent.trim() === '\u4e0b\u4e00\u6b65') { nextBtn = btns[i]; break; }
+            }
+            return JSON.stringify({
+                is_recording: visible,
+                stop_disabled: btn.disabled,
+                next_disabled: nextBtn ? nextBtn.disabled : null
+            });
+        })()'''
+        try:
+            r = json.loads(self.eval_js(js) or '{}')
+            return r.get('is_recording', False)
+        except Exception:
+            return False
+
+    def wait_for_recording_done(self, max_wait=600):
+        """Wait for user to finish recording manually. Polls until 'next' button
+        becomes enabled (recording submitted) or timeout. Returns True if next
+        became available, False on timeout/stop."""
+        print("\n" + "=" * 40)
+        print("🎤 \u5f55\u97f3\u9898\u5df2\u5230\u8fbe\uff01\u8bf7\u624b\u52a8\u5b8c\u6210\u5f55\u97f3\uff1a")
+        print("   1. \u70b9\u51fb\u9875\u9762\u4e0a\u7684\u5f55\u97f3\u6309\u94ae\u5f00\u59cb\u5f55\u97f3")
+        print("   2. \u5f55\u97f3\u7ed3\u675f\u540e\u70b9\u51fb\u201c\u7ed3\u675f\u5f55\u97f3\u201d")
+        print("   3. \u63d0\u4ea4\u540e\u811a\u672c\u4f1a\u81ea\u52a8\u7ee7\u7eed")
+        print("   \u7b49\u5f85\u6700\u957f %d \u79d2\uff08%d \u5206\u949f\uff09" % (max_wait, max_wait // 60))
+        print("=" * 40 + "\n")
+
+        # Notify GUI via callback
+        self._fire_question({'type': 'recording', 'type_label': '\u5f55\u97f3\u9898-\u7b49\u5f85\u624b\u52a8\u5b8c\u6210',
+                             'step': 'recording_wait'})
+
+        start = time.time()
+        notified_5min = False
+        notified_1min = False
+
+        while time.time() - start < max_wait:
+            # Check stop signal
+            if self.stop_event and self.stop_event.is_set():
+                return False
+            if self._recording_window_closed:
+                return False
+
+            # Check if next button is now enabled (recording done)
+            js = r'''(function(){
+                var btns = document.querySelectorAll('button');
+                for (var i = 0; i < btns.length; i++) {
+                    if (btns[i].textContent.trim() === '\u4e0b\u4e00\u6b65' && !btns[i].disabled) {
+                        return JSON.stringify({next_ready: true});
+                    }
+                }
+                return JSON.stringify({next_ready: false});
+            })()'''
+            try:
+                r = json.loads(self.eval_js(js) or '{}')
+                if r.get('next_ready'):
+                    elapsed = int(time.time() - start)
+                    print("\u2705 \u5f55\u97f3\u5b8c\u6210\uff08\u8017\u65f6 %d \u79d2\uff09\uff0c\u7ee7\u7eed\u7b54\u9898" % elapsed)
+                    return True
+            except Exception:
+                pass
+
+            # Progress notifications
+            elapsed = time.time() - start
+            if not notified_5min and elapsed > 300:
+                print("\u23f0 \u5df2\u7b49\u5f85 5 \u5206\u949f\uff0c\u8bf7\u5c3d\u5feb\u5b8c\u6210\u5f55\u97f3")
+                notified_5min = True
+            if not notified_1min and elapsed > max_wait - 60:
+                print("\u26a0\ufe0f \u5269\u4f59\u4e0d\u8db3 1 \u5206\u949f\uff0c\u5373\u5c06\u8d85\u65f6\u9000\u51fa")
+                notified_1min = True
+
+            self.interruptible_sleep(3)
+
+        print("\u23f0 \u5f55\u97f3\u7b49\u5f85\u8d85\u65f6\uff08%d \u5206\u949f\uff09\uff0c\u811a\u672c\u9000\u51fa" % (max_wait // 60))
+        return False
+
     # ── Choose Answer ─────────────────────────────────────────
 
     def answer_choose(self):
@@ -780,7 +922,14 @@ class ETSAutoAnswer(ETSBase):
             r1 = json.loads(self.eval_js(js_fill) or "{}")
             self.debug("Fill result: " + str(r1))
 
-            self.stats['fill_answered'] += 1
+            # Bug fix: only count as answered if fill actually succeeded
+            if r1.get('filled'):
+                self.stats['fill_answered'] += 1
+            else:
+                self.stats.setdefault('fill_errors', 0)
+                self.stats['fill_errors'] += 1
+                print("  Fill FAILED for %s: %s" % (inp_id, r1.get('error', 'unknown')))
+                continue
             if self._on_question_answered:
                 try:
                     self._on_question_answered(inp_id, value, 'fill')
@@ -809,16 +958,12 @@ class ETSAutoAnswer(ETSBase):
 
     # ── Recording Helper ────────────────────────────────────
 
-    def show_recording_answers_window(self, poll_worker_fn=None):
-        """Show ALL recording answers in a single tkinter window at startup.
-        Window stays open while script runs; closing it signals the script to stop.
-        poll_worker_fn: optional callback to register with root.after for thread monitoring."""
-        if not self.recording_answers:
-            return False
+    def _build_recording_window(self, root, poll_worker_fn=None):
+        """Build recording answers window content on the given Tk root or Toplevel.
+        Shared by CLI (tk.Tk) and GUI (tk.Toplevel) paths."""
         import tkinter as tk
         from tkinter import scrolledtext
 
-        root = tk.Tk()
         self._tk_root = root  # Assign immediately so _poll_worker can reference it
         root.title('[Recording] 录音题参考答案')
         root.configure(bg='#1e1e2e')
@@ -849,7 +994,6 @@ class ETSAutoAnswer(ETSBase):
         )
         st.pack(fill='both', expand=True)
 
-        import re
         type_labels = {'picture': '听后转述', 'dialogue': '回答问题', 'read': '短文朗读'}
         type_icons = {'picture': '📖', 'dialogue': '💬', 'read': '📚'}
 
@@ -905,9 +1049,7 @@ class ETSAutoAnswer(ETSBase):
                        bg='#2d2d3f', fg='#a6adc8', font=('Microsoft YaHei UI', 10))
         hint.pack(side='left', padx=(16, 0), pady=14)
 
-        closed = [False]
         def on_close():
-            closed[0] = True
             # Signal stop_event so worker thread exits cleanly
             if self.stop_event:
                 self.stop_event.set()
@@ -926,12 +1068,67 @@ class ETSAutoAnswer(ETSBase):
 
         # Register poll_worker AFTER root is created (fixes _tk_root AttributeError)
         if poll_worker_fn:
-            self._tk_root.after(500, poll_worker_fn)
+            root.after(500, poll_worker_fn)
 
         root.focus_force()
-        root.mainloop()
-        self._recording_window_closed = True
-        return True
+
+    def show_recording_answers_window(self, poll_worker_fn=None):
+        """Show ALL recording answers in a single tkinter window at startup.
+        Window stays open while script runs; closing it signals the script to stop.
+        poll_worker_fn: optional callback to register with root.after for thread monitoring.
+
+        Thread-safety: detects whether a Tk root already exists (GUI mode).
+        - CLI mode: creates tk.Tk() + mainloop (blocks main thread, worker runs in bg)
+        - GUI mode: creates tk.Toplevel() on existing root, runs mainloop on main thread
+          via after() scheduling — never creates a second tk.Tk()"""
+        if not self.recording_answers:
+            return False
+        import tkinter as tk
+
+        # Detect existing Tk root (GUI mode — ets_gui already has CTk mainloop)
+        existing_root = None
+        try:
+            existing_root = tk._default_root
+        except AttributeError:
+            pass
+
+        if existing_root is not None:
+            # GUI mode: create Toplevel on existing root, schedule on main thread
+            # The worker thread (which called run()) will block here until the
+            # window is closed. We use a threading.Event to synchronize.
+            import threading as _th
+            done = _th.Event()
+
+            def _create_on_main():
+                try:
+                    win = tk.Toplevel(existing_root)
+                    self._build_recording_window(win, poll_worker_fn)
+                    # When Toplevel is destroyed, signal done
+                    win.protocol('WM_DELETE_WINDOW', lambda: (self.stop_event.set() if self.stop_event else None, win.destroy()))
+                    existing_root.bind('<<RecWindowClosed>>', lambda e: done.set(), add='+')
+                    # Override on_close to also signal done
+                    def _on_close():
+                        if self.stop_event:
+                            self.stop_event.set()
+                        win.destroy()
+                        done.set()
+                    win.protocol('WM_DELETE_WINDOW', _on_close)
+                except Exception as e:
+                    print('[REC] Error creating Toplevel: %s' % e)
+                    done.set()
+
+            existing_root.after(0, _create_on_main)
+            # Block worker thread until window is closed
+            done.wait(timeout=86400)  # 24h safety timeout
+            self._recording_window_closed = True
+            return True
+        else:
+            # CLI mode: create new Tk root + mainloop (blocks main thread)
+            root = tk.Tk()
+            self._build_recording_window(root, poll_worker_fn)
+            root.mainloop()
+            self._recording_window_closed = True
+            return True
 
     # ── Navigation ────────────────────────────────────────────
 
@@ -958,11 +1155,13 @@ class ETSAutoAnswer(ETSBase):
         var iDoc = iframe.contentDocument || iframe.contentWindow.document;
         var ni = iDoc.querySelector(".next_icon");
         if (!ni) return JSON.stringify({success: false, reason: "no next_icon"});
-        // If parent container is hidden, force-show it (ETS hides submit until audio/timeout,
-        // but we've already selected an answer, so it's safe to submit)
+        // Bug fix: do NOT force-show hidden submit button — ETS hides it while
+        // audio is playing or a timer is running. Forcing it may submit before
+        // the server is ready, causing score anomalies. Instead, report it as
+        // not-ready so the caller waits.
         var parent = ni.parentElement;
         if (parent && getComputedStyle(parent).display === "none") {
-            parent.classList.remove("none");
+            return JSON.stringify({success: false, reason: "next_icon hidden (waiting for audio/timer)"});
         }
         ni.click();
         return JSON.stringify({success: true, method: "iframe .next_icon"});
@@ -1002,7 +1201,15 @@ class ETSAutoAnswer(ETSBase):
             self.debug("Next: button")
         return result
 
-    def wait_iframe_ready(self, timeout=10):
+    def wait_iframe_ready(self, timeout=15):
+        """Wait for iframe to contain choices or inputs.
+
+        Adaptive timeout: scales with total_questions (more questions → more
+        tolerance for slow page loads), capped at 30s.
+        """
+        # #7: Adaptive timeout — larger exams tend to have heavier pages
+        adaptive_timeout = min(10 + max(self.total_questions, 1) // 3, 30)
+        timeout = max(timeout, adaptive_timeout)
         start = time.time()
         while time.time() - start < timeout:
             state = self.get_page_state()
@@ -1237,6 +1444,7 @@ class ETSAutoAnswer(ETSBase):
 
         consecutive_empty = 0
         step = 0
+        consecutive_conn_errors = 0  # #3: track connection drops for reconnect logic
 
         # ── Adaptive thresholds ──────────────────────────────────────────
         # Hardcoded thresholds (5/10) cause premature termination on jittery
@@ -1281,38 +1489,68 @@ class ETSAutoAnswer(ETSBase):
                 self.stop_event.set()
                 break
 
-            ready, _ = self.wait_iframe_ready()
-            self.inject_bridge()
-            self.interruptible_sleep(0.3)
+            # ── #3: Connection resilience — wrap page state read with reconnect ──
+            try:
+                ready, _ = self.wait_iframe_ready()
+                self.inject_bridge()
+                self.interruptible_sleep(0.3)
 
-            if not ready:
-                self.debug("Step %d: iframe not ready, waiting..." % step)
-                nr = self.click_next()
-                if nr.get('success'):
-                    self.interruptible_sleep(1)
-                # Wait for iframe to stabilize
-                for _wait_i in range(15):
-                    self.interruptible_sleep(2)
-                    ready2, _ = self.wait_iframe_ready(timeout=5)
-                    if ready2:
-                        break
+                if not ready:
+                    self.debug("Step %d: iframe not ready, waiting..." % step)
+                    nr = self.click_next()
+                    if nr.get('success'):
+                        self.interruptible_sleep(1)
+                    # Wait for iframe to stabilize
+                    for _wait_i in range(15):
+                        self.interruptible_sleep(2)
+                        ready2, _ = self.wait_iframe_ready(timeout=5)
+                        if ready2:
+                            break
+                    else:
+                        consecutive_unreachable += 1
+                        if consecutive_unreachable >= max_unreachable:
+                            print("Too many unreachable pages (%d), stopping." % consecutive_unreachable)
+                            break
+                        # Exponential backoff: 2s, 4s, 8s (cap at 8s)
+                        backoff = min(2 * (2 ** (consecutive_unreachable - 1)), 8)
+                        self.debug("  Unreachable page %d, backoff %.0fs" % (consecutive_unreachable, backoff))
+                        self.interruptible_sleep(backoff)
+                        continue
+                    state = self.get_page_state()
+                    consecutive_unreachable = 0
+                    consecutive_empty = 0
                 else:
-                    consecutive_unreachable += 1
-                    if consecutive_unreachable >= max_unreachable:
-                        print("Too many unreachable pages (%d), stopping." % consecutive_unreachable)
-                        break
-                    # Exponential backoff: 2s, 4s, 8s (cap at 8s)
-                    backoff = min(2 * (2 ** (consecutive_unreachable - 1)), 8)
-                    self.debug("  Unreachable page %d, backoff %.0fs" % (consecutive_unreachable, backoff))
-                    self.interruptible_sleep(backoff)
+                    consecutive_unreachable = 0
+                    consecutive_empty = 0
+                    state = self.get_page_state()
+                consecutive_conn_errors = 0  # reset on successful page state read
+            except (ConnectionError, TimeoutError) as conn_err:
+                consecutive_conn_errors += 1
+                self.debug("Connection error #%d: %s" % (consecutive_conn_errors, conn_err))
+                if consecutive_conn_errors >= 3:
+                    print("\n4. Connection lost repeatedly, stopping.")
+                    break
+                print("\n4. Connection lost (%s). Reconnecting..." % str(conn_err)[:80])
+                try:
+                    old_set_id = self.set_id
+                    self.reconnect()
+                    self._read_pinia_config()
+                    self._detect_rw_mode()
+                    # Bug fix: clear RW cache so stale showData isn't used after reconnect
+                    self.rw_show_data = None
+                    self._rw_cache_time = 0
+                    # Bug fix: reload answers if set_id changed during reconnect
+                    if self.set_id != old_set_id:
+                        self.debug("set_id changed after reconnect: %s → %s" % (old_set_id, self.set_id))
+                        self.load_answers()
+                        if self.strategy:
+                            self.strategy.load_set(self.set_id)
+                    print("Reconnected successfully, resuming...")
+                    self.interruptible_sleep(1)
                     continue
-                state = self.get_page_state()
-                consecutive_unreachable = 0
-                consecutive_empty = 0
-            else:
-                consecutive_unreachable = 0
-                consecutive_empty = 0
-                state = self.get_page_state()
+                except Exception as recon_err:
+                    print("Reconnect failed: %s" % recon_err)
+                    break
 
             # ── Real-time question info for GUI ──
             if self._on_question:
@@ -1402,6 +1640,16 @@ class ETSAutoAnswer(ETSBase):
                         continue
                     elif nr.get('reason') == 'disabled':
                         # Button disabled during fill section (ETS replays audio)
+                        # Could also be a fill+recording hybrid page
+                        if self.is_recording_page():
+                            self.debug("Recording page detected (fill + stopRecord visible)")
+                            if self.wait_for_recording_done():
+                                consecutive_empty = 0
+                                continue
+                            else:
+                                print("Recording wait ended, stopping script.")
+                                self.stop_event.set()
+                                break
                         self.debug("  Next disabled (fill audio replay), waiting for button...")
                         if self._wait_for_next(max_wait_loops=60, wait_sec=4, label="fill-audio"):
                             continue
@@ -1414,7 +1662,19 @@ class ETSAutoAnswer(ETSBase):
                         break
                     continue
             else:
-                # No choices AND no inputs — section transition
+                # No choices AND no inputs — could be section transition OR recording page
+                # Check for recording page first (btn-stopRecord visible)
+                if self.is_recording_page():
+                    self.debug("Recording page detected (no choice/input, stopRecord visible)")
+                    if self.wait_for_recording_done():
+                        consecutive_empty = 0
+                        continue  # next button is ready, loop will click it
+                    else:
+                        print("Recording wait ended, stopping script.")
+                        self.stop_event.set()
+                        break
+
+                # Not a recording page — treat as section transition
                 consecutive_empty += 1
                 self.debug("Section transition, waiting... (empty %d/%d)" % (consecutive_empty, max_empty))
                 if consecutive_empty >= max_empty:
@@ -1491,6 +1751,24 @@ class ETSAutoAnswer(ETSBase):
 
         # Fire on_complete callback
         self._fire_complete(result)
+
+        # #2: Save statistics report to file for later analysis
+        try:
+            stats_path = os.path.join(self.ets_base or '.', 'ets_stats.json')
+            report = {
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'set_id': self.set_id,
+                'mode': 'HOMEWORK' if self.homework_mode else 'PRACTICE',
+                'rw_mode': self.rw_mode,
+                'total_questions': self.total_questions,
+                'stats': dict(self.stats),
+                'result': result
+            }
+            with open(stats_path, 'w', encoding='utf-8') as sf:
+                json.dump(report, sf, ensure_ascii=False, indent=2)
+            self.debug("Stats report saved: %s" % stats_path)
+        except Exception as e:
+            self.debug("Stats report save failed: %s" % e)
 
         # Cleanup WebSocket
         if self.ws:
@@ -1658,7 +1936,32 @@ if __name__ == "__main__":
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
     parser.add_argument("--show-answers", action="store_true", help="Show all answers without auto-answering")
     parser.add_argument("--log", type=str, default=None, metavar="FILE", help="Save all output to a log file")
+    parser.add_argument("--log-keep", type=int, default=7, metavar="DAYS",
+                        help="Auto-delete log files older than N days in the log directory (default: 7, 0=disable)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Load answers and simulate without actually answering (safety check)")
     args = parser.parse_args()
+
+    # #8: Auto-clean old log files
+    if args.log and args.log_keep > 0:
+        try:
+            log_dir = os.path.dirname(os.path.abspath(args.log)) or '.'
+            cutoff = time.time() - args.log_keep * 86400
+            for fname in os.listdir(log_dir):
+                fpath = os.path.join(log_dir, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                # Only clean .log files to avoid accidents
+                if not fname.endswith('.log'):
+                    continue
+                if os.path.getmtime(fpath) < cutoff:
+                    try:
+                        os.remove(fpath)
+                        print("[Cleanup] Removed old log: %s" % fname)
+                    except Exception:
+                        pass
+        except Exception:
+            pass  # cleanup is non-critical
 
     # Setup log file (tee stdout AND stderr to file)
     tee = None
@@ -1682,9 +1985,31 @@ if __name__ == "__main__":
                 except Exception:
                     pass
         else:
-            result = auto.run(max_steps=args.max)
-            if args.json and result:
-                print(json.dumps(result, ensure_ascii=False))
+            if args.dry_run:
+                # #4: Dry-run mode — load answers, print summary, don't answer
+                auto.connect()
+                auto.load_answers()
+                print("\n[DRY RUN] Answers loaded, no questions will be answered.")
+                print("Set ID: %s" % auto.set_id)
+                print("Total questions: %d" % auto.total_questions)
+                print("Choose answers: %d" % sum(1 for v in auto.answers.values() if v.get('type') == 'choose'))
+                print("Fill answers: %d" % sum(1 for v in auto.answers.values() if v.get('type') == 'fill'))
+                print("Recording answers: %d" % len(auto.recording_answers))
+                print("\nDry run complete. Re-run without --dry-run to actually answer.")
+                if auto.ws:
+                    try:
+                        auto.ws.close()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    result = auto.run(max_steps=args.max)
+                    if args.json and result:
+                        print(json.dumps(result, ensure_ascii=False))
+                except InterruptedError:
+                    print("\n已停止")
+                except (ConnectionError, TimeoutError) as e:
+                    print("\n连接断开: %s" % e)
     finally:
         # Cleanup: restore stdout/stderr BEFORE closing log file
         # (so any exception during close can still write to stderr)

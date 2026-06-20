@@ -83,14 +83,19 @@ def _read_json(path):
 
 
 def _html_to_text(html_str):
-    """Convert HTML markup from ETS content to plain text."""
+    """Convert HTML markup from ETS content to plain text.
+
+    Uses a conservative tag-matching pattern that requires tags to start
+    with a letter — avoids false matches on math text like "x < y".
+    """
     if not html_str:
         return ''
     text = html_str
     text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
     text = re.sub(r'<p\s*/?>', '\n', text, flags=re.IGNORECASE)
     text = re.sub(r'</p>', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'<[^>]+>', '', text)
+    # Match only valid HTML tags: < followed by optional / then a letter
+    text = re.sub(r'</?[a-zA-Z][^>]*>', '', text)
     text = html.unescape(text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()

@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.6.3] - 2026-06-21
+
+### Added
+- **reconnect() 方法** — ETSBase 新增 CDP 重连机制，最多重试 3 次，每次间隔 2 秒，断线后可自动恢复
+- **录音题检测与等待** — ets_auto 新增 `is_recording_page()` 和 `wait_for_recording_done()`，到达录音题时提示用户手动完成
+- **GUI 进度条** — ets_gui 新增答题进度条和百分比标签，实时显示已完成/总数
+- **set_id 兜底扫描** — 当 Pinia 和 URL 均无法获取 set_id 时，扫描 ETS 数据目录找最新套卷
+- **RW 子题索引对齐** — 读写同步模式修复子题答案错位，按 qid 出现次数推进 letters 索引
+
+### Fixed
+- **Bug 1: GUI 模式录音窗口冲突** — `show_recording_answers_window` 在 GUI 模式下创建第二个 `tk.Tk()` 导致崩溃，改为检测已有 Tk root 并使用 `Toplevel` + 线程同步
+- **Bug 3: SemVer 预发布版比较** — `compare_versions` 将 `0.5.1-beta` 与 `0.5.1` 视为相等，现按 SemVer 规范预发布 < 正式版
+- **Bug 5: _set_cache 无淘汰** — ETSStrategy 类级缓存无上限，长时间运行内存泄漏，加 LRU 淘汰（上限 20 套）
+- **Bug 7: HTML 正则误匹配** — `<[^>]+>` 会误匹配数学表达式 `x < y`，改为 `</?[a-zA-Z][^>]*>` 要求标签以字母开头
+- **GUI 启动卡顿** — 移除 `_start` 中的 `_check_remote_async()` + `sleep(0.3)` 阻塞主线程 300ms 的问题
+- **worker 线程竞态** — `_restore_streams` 在 worker 线程仍可能写 QueueWriter 时恢复 stdout，现先 `join(timeout=2)` 再恢复
+- **GUI 错误状态检测** — worker 线程异常后状态栏仍显示"已完成"，现区分错误/停止/完成三种状态
+
+### Changed
+- **show_recording_answers_window 重构** — 拆分出 `_build_recording_window` 共享构建逻辑，CLI 用 `tk.Tk()` + mainloop，GUI 用 `Toplevel` + Event 同步
+- **_html_to_text 安全正则** — ets_parser.py 和 ets_strategy.py 同步修正则模式
+
 ## [0.6.2] - 2026-06-19
 
 ### Added

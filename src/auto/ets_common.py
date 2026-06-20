@@ -119,6 +119,9 @@ class ETSBase:
         if self.debug_mode:
             print("  [D] " + msg)
 
+    _RECONNECT_MAX_RETRIES = 3
+    _RECONNECT_DELAY = 2  # seconds between retries
+
     def connect(self):
         """Find ETS tab and establish CDP WebSocket connection.
 
@@ -134,6 +137,42 @@ class ETSBase:
         self.ws = websocket.create_connection(self.tab["webSocketDebuggerUrl"], timeout=None)
         print("ETS connected")
         self.debug("URL: " + self.tab['url'][:120])
+
+    def reconnect(self):
+        """Attempt to re-establish CDP WebSocket after disconnection.
+
+        Tries up to _RECONNECT_MAX_RETRIES times with _RECONNECT_DELAY second
+        intervals. Updates self.tab and self.ws on success.
+        Raises ConnectionError if all retries fail.
+        """
+        last_err = None
+        for attempt in range(1, self._RECONNECT_MAX_RETRIES + 1):
+            self.debug("Reconnect attempt %d/%d..." % (attempt, self._RECONNECT_MAX_RETRIES))
+            try:
+                # Close stale WebSocket if still open
+                if self.ws:
+                    try:
+                        self.ws.close()
+                    except Exception:
+                        pass
+                    self.ws = None
+                url = "http://localhost:%d/json" % self.port
+                tabs = json.loads(urllib.request.urlopen(url, timeout=5).read())
+                ets_tabs = [t for t in tabs if "ets100.com" in t.get("url", "")]
+                if not ets_tabs:
+                    raise Exception("No ETS tab found")
+                self.tab = ets_tabs[0]
+                self.ws = websocket.create_connection(self.tab["webSocketDebuggerUrl"], timeout=None)
+                print("ETS reconnected (attempt %d)" % attempt)
+                self.debug("URL: " + self.tab['url'][:120])
+                return True
+            except Exception as e:
+                last_err = e
+                self.debug("Reconnect attempt %d failed: %s" % (attempt, e))
+                if attempt < self._RECONNECT_MAX_RETRIES:
+                    time.sleep(self._RECONNECT_DELAY)
+        raise ConnectionError(
+            "Reconnect failed after %d attempts: %s" % (self._RECONNECT_MAX_RETRIES, last_err))
 
     _EVAL_JS_TIMEOUT = 15  # seconds per eval_js call
 

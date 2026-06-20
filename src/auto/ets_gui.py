@@ -34,7 +34,7 @@ force_utf8_stdio()
 import customtkinter as ctk
 
 # Version constant — bump on each release
-APP_VERSION = "0.6.2"
+APP_VERSION = "0.6.3"
 
 
 # ── Queue-based stdout bridge ────────────────────────────────
@@ -186,6 +186,19 @@ class ETSApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"))
         self._status_label.pack(fill="x", padx=16, pady=(0, 4))
 
+        # #1: Progress bar
+        self._progress_var = ctk.DoubleVar(value=0.0)
+        self._progress_bar = ctk.CTkProgressBar(parent, variable=self._progress_var, height=14)
+        self._progress_bar.pack(fill="x", padx=16, pady=(0, 4))
+        self._progress_bar.set(0.0)
+
+        # Progress label
+        self._progress_label_var = ctk.StringVar(value="")
+        self._progress_label = ctk.CTkLabel(
+            parent, textvariable=self._progress_label_var, anchor="w",
+            font=ctk.CTkFont(size=11), text_color="gray")
+        self._progress_label.pack(fill="x", padx=16, pady=(0, 4))
+
         # Hotkey hint
         self._hotkey_var = ctk.StringVar(value="")
         self._hotkey_label = ctk.CTkLabel(
@@ -288,6 +301,14 @@ class ETSApp(ctk.CTk):
                 inline_text += "  (%d/%d)" % (answered, total)
             self._preview_inline.configure(text=inline_text)
 
+            # #1: Update progress bar
+            if total and total > 0:
+                pct = min(answered / total, 1.0)
+                self._progress_var.set(pct)
+                self._progress_label_var.set("进度: %d/%d (%.0f%%)" % (answered, total, pct * 100))
+            elif answered:
+                self._progress_label_var.set("已处理: %d" % answered)
+
             # Update expanded panel if open
             if self._preview_expanded and self._preview_panel:
                 self._preview_panel.configure(state="normal")
@@ -320,12 +341,11 @@ class ETSApp(ctk.CTk):
         if self._running:
             return
 
-        # Re-check remote info before starting (may have changed since GUI launch)
-        self._check_remote_async()
-        # Give the remote check a moment to complete (it's non-blocking otherwise)
-        import time as _time
-        _time.sleep(0.3)
-
+        # Use already-fetched remote info (populated at startup or last check).
+        # Bug fix: removed _check_remote_async() + sleep(0.3) here — it blocked
+        # the tkinter main thread for 300ms causing UI freeze, and 0.3s wasn't
+        # enough for slow networks anyway. The remote check runs at GUI launch
+        # and via _on_remote_checked callback; we just use whatever is available.
         if self._remote_info is not None:
             try:
                 from ets_remote import classify_info
@@ -360,6 +380,9 @@ class ETSApp(ctk.CTk):
         self._stop_btn.configure(state="normal")
         self._status_var.set("运行中...")
         self._hotkey_var.set("⌨ F9暂停/恢复  F10跳过  F12停止")
+        # Reset progress bar
+        self._progress_var.set(0.0)
+        self._progress_label_var.set("")
 
         # Redirect stdout/stderr to queue
         self._queue_writer_out = QueueWriter(self._log_queue, original=sys.stdout)
@@ -464,9 +487,13 @@ class ETSApp(ctk.CTk):
 
     def _restore_streams(self):
         """Restore stdout/stderr to original, drain remaining log queue.
-        Note: QueueWriter already wrote to self.original synchronously,
-        so we only drain the queue to prevent stale messages leaking
-        into the next run — we do NOT re-write them to _original_stdout."""
+        Bug fix: join worker thread briefly first to close the race window
+        where QueueWriter still writes after streams are restored."""
+        # Wait briefly for worker thread to fully exit so it stops writing
+        # to QueueWriter (which may still reference this queue).
+        if self._worker and self._worker.is_alive() and self._worker is not threading.current_thread():
+            self._worker.join(timeout=2)
+
         # Drain remaining log messages (already written to original by QueueWriter)
         while not self._log_queue.empty():
             try:
@@ -485,16 +512,28 @@ class ETSApp(ctk.CTk):
         self._hotkey_var.set("")
         self._start_btn.configure(state="normal")
         self._stop_btn.configure(state="disabled")
+        # Bug fix: detect error state from worker thread
+        had_error = getattr(self, '_worker_error', False)
         if self._stop_event.is_set():
             self._status_var.set("已停止")
+            # Reset progress bar on stop
+            self._progress_var.set(0.0)
+            self._progress_label_var.set("")
+        elif had_error:
+            self._status_var.set("错误")
+            # Keep progress bar where it is (partial progress visible)
+            self._worker_error = False  # reset
         else:
             self._status_var.set("已完成")
+            # Set progress bar to 100% if completed naturally
+            self._progress_var.set(1.0)
 
     # ── Worker thread ────────────────────────────────────────
     def _run_worker(self, mode, port, debug, max_val):
         """Run the selected automation in a background thread.
         Uses stop_event passed to automation instances for clean interruption.
         No global monkey-patching of time.sleep."""
+        self._worker_error = False
         try:
             if mode == self.MODE_EXAM:
                 from ets_auto import ETSAutoAnswer
@@ -508,8 +547,10 @@ class ETSApp(ctk.CTk):
                     print("\n已停止")
                 except (ConnectionError, TimeoutError) as e:
                     print("\n连接断开: %s" % e)
+                    self._worker_error = True
                 except Exception as e:
                     print("\n错误: %s" % e)
+                    self._worker_error = True
 
             elif mode == self.MODE_PK:
                 from ets_word_pk import ETSWordPK
@@ -523,17 +564,21 @@ class ETSApp(ctk.CTk):
                     print("\n已停止")
                 except (ConnectionError, TimeoutError) as e:
                     print("\n连接断开: %s" % e)
+                    self._worker_error = True
                 except Exception as e:
                     print("\n错误: %s" % e)
+                    self._worker_error = True
 
         except ImportError as e:
             print("[错误] 导入失败: %s" % e)
             print("请确保 ets_auto.py / ets_word_pk.py / ets_common.py 在正确路径")
+            self._worker_error = True
             self.after(0, lambda: self._show_error(
                 "导入失败",
                 "找不到必要模块：%s\n\n请确保 ets_auto.py / ets_word_pk.py / ets_common.py 在正确路径" % e))
         except Exception as e:
             print("[错误] %s" % e)
+            self._worker_error = True
             self.after(0, lambda: self._show_error("运行错误", str(e)))
         finally:
             # Schedule UI update on main thread

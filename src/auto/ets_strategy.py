@@ -58,7 +58,12 @@ def _text_hash(text, length=8):
 
 
 def _html_to_text(html_str):
-    """Strip HTML tags and unescape entities."""
+    """Strip HTML tags and unescape entities.
+
+    Uses a conservative tag-matching pattern that requires tags to start
+    with a letter (e.g. <br>, <p>, </div>) — this avoids false matches on
+    math text like "x < y" or "a < 3" which are not HTML tags.
+    """
     if not html_str:
         return ''
     import html
@@ -68,7 +73,9 @@ def _html_to_text(html_str):
     text = re.sub(r'<br\s*/?>', ' ', text, flags=re.IGNORECASE)
     text = re.sub(r'<p\s*/?>', ' ', text, flags=re.IGNORECASE)
     text = re.sub(r'</p>', ' ', text, flags=re.IGNORECASE)
-    text = re.sub(r'<[^>]+>', '', text)
+    # Match only valid HTML tags: < followed by optional / then a letter
+    # This avoids matching math/comparison operators like "x < y"
+    text = re.sub(r'</?[a-zA-Z][^>]*>', '', text)
     text = html.unescape(text)
     # Collapse multiple spaces introduced by tag replacement
     text = re.sub(r' +', ' ', text)
@@ -85,11 +92,19 @@ class ETSStrategy:
     The composite key is built internally from (structure_type, stid, qid/title).
     """
 
+    _SET_CACHE_MAX = 20  # max cached sets; LRU eviction beyond this
+
     def __init__(self):
         self.set_id = None
         self.sections = []        # list of section dicts
         self.answer_index = {}    # composite_key → answer_dict
         self.recording_answers = []
+        # Class-level LRU cache: set_id → (sections, answer_index, recording_answers)
+        # Avoids re-reading content.json when switching between sets
+        if not hasattr(self.__class__, '_set_cache'):
+            self.__class__._set_cache = {}
+        if not hasattr(self.__class__, '_set_cache_order'):
+            self.__class__._set_cache_order = []  # list of set_ids, MRU at end
 
     # ── Public API ────────────────────────────────────────────
 
@@ -97,8 +112,23 @@ class ETSStrategy:
         """
         Load all sections for a set_id from ETS cache.
         Returns True on success, False if no data found.
+        Uses class-level cache to avoid re-reading content.json files.
         """
-        self.set_id = str(set_id)
+        set_id = str(set_id)
+
+        # Check cache first (and update LRU order)
+        cached = self.__class__._set_cache.get(set_id)
+        if cached is not None:
+            self.set_id = set_id
+            self.sections, self.answer_index, self.recording_answers = cached
+            # Move to end (most recently used)
+            order = self.__class__._set_cache_order
+            if set_id in order:
+                order.remove(set_id)
+            order.append(set_id)
+            return len(self.sections) > 0
+
+        self.set_id = set_id
         self.sections = []
         self.answer_index = {}
         self.recording_answers = []
@@ -130,6 +160,19 @@ class ETSStrategy:
             }
             self.sections.append(section)
             self._index_section(section)
+
+        # Store in cache with LRU eviction
+        if self.sections:
+            cache = self.__class__._set_cache
+            order = self.__class__._set_cache_order
+            cache[set_id] = (self.sections, self.answer_index, self.recording_answers)
+            if set_id in order:
+                order.remove(set_id)
+            order.append(set_id)
+            # Evict oldest entries beyond max size
+            while len(order) > self.__class__._SET_CACHE_MAX:
+                old_id = order.pop(0)
+                cache.pop(old_id, None)
 
         return len(self.sections) > 0
 
