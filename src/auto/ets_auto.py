@@ -15,7 +15,7 @@ from urllib.parse import urlparse, parse_qs
 from urllib.error import URLError
 
 # Version constant — keep in sync with ets_gui.py APP_VERSION
-__version__ = "0.6.3"
+__version__ = "0.6.4"
 from ets_common import ETSBase, force_utf8_stdio
 from ets_strategy import ETSStrategy
 

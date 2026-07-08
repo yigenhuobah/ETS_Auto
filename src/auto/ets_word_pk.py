@@ -9,7 +9,7 @@ from ets_common import ETSBase, force_utf8_stdio
 from ets_hotkey import ETSHotkey
 
 # Version constant — keep in sync with ets_gui.py APP_VERSION
-__version__ = "0.6.2"
+__version__ = "0.6.4"
 
 
 def _edit_dist(a, b):
@@ -80,7 +80,14 @@ class ETSWordPK(ETSBase):
     def __init__(self, port=10086, debug_mode=False, stop_event=None):
         super().__init__(port=port, debug_mode=debug_mode, stop_event=stop_event)
         self.ets_base = os.path.join(os.path.expandvars(r'%APPDATA%'), 'ETS')
+        # ETS client changed dict location/format around 2026-06:
+        #   Old: pc_xst_dict/pc_xst_dict.json  (pure JSON [{Word, Trans}])
+        #   New: common/material/word/worddict_data.json  (JS var + Base64 trans)
+        # Try new path first, fall back to old.
+        self.dict_path_new = os.path.join(self.ets_base, 'common', 'material', 'word', 'worddict_data.json')
         self.dict_path = os.path.join(self.ets_base, 'pc_xst_dict', 'pc_xst_dict.json')
+        if os.path.exists(self.dict_path_new):
+            self.dict_path = self.dict_path_new
         # Read-only: bundled inside exe via --add-data (PyInstaller _MEIPASS)
         self.ecdict_path = _resource_path('ecdict_pk.json')
         # User-writable: must live next to the exe, not inside the bundle
@@ -94,17 +101,37 @@ class ETSWordPK(ETSBase):
 
     # ── Dictionary Loading ──────────────────────────────────
 
-    def load_dictionary(self):
-        if not os.path.exists(self.dict_path):
-            print("ERROR: Dictionary not found: " + self.dict_path)
-            return False
-        t0 = time.time()
-        with open(self.dict_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        for entry in data:
-            word = entry.get('Word', '').strip()
-            trans = entry.get('Trans', '').strip()
-            if not word or not trans:
+    def _load_dict_new_format(self, path):
+        """Load new ETS dict format: JS variable assignment with Base64-encoded trans.
+
+        File format:  wordsTranslateArr = `[{word: {word, trans(b64), ...}}, ...]`
+        Each entry is a single-key dict: {the_word: {word, trans, url_us, ...}}
+        """
+        import base64 as _b64
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        m = re.search(r'`\[.*\]`', content, re.DOTALL)
+        if not m:
+            raise ValueError("Cannot extract JSON from new-format dict file")
+        json_str = m.group(0)[1:-1]  # strip leading/trailing backticks
+        arr = json.loads(json_str)
+        for entry in arr:
+            if not isinstance(entry, dict) or not entry:
+                continue
+            # Each entry: {word: {word, trans(b64), ...}}
+            key = next(iter(entry))
+            val = entry[key]
+            if not isinstance(val, dict):
+                continue
+            word = (val.get('word') or key).strip()
+            trans_b64 = val.get('trans', '').strip()
+            if not word or not trans_b64:
+                continue
+            try:
+                trans = _b64.b64decode(trans_b64).decode('utf-8').strip()
+            except Exception:
+                continue
+            if not trans:
                 continue
             self.word_trans[word.lower()] = trans
             for line in trans.split('\n'):
@@ -114,6 +141,35 @@ class ETSWordPK(ETSBase):
                 cn = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', line).strip()
                 if cn:
                     self.trans_index.setdefault(cn, []).append(word)
+        return len(arr)
+
+    def load_dictionary(self):
+        if not os.path.exists(self.dict_path):
+            print("ERROR: Dictionary not found: " + self.dict_path)
+            return False
+        t0 = time.time()
+        is_new_format = 'worddict_data' in os.path.basename(self.dict_path)
+        if is_new_format:
+            count = self._load_dict_new_format(self.dict_path)
+            base_count = len(self.word_trans)
+            print("  New-format dict loaded: %d entries" % count)
+        else:
+            with open(self.dict_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            for entry in data:
+                word = entry.get('Word', '').strip()
+                trans = entry.get('Trans', '').strip()
+                if not word or not trans:
+                    continue
+                self.word_trans[word.lower()] = trans
+                for line in trans.split('\n'):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    cn = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', line).strip()
+                    if cn:
+                        self.trans_index.setdefault(cn, []).append(word)
+            base_count = len(self.word_trans)
         base_count = len(self.word_trans)
 
         # ── Load ECDICT PK supplement ──

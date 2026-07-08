@@ -34,7 +34,7 @@ force_utf8_stdio()
 import customtkinter as ctk
 
 # Version constant — bump on each release
-APP_VERSION = "0.6.3"
+APP_VERSION = "0.6.4"
 
 
 # ── Queue-based stdout bridge ────────────────────────────────

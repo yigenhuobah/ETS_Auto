@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.6.4] - 2026-07-08
+
+### Fixed
+- **单词PK无法启动（词典路径变更）** — ETS客户端更新后词典从 `pc_xst_dict/pc_xst_dict.json`（纯JSON）迁移到 `common/material/word/worddict_data.json`（JS变量+Base64编码），旧路径目录为空导致 `load_dictionary()` 直接返回False，PK启动后立即退出。新增 `_load_dict_new_format()` 解析新格式，`__init__` 自动检测新旧路径，完全向后兼容
+
 ## [0.6.3] - 2026-06-21
 
 ### Added
