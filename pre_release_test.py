@@ -7,6 +7,7 @@ Exit code 0 = all pass, non-zero = fail (CI should abort).
 import sys
 import os
 import re
+import json
 
 # Add src/auto to path so imports work like they do in production
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src', 'auto')
@@ -777,6 +778,85 @@ def t_sig_base_connect():
     sig = inspect.signature(ETSBase.connect)
     assert sig.parameters, f"connect() should have parameters"
 test("ETSBase.connect() signature stable", t_sig_base_connect)
+
+# ── 13. Version / path / integrity hygiene (v0.6.5) ─────────
+print("\n=== Version / Path / Integrity Hygiene ===")
+
+def t_app_version_single_source():
+    from ets_common import APP_VERSION
+    import ets_auto
+    import ets_word_pk
+    import ets_gui
+    assert isinstance(APP_VERSION, str) and APP_VERSION, "APP_VERSION empty"
+    assert ets_auto.__version__ == APP_VERSION, (
+        f"ets_auto.__version__={ets_auto.__version__!r} != {APP_VERSION!r}")
+    assert ets_word_pk.__version__ == APP_VERSION, (
+        f"ets_word_pk.__version__={ets_word_pk.__version__!r} != {APP_VERSION!r}")
+    gui_v = getattr(ets_gui, 'APP_VERSION', APP_VERSION)
+    assert gui_v == APP_VERSION, f"ets_gui.APP_VERSION={gui_v!r} != {APP_VERSION!r}"
+    # info.json at repo root should match when present
+    info_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'info.json')
+    if os.path.isfile(info_path):
+        with open(info_path, 'r', encoding='utf-8') as f:
+            info = json.load(f)
+        assert info.get('version') == APP_VERSION, (
+            f"info.json version={info.get('version')!r} != {APP_VERSION!r}")
+test("APP_VERSION single-source matches auto/pk/gui/info.json", t_app_version_single_source)
+
+def t_user_data_path_basename():
+    from ets_common import user_data_path
+    p = user_data_path('pk_extra.json')
+    assert os.path.basename(p) == 'pk_extra.json', p
+    p2 = user_data_path(r'..\..\evil.json')
+    assert os.path.basename(p2) == 'evil.json', p2
+    assert '..' not in os.path.basename(p2)
+test("user_data_path() uses basename only (no path escape)", t_user_data_path_basename)
+
+def t_verify_remote_integrity_api():
+    from ets_remote import verify_remote_payload_integrity
+    # No key configured → allowlist-only success
+    ok, why = verify_remote_payload_integrity({'version': '0.6.5'})
+    assert ok is True, why
+    assert isinstance(why, str) and why
+test("verify_remote_payload_integrity() allowlist-only when no key", t_verify_remote_integrity_api)
+
+def t_word_pk_stop_event_default():
+    import threading
+    from ets_word_pk import ETSWordPK
+    pk = ETSWordPK(debug_mode=False, stop_event=None)
+    assert pk.stop_event is not None
+    assert isinstance(pk.stop_event, threading.Event)
+test("ETSWordPK default stop_event is Event (OPEN-M4)", t_word_pk_stop_event_default)
+
+def t_safe_set_id_digits_only():
+    from ets_strategy import _safe_set_id
+    assert _safe_set_id('12345') == '12345'
+    assert _safe_set_id(' 99 ') == '99'
+    assert _safe_set_id('../x') is None
+    assert _safe_set_id('12ab') is None
+    assert _safe_set_id(None) is None
+test("_safe_set_id() digits-only / rejects traversal", t_safe_set_id_digits_only)
+
+def t_pick_ets_tab_prefers_exam():
+    from ets_common import ETSBase
+    base = ETSBase()
+    tabs = [
+        {'url': 'https://statics.ets100.com/home', 'title': 'Home',
+         'webSocketDebuggerUrl': 'ws://localhost/1', 'type': 'page'},
+        {'url': 'https://statics.ets100.com/x#/doHomework?id=1', 'title': 'HW',
+         'webSocketDebuggerUrl': 'ws://localhost/2', 'type': 'page'},
+    ]
+    picked = base._pick_ets_tab(tabs)
+    assert picked is not None
+    assert 'doHomework' in picked['url'] or 'Homework' in picked.get('title', '')
+test("_pick_ets_tab() prefers homework/exam URL (OPEN-H3)", t_pick_ets_tab_prefers_exam)
+
+def t_js_escape_line_separators():
+    from ets_common import ETSBase
+    out = ETSBase.js_escape('a b c')
+    assert ' ' not in out and ' ' not in out
+    assert '\\u2028' in out and '\\u2029' in out
+test("js_escape() escapes U+2028/U+2029 (OPEN-M3)", t_js_escape_line_separators)
 
 # ── Summary ────────────────────────────────────────────────
 print(f"\n{'='*40}")

@@ -22,6 +22,11 @@
 - ✅ **零网络依赖** — 答案从本地缓存直接提取，无需抓包联网
 - ✅ **双模式兼容** — 模拟练习 & 作业模式自动检测，无缝切换
 - ✅ **跨题型自动导航** — 选择→填空 Section 过渡自动等待重试
+- ✅ **断连自动重连** — CDP WebSocket 断开后自动 reconnect（套卷/PK/RW）
+- ✅ **录音页等待** — 到达录音题提示手动完成，提交后自动继续
+- ✅ **全局热键** — F9 暂停 / F10 跳过 / F12 停止
+- ✅ **GUI 进度条** — 实时显示已完成/总数
+- ✅ **远程配置（可选网络）** — 版本检查/杀开关/公告；**答案仍纯本地**，不上传题目
 
 ---
 
@@ -58,6 +63,10 @@ A: 脚本启动时会自动弹出参考答案窗口（听后转述/回答问题/
 A: 运行 `python run.py pk` 或 `ets_pk.exe`，然后进入 ETS 的单词 PK 匹配页面即可。脚本会自动抓取题目并从本地字典匹配答案，答错的会自动学习，命中率越来越高。
 * **Q: 离线试卷浏览器看不到任何试卷？**
 A: 浏览器读取 `%APPDATA%\ETS` 目录下的缓存。需要先在 ETS 客户端中打开过至少一次作业，系统才会缓存试卷数据。
+* **Q: 热键怎么用？**
+A: 运行中全局有效：**F9** 暂停/继续，**F10** 跳过当前题，**F12** 紧急停止（断开 CDP）。命令行与 GUI 均可。
+* **Q: 不是说「零网络」吗，为什么还会联网？**
+A: **答题答案始终读本地缓存**，不抓包、不上传题目。可选联网仅用于检查 `info.json`（版本/杀开关/公告）和热更 `pk_extra.json`；可断网使用。
 
 ---
 
@@ -100,6 +109,9 @@ python src/auto/ets_parser.py
 python src/auto/ets_auto.py --debug        # 套卷答题
 python src/auto/ets_word_pk.py --debug     # 单词PK
 
+# 6. 发版前 / 开发自检（无需 ETS 客户端）
+python pre_release_test.py
+python src/auto/tests/test_unit.py
 ```
 
 ---
@@ -108,7 +120,7 @@ python src/auto/ets_word_pk.py --debug     # 单词PK
 
 ```text
 # ── 套卷答题 ──
-ETS Auto v0.6.2
+ETS Auto v0.6.5
 ========================================
 ETS connected
 Loaded 21 answers (set_id=721920)
@@ -219,11 +231,15 @@ ETS_Auto/
 ├── CHANGELOG.md
 ├── ecdict_pk.json                # ECDICT 字典补充 (PK用)
 └── src/auto/
-    ├── ets_common.py             # ★ 共享基类 (CDP连接/eval_js)
-    ├── ets_auto.py                # ★ 套卷自动答题
+    ├── ets_common.py             # ★ 共享基类 (CDP/重连/版本/路径)
+    ├── ets_auto.py               # ★ 套卷自动答题
     ├── ets_word_pk.py            # ★ 单词PK自动答题
+    ├── ets_strategy.py           # 答案策略层
+    ├── ets_hotkey.py             # 全局热键
+    ├── ets_remote.py             # 远程配置
     ├── ets_gui.py                # ★ 图形界面 (CustomTkinter)
-    ├── ets_parser.py             # ★ 离线试卷浏览器
+    ├── ets_parser.py             # ★ 离线试卷浏览器数据层
+    ├── ets_browser_ui.py         # 离线浏览 UI
     └── run.py                    # 统一入口 (exam|pk|gui)
 
 ```
@@ -238,8 +254,11 @@ ETS_Auto/
 * [x] **模块拆分** —— 提取 ets_common.py 共享基类，统一入口 run.py。 ✅ v0.3.0
 * [x] **傻瓜式 GUI 界面** —— CustomTkinter 可视化窗口，点点鼠标即可完成。 ✅ v0.4.0
 * [x] **离线试卷浏览器** —— 扫描本地缓存，红字高亮正确答案，支持五种题型。 ✅ v0.4.0
-* [ ] **热键支持** —— 全局快捷键控制开始/暂停/停止
-* [ ] **答案本地解析增强** — 断连恢复/双重验证/作业列表
+* [x] **热键支持** —— F9 暂停 / F10 跳过 / F12 停止（全局 RegisterHotKey）。 ✅ v0.5+
+* [x] **断连恢复** —— CDP `reconnect()` + 套卷/PK/RW 自动重连与 bridge 重注入。 ✅ v0.6.3–0.6.5
+* [x] **策略层双重验证** —— 复合 key 索引 + 模糊 + DOM 回退；`set_id` 数字校验。 ✅ v0.5–0.6.5
+* [x] **远程配置** —— 版本/杀开关/公告/pk_extra 热更；可选 HMAC/Ed25519 完整性。 ✅ v0.6.0–0.6.5
+* [ ] **作业模式全量真机验收** — 真实作业卷提交链路（桥接已做，缺稳定作业卷回归）
 
 > **注**：由于移动端系统级权限管控，本脚本目前及未来均**不计划**兼容 Android 或 iOS 平台。如果有移动端相关需求，请尝试开源社区的其他相关库吧（如 `Fuck_ets100`，适用于安卓设备的答案检索工具）。
 
@@ -264,10 +283,16 @@ ETS_Auto/
 一个人（还有机）的力量是有限的，目标平台的版本和题型也千奇百怪。我们极其欢迎各路技术大佬共同参与开发！
 无论你是：
 - 修复了某个特定旧版本客户端的兼容性 Bug。
-- 实现了 Roadmap 中的热键支持或答案解析增强。
+- 补齐真机验收项（作业提交、多 tab、整卷 E2E）或纯逻辑单测。
 - 优化了底层的 JS 注入逻辑。
-- 甚至只是修正了readme里的一个错别字。
+- 甚至只是修正了 readme 里的一个错别字。
 都可以直接 Fork 本仓库并提交 Pull Requests！
+
+提交前建议本地跑通：
+```bash
+python pre_release_test.py
+python src/auto/tests/test_unit.py
+```
 
 
 ## ⚠️ 注意事项与免责声明

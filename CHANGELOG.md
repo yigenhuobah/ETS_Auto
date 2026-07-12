@@ -2,6 +2,12 @@
 
 ## [0.6.5] - 2026-07-12
 
+### Docs & Tests (2026-07-12 补全)
+- **文档对齐 0.6.5** — `CLAUDE.md` 版本单源；`src/auto/README` 重写；根 `README` 功能/FAQ/Roadmap/自检命令；`HANDOVER` 头+§3.3/3.4/录音结论；`docs/testing.md` + `docs/release.md` 新建；`deep_bug_audit` §8.1 状态刷新；`dev_log` 页首现状注记
+- **`test_unit.py`** — APP_VERSION / user_data_path / stop_event / tab / PK 新词典 / fuzzy / RW rebuild / drop_connection；**另补** reconnect 控制流、录音 wait、词典路径选择、remote allowlist、GUI 进度公式；失败时 **exit≠0**
+- **`pre_release_test.py`** — 版本/info.json、user_data_path、integrity API、PK stop_event、safe set_id、pick tab、js_escape（**58** 项）
+- **CI** — `build-exe.yml` 在 pre_release 后增加 `python src/auto/tests/test_unit.py`
+
 ### Changed (low-risk simplify)
 - **版本单源** — `APP_VERSION` 只在 `ets_common` 定义；`ets_auto` / `ets_word_pk` / `ets_gui` 再导出
 - **RW 重连控制流** — `_handle_rw_reconnect()` 收口原 6 处复制粘贴
@@ -63,8 +69,8 @@
 - **2026-07-12 选项2 重扫**：对照当前工作树更新 §8.0/§8.1（大审计+residual 多为 FIXED；仍开项仍为 OPEN-H1–H8 等）。**只更新文档，未改生产代码。**
 
 ### Tests
-- `test_unit.py` 扩展（103 tests）
-- `pre_release_test.py` 含 strategy/hotkey 语法检查
+- `test_unit.py`：**142** OK（无真机 CDP）
+- `pre_release_test.py`：**58** passed / 0 failed
 
 ## [0.6.4] - 2026-07-08
 

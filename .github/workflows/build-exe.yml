@@ -24,6 +24,9 @@ jobs:
       - name: Pre-release tests
         run: python pre_release_test.py
 
+      - name: Unit tests (pure logic, no CDP)
+        run: python src/auto/tests/test_unit.py
+
       # H21: GUI dynamically imports exam/pk/remote/parser/browser/strategy/hotkey
       # CustomTkinter needs package data (themes/fonts) + darkdetect for onefile
       - name: Build GUI
