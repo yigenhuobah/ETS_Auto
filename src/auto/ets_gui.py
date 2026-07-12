@@ -17,24 +17,28 @@ import threading
 import queue
 import time
 
-# ── Path setup: ensure src/auto is importable ────────────────
-# When running from PyInstaller bundle or from project root
+# ── Path setup: ensure auto modules are importable ───────────
+# Dev: this file lives in src/auto. Frozen onefile: modules unpack
+# to _MEIPASS root (not _MEIPASS/src/auto) — only insert a real dir.
 if getattr(sys, 'frozen', False):
-    # PyInstaller: _MEIPASS is the temp bundle root
-    _BASE = sys._MEIPASS
+    # PyInstaller: modules live at the bundle root
+    _BASE = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(sys.executable)))
+    _AUTO_DIR = _BASE
 else:
     _BASE = os.path.dirname(os.path.abspath(__file__))
+    _AUTO_DIR = _BASE
 
-sys.path.insert(0, os.path.join(_BASE, 'src', 'auto'))
+if _AUTO_DIR and _AUTO_DIR not in sys.path:
+    sys.path.insert(0, _AUTO_DIR)
 
 # ── Force UTF-8 on Windows ──────────────────────────────────
-from ets_common import force_utf8_stdio
+from ets_common import APP_VERSION, force_utf8_stdio
 force_utf8_stdio()
 
 import customtkinter as ctk
 
-# Version constant — bump on each release
-APP_VERSION = "0.6.4"
+# Re-export (single source: ets_common.APP_VERSION)
+# APP_VERSION imported above
 
 
 # ── Queue-based stdout bridge ────────────────────────────────
@@ -103,6 +107,9 @@ class ETSApp(ctk.CTk):
 
         # Remote info state
         self._remote_info = None
+        # H22: last callback progress (answered, total); per-type for exam
+        self._last_progress = (0, 0)
+        self._type_answered = {}
 
         self._build_ui()
         self._poll_log()
@@ -281,7 +288,12 @@ class ETSApp(ctk.CTk):
         self.after(0, lambda: self._do_update_answer_preview(info))
 
     def _do_update_answer_preview(self, info):
-        """Actual UI update — always runs on main thread."""
+        """Actual UI update — always runs on main thread.
+
+        H22: progress comes only from question callbacks.
+        Prefer answered/total_questions; fall back to index (PK) sensibly.
+        Do not invent totals; recording is excluded by auto (choose+fill only).
+        """
         # Guard: widget may have been destroyed if window closed
         try:
             if not self.winfo_exists():
@@ -291,29 +303,63 @@ class ETSApp(ctk.CTk):
         try:
             qtype = info.get('type_label', '')
             answer = info.get('answer', '')
-            qid = info.get('qid', '')
-            answered = info.get('answered', 0)
-            total = info.get('total_questions', 0)
+            qid = info.get('qid', '') or info.get('title', '')
+            # Prefer explicit answered/total; PK sends index only
+            answered = info.get('answered')
+            total = info.get('total_questions') or info.get('total') or 0
+            if answered is None:
+                # PK / step-style callbacks: use index when present
+                answered = info.get('index') or info.get('step') or 0
+            try:
+                answered = int(answered or 0)
+                total = int(total or 0)
+            except (TypeError, ValueError):
+                answered, total = 0, 0
+
+            # Exam callbacks report per-type counts; sum choose+fill so
+            # fill after choose does not reset the bar (H22 UX).
+            q_kind = info.get('type')
+            if q_kind in ('choose', 'fill') and total > 0:
+                self._type_answered[q_kind] = answered
+                answered = sum(self._type_answered.values())
+            elif q_kind == 'pk' and answered:
+                # PK has no total_questions in callback — count by index
+                pass
 
             # Update inline text (always visible)
-            inline_text = "%s %s → %s" % (qtype, qid, answer) if qid else qtype
-            if total:
+            if qid and answer not in (None, ''):
+                inline_text = "%s %s → %s" % (qtype, qid, answer)
+            elif answer not in (None, ''):
+                inline_text = "%s → %s" % (qtype, answer)
+            else:
+                inline_text = qtype or ""
+            if total > 0:
                 inline_text += "  (%d/%d)" % (answered, total)
+            elif answered:
+                inline_text += "  (#%d)" % answered
             self._preview_inline.configure(text=inline_text)
 
-            # #1: Update progress bar
-            if total and total > 0:
-                pct = min(answered / total, 1.0)
+            # Progress bar from callback only (never force 100% here)
+            if total > 0:
+                pct = min(max(answered, 0) / total, 1.0)
                 self._progress_var.set(pct)
-                self._progress_label_var.set("进度: %d/%d (%.0f%%)" % (answered, total, pct * 100))
+                self._progress_label_var.set(
+                    "进度: %d/%d (%.0f%%)" % (answered, total, pct * 100))
+                self._last_progress = (answered, total)
             elif answered:
                 self._progress_label_var.set("已处理: %d" % answered)
+                self._last_progress = (answered, 0)
 
             # Update expanded panel if open
             if self._preview_expanded and self._preview_panel:
                 self._preview_panel.configure(state="normal")
                 # Append new answer line
-                line = "[%s] %s → %s" % (qtype, qid, answer) if qid else "[%s]" % qtype
+                if qid and answer not in (None, ''):
+                    line = "[%s] %s → %s" % (qtype, qid, answer)
+                elif answer not in (None, ''):
+                    line = "[%s] → %s" % (qtype, answer)
+                else:
+                    line = "[%s]" % qtype
                 self._preview_panel.insert("end", line + "\n")
                 self._preview_panel.configure(state="disabled")
                 self._preview_panel.see("end")
@@ -337,6 +383,36 @@ class ETSApp(ctk.CTk):
             self._max_label.configure(text="步数上限")
 
     # ── Start / Stop ─────────────────────────────────────────
+
+    def _remote_is_blocked(self):
+        """Return (blocked: bool, reason: str) from cached remote info."""
+        if self._remote_info is None:
+            return False, ""
+        try:
+            from ets_remote import classify_info
+            level, reason = classify_info(self._remote_info)
+            return level == "block", reason or ""
+        except ImportError:
+            return False, ""
+
+    def _apply_remote_block(self, reason, *, stop_worker=False, cancel_start=False, log_suffix=""):
+        """Central remote kill-switch UI + stop_event (low-risk simplify)."""
+        msg = reason or "远程已关闭"
+        self._status_var.set("⛔ %s" % msg)
+        self._start_btn.configure(state="disabled")
+        self._append_log("[远程] ⛔ %s%s\n" % (msg, log_suffix))
+        info = self._remote_info
+        if info is not None and getattr(info, "download_url", None):
+            self._append_log("[远程] 下载地址：%s\n" % info.download_url)
+        if stop_worker or cancel_start:
+            self._stop_event.set()
+        if cancel_start:
+            self._running = False
+            self._stop_btn.configure(state="disabled")
+        if stop_worker and self._running:
+            self._append_log("[远程] 运行中收到阻断指令，正在停止...\n")
+            self._status_var.set("⛔ 远程阻断，正在停止...")
+
     def _on_start(self):
         if self._running:
             return
@@ -346,17 +422,11 @@ class ETSApp(ctk.CTk):
         # the tkinter main thread for 300ms causing UI freeze, and 0.3s wasn't
         # enough for slow networks anyway. The remote check runs at GUI launch
         # and via _on_remote_checked callback; we just use whatever is available.
-        if self._remote_info is not None:
-            try:
-                from ets_remote import classify_info
-                level, reason = classify_info(self._remote_info)
-                if level == "block":
-                    self._append_log("[远程] ⛔ %s\n" % reason)
-                    if self._remote_info.download_url:
-                        self._append_log("[远程] 下载地址：%s\n" % self._remote_info.download_url)
-                    return
-            except ImportError:
-                pass  # ets_remote not available — allow start
+        # H17: if remote already says block, refuse start
+        blocked, reason = self._remote_is_blocked()
+        if blocked:
+            self._apply_remote_block(reason, stop_worker=True)
+            return
 
         # Validate port
         try:
@@ -380,9 +450,17 @@ class ETSApp(ctk.CTk):
         self._stop_btn.configure(state="normal")
         self._status_var.set("运行中...")
         self._hotkey_var.set("⌨ F9暂停/恢复  F10跳过  F12停止")
-        # Reset progress bar
+        # Reset progress bar (H22: progress driven by question callbacks)
         self._progress_var.set(0.0)
         self._progress_label_var.set("")
+        self._last_progress = (0, 0)
+        self._type_answered = {}
+
+        # H17: re-check remote after arming UI
+        blocked, reason = self._remote_is_blocked()
+        if blocked:
+            self._apply_remote_block(reason, cancel_start=True, log_suffix="（启动已取消）")
+            return
 
         # Redirect stdout/stderr to queue
         self._queue_writer_out = QueueWriter(self._log_queue, original=sys.stdout)
@@ -419,17 +497,17 @@ class ETSApp(ctk.CTk):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_remote_checked(self, info):
-        """Handle remote check result on main thread."""
+        """Handle remote check result on main thread.
+
+        H17: if remote says block while a worker is already running,
+        set stop_event so the automation exits cleanly (do not only
+        disable the Start button).
+        """
         from ets_remote import classify_info, format_update_message
 
-        # Unified block/normal decision
         level, reason = classify_info(info)
         if level == "block":
-            self._status_var.set("⛔ %s" % reason)
-            self._start_btn.configure(state="disabled")
-            self._append_log("[远程] ⛔ %s\n" % reason)
-            if info.download_url:
-                self._append_log("[远程] 下载地址：%s\n" % info.download_url)
+            self._apply_remote_block(reason, stop_worker=self._running)
             return
 
         # Show announcement / update info
@@ -456,12 +534,13 @@ class ETSApp(ctk.CTk):
                     return  # no URL available, skip silently
                 remote = ETSRemote(current_version=APP_VERSION)
                 success, message = remote.download_pk_extra(url=pk_url)
+                # Bind message as default arg to avoid late-binding in after()
                 if success:
-                    self.after(0, lambda: self._append_log(
-                        "[远程] %s\n" % message))
+                    self.after(0, lambda m=message: self._append_log(
+                        "[远程] %s\n" % m))
                 else:
-                    self.after(0, lambda: self._append_log(
-                        "[远程] ⚠️ %s\n" % message))
+                    self.after(0, lambda m=message: self._append_log(
+                        "[远程] ⚠️ %s\n" % m))
             except Exception as e:
                 pass  # pk_extra update is non-critical
 
@@ -510,23 +589,49 @@ class ETSApp(ctk.CTk):
 
         self._running = False
         self._hotkey_var.set("")
-        self._start_btn.configure(state="normal")
+        # H17: keep Start disabled if remote still blocks after run ends
+        remote_blocked, reason = self._remote_is_blocked()
+        if remote_blocked:
+            self._start_btn.configure(state="disabled")
+            self._status_var.set("⛔ %s" % reason)
+        else:
+            self._start_btn.configure(state="normal")
         self._stop_btn.configure(state="disabled")
         # Bug fix: detect error state from worker thread
         had_error = getattr(self, '_worker_error', False)
+        last = getattr(self, '_last_progress', (0, 0))
+        answered, total = last if isinstance(last, tuple) else (0, 0)
         if self._stop_event.is_set():
-            self._status_var.set("已停止")
-            # Reset progress bar on stop
-            self._progress_var.set(0.0)
-            self._progress_label_var.set("")
+            if not remote_blocked:
+                self._status_var.set("已停止")
+            # Keep last known callback progress (do not invent 100%)
+            if total > 0:
+                pct = min(max(answered, 0) / total, 1.0)
+                self._progress_var.set(pct)
+                self._progress_label_var.set(
+                    "已停止: %d/%d (%.0f%%)" % (answered, total, pct * 100))
+            elif answered:
+                self._progress_label_var.set("已停止: 已处理 %d" % answered)
+            else:
+                self._progress_var.set(0.0)
+                self._progress_label_var.set("")
         elif had_error:
-            self._status_var.set("错误")
+            if not remote_blocked:
+                self._status_var.set("错误")
             # Keep progress bar where it is (partial progress visible)
             self._worker_error = False  # reset
         else:
-            self._status_var.set("已完成")
-            # Set progress bar to 100% if completed naturally
-            self._progress_var.set(1.0)
+            if not remote_blocked:
+                self._status_var.set("已完成")
+            # H22: show real coverage from callbacks; only fill bar when
+            # total is known and answered covers it — never force fake 100%.
+            if total > 0:
+                pct = min(max(answered, 0) / total, 1.0)
+                self._progress_var.set(pct)
+                self._progress_label_var.set(
+                    "完成: %d/%d (%.0f%%)" % (answered, total, pct * 100))
+            elif answered:
+                self._progress_label_var.set("完成: 已处理 %d" % answered)
 
     # ── Worker thread ────────────────────────────────────────
     def _run_worker(self, mode, port, debug, max_val):
@@ -573,13 +678,13 @@ class ETSApp(ctk.CTk):
             print("[错误] 导入失败: %s" % e)
             print("请确保 ets_auto.py / ets_word_pk.py / ets_common.py 在正确路径")
             self._worker_error = True
-            self.after(0, lambda: self._show_error(
+            self.after(0, lambda err=str(e): self._show_error(
                 "导入失败",
-                "找不到必要模块：%s\n\n请确保 ets_auto.py / ets_word_pk.py / ets_common.py 在正确路径" % e))
+                "找不到必要模块：%s\n\n请确保 ets_auto.py / ets_word_pk.py / ets_common.py 在正确路径" % err))
         except Exception as e:
             print("[错误] %s" % e)
             self._worker_error = True
-            self.after(0, lambda: self._show_error("运行错误", str(e)))
+            self.after(0, lambda err=str(e): self._show_error("运行错误", err))
         finally:
             # Schedule UI update on main thread
             self.after(0, self._run_finished)

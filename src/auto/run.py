@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 ETS Auto — Unified entry point for ETS automation tools.
 
@@ -8,22 +8,34 @@ Usage:
   python run.py pk [options]       # 单词PK自动答题
   python run.py --help             # Show help
 """
+import argparse
+import json
 import sys
-import os
+
+from ets_common import force_utf8_stdio
+
+force_utf8_stdio()
 
 
-def _force_utf8():
-    """Force UTF-8 output on Windows to prevent UnicodeEncodeError with phonetic symbols."""
-    if sys.platform == 'win32':
-        os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
-        try:
-            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-        except (AttributeError, LookupError):
-            pass  # Python <3.7 or unsupported
+def _install_log_tee(log_path):
+    """Tee stdout/stderr to log_path; return (tee_out, tee_err) or (None, None)."""
+    if not log_path:
+        return None, None
+    from ets_auto import TeeOutput
+    tee = TeeOutput(log_path)
+    tee_err = TeeOutput(log_path, original_stream=sys.stderr, shared_handle=tee.log)
+    sys.stdout = tee
+    sys.stderr = tee_err
+    return tee, tee_err
 
 
-_force_utf8()
+def _restore_log_tee(tee, tee_err, log_path):
+    if tee_err:
+        sys.stderr = tee_err.terminal
+    if tee:
+        sys.stdout = tee.terminal
+        tee.close()
+        print("Log saved to: " + log_path)
 
 
 def main(args_list=None):
@@ -49,12 +61,10 @@ def main(args_list=None):
 
     if command == 'gui':
         from ets_gui import ETSApp
-        app = ETSApp()
-        app.mainloop()
+        ETSApp().mainloop()
 
     elif command == 'exam':
         from ets_auto import ETSAutoAnswer
-        import argparse, json
 
         parser = argparse.ArgumentParser(description="ETS Exam Auto — e听说PC端套卷自动答题")
         parser.add_argument("--max", type=int, default=999, help="Safety limit (default: 999)")
@@ -64,16 +74,9 @@ def main(args_list=None):
         parser.add_argument("--log", type=str, default=None, metavar="FILE", help="Save all output to a log file")
         args = parser.parse_args(sub_args)
 
-        from ets_auto import TeeOutput
-        tee = None
-        tee_err = None
-        if args.log:
-            tee = TeeOutput(args.log)
-            sys.stdout = tee
-            tee_err = TeeOutput(args.log, original_stream=sys.stderr, shared_handle=tee.log)
-            sys.stderr = tee_err
-
+        tee, tee_err = _install_log_tee(args.log)
         try:
+            # stop_event defaulted inside ETSAutoAnswer.ensure_stop_event()
             auto = ETSAutoAnswer(debug_mode=args.debug)
             if args.show_answers:
                 auto.connect()
@@ -86,16 +89,10 @@ def main(args_list=None):
                 if args.json and result:
                     print(json.dumps(result, ensure_ascii=False))
         finally:
-            if tee_err:
-                sys.stderr = tee_err.terminal
-            if tee:
-                sys.stdout = tee.terminal
-                tee.close()
-                print("Log saved to: " + args.log)
+            _restore_log_tee(tee, tee_err, args.log)
 
     elif command == 'pk':
         from ets_word_pk import ETSWordPK
-        import argparse
 
         parser = argparse.ArgumentParser(description="ETS Word PK Auto v5")
         parser.add_argument("--max", type=int, default=999, help="Max questions")
@@ -104,24 +101,12 @@ def main(args_list=None):
         parser.add_argument("--log", type=str, default=None, metavar="FILE", help="Save all output to a log file")
         args = parser.parse_args(sub_args)
 
-        from ets_auto import TeeOutput
-        tee = None
-        tee_err = None
-        if args.log:
-            tee = TeeOutput(args.log)
-            sys.stdout = tee
-            tee_err = TeeOutput(args.log, original_stream=sys.stderr, shared_handle=tee.log)
-            sys.stderr = tee_err
-
+        tee, tee_err = _install_log_tee(args.log)
         try:
+            # stop_event defaulted inside ETSWordPK.ensure_stop_event()
             ETSWordPK(port=args.port, debug_mode=args.debug).run(max_q=args.max)
         finally:
-            if tee_err:
-                sys.stderr = tee_err.terminal
-            if tee:
-                sys.stdout = tee.terminal
-                tee.close()
-                print("Log saved to: " + args.log)
+            _restore_log_tee(tee, tee_err, args.log)
 
     else:
         print("Unknown command: %s" % command)

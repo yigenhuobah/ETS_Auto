@@ -14,15 +14,21 @@ import json, os, time, sys, threading, re
 from urllib.parse import urlparse, parse_qs
 from urllib.error import URLError
 
-# Version constant — keep in sync with ets_gui.py APP_VERSION
-__version__ = "0.6.4"
-from ets_common import ETSBase, force_utf8_stdio
-from ets_strategy import ETSStrategy
+from ets_common import APP_VERSION, ETSBase, force_utf8_stdio
+
+# Re-export (single source: ets_common.APP_VERSION)
+__version__ = APP_VERSION
+
+from ets_strategy import (
+    ETSStrategy, _safe_set_id, _resolve_exam_dir, _read_json, _html_to_text,
+)
 
 
 class ETSAutoAnswer(ETSBase):
     def __init__(self, port=10086, debug_mode=False, stop_event=None):
         super().__init__(port=port, debug_mode=debug_mode, stop_event=stop_event)
+        # C1: always have a real Event so .set() never crashes on CLI paths
+        self.ensure_stop_event()
         self.ets_base = None
         self.answers = {}
         self.set_id = None
@@ -30,6 +36,7 @@ class ETSAutoAnswer(ETSBase):
         self.homework_id = None
         self.answered_questions = []
         self._recording_window_closed = False
+        self._rec_done_event = None  # C2: GUI recording Toplevel done signal
         self.total_questions = 0
         self.recording_answers = []   # list of dicts for picture/dialogue
         self.strategy = ETSStrategy()  # strategy layer for local answer lookup
@@ -43,6 +50,17 @@ class ETSAutoAnswer(ETSBase):
             'fill_answered': 0, 'fill_skip': 0,
             'next_click': 0, 'errors': 0
         }
+
+    def _signal_stop(self):
+        """C1: safely set stop_event (delegates to ETSBase.signal_stop)."""
+        self.signal_stop()
+
+    @staticmethod
+    def _is_next_waiting(reason):
+        """True when Next is temporarily unavailable (disabled or audio/timer hide)."""
+        if not reason:
+            return False
+        return reason == 'disabled' or reason.startswith('next_icon hidden')
 
     # ── Public API (CLI + GUI) ─────────────────────────────
 
@@ -58,7 +76,7 @@ class ETSAutoAnswer(ETSBase):
             return
         print("\nAnswers for set_id=%s:\n" % (self.set_id or "?"))
         for key, val in sorted(self.answers.items()):
-            tag = {'choose': '[CHS]', 'fill': '[FIL]', 'dialogue': '[DLG]', 'picture': '[PIC]', 'read': '[RD]'}.get(val['type'], '[??]')
+            tag = {'choose': '[CHS]', 'fill': '[FIL]', 'dialogue': '[DLG]', 'picture': '[PIC]', 'read': '[RD]', 'role': '[ROL]'}.get(val['type'], '[??]')
             print("  %s %s → %s" % (tag, key, val['answer']))
         print("\n%d total answers" % len(self.answers))
 
@@ -95,11 +113,18 @@ class ETSAutoAnswer(ETSBase):
         # Detect read-write (读写同步) mode from URL hash
         self._detect_rw_mode()
 
+    def _tab_url(self):
+        """Safe tab URL after reconnect may set tab=None (_drop_connection)."""
+        tab = self.tab
+        if not isinstance(tab, dict):
+            return ''
+        return str(tab.get('url') or '')
+
     def _get_url_set_id(self):
         """Extract set_id from URL fragment query string.
         Supports both snake_case 'set_id' and camelCase 'setId' (ETS uses both)."""
         try:
-            parsed = urlparse(self.tab['url'])
+            parsed = urlparse(self._tab_url())
             fragment = parsed.fragment
             if '?' in fragment:
                 qs = parse_qs(fragment.split('?', 1)[1])
@@ -122,6 +147,9 @@ class ETSAutoAnswer(ETSBase):
         try:
             candidates = []
             for entry in os.listdir(self.ets_base):
+                # Digits-only set_id (same rule as strategy._safe_set_id)
+                if not entry.isdigit():
+                    continue
                 full = os.path.join(self.ets_base, entry)
                 if not os.path.isdir(full):
                     continue
@@ -169,17 +197,23 @@ class ETSAutoAnswer(ETSBase):
                 self.debug("Pinia error: " + cfg['error'])
                 return
             if cfg.get('appDataPath'):
-                path = cfg['appDataPath'].replace('\\', '/')
-                if not path.replace('\\', '/').endswith('/ETS'):
-                    path = os.path.join(path, 'ETS')
+                # Normalize separators + trailing slash so ".../ETS/" still
+                # counts as the ETS root (endswith('/ETS') alone false-negatives).
+                path = cfg['appDataPath'].replace('\\', '/').rstrip('/')
+                if not path.upper().endswith('/ETS'):
+                    path = path + '/ETS'
                 self.ets_base = path
                 self.debug("Pinia: dataPath=" + self.ets_base)
             self.homework_mode = cfg.get('doHomework')
             self.homework_id = str(cfg.get('homework_id') or '')
             hw_set = str(cfg.get('hw_set_id') or '')
-            if hw_set:
+            # H6: only trust homework store set_id when actually in homework mode;
+            # practice/mock keeps residual current_class_id which would load wrong answers.
+            if hw_set and self.homework_mode:
                 self.set_id = hw_set
-                self.debug("Pinia: set_id=" + self.set_id)
+                self.debug("Pinia: set_id=" + self.set_id + " (homework)")
+            elif hw_set and not self.homework_mode:
+                self.debug("Pinia: ignoring hw_set_id=%s (not doHomework; prefer URL)" % hw_set)
             mode_str = "HOMEWORK" if self.homework_mode else ("PRACTICE" if self.homework_mode is False else "UNKNOWN")
             self.debug("Pinia: mode=" + mode_str)
         except Exception as e:
@@ -283,7 +317,7 @@ class ETSAutoAnswer(ETSBase):
         """Detect if current page is read-write (读写同步) mode via URL hash.
         Sets self.rw_mode = True if on #/readingWritingDetails page."""
         try:
-            url = self.tab.get('url', '')
+            url = self._tab_url()
             if 'readingWritingDetails' in url or 'readingWriting' in url:
                 self.rw_mode = True
                 self.debug("Read-Write mode detected (读写同步)")
@@ -358,6 +392,8 @@ class ETSAutoAnswer(ETSBase):
             info_list = q.get('info', [])
             letters = []
             for info_item in info_list:
+                if not isinstance(info_item, dict):
+                    continue
                 ans = info_item.get('answer', '')
                 if ans:
                     letters.append(ans.upper())
@@ -465,29 +501,49 @@ class ETSAutoAnswer(ETSBase):
     def load_answers(self):
         """Load answers from local ETS cache (content.json per content_* dir)."""
         import re as _html_re
+        import html as _html_mod
+
         def _strip_html(t):
-            if not t: return ''
-            t = _html_re.sub(r'</p>\s*<p[^>]*>', '\n', t)
-            t = _html_re.sub(r'<br\s*/?>', '\n', t)
-            t = _html_re.sub(r'<[^>]+>', '', t)
-            t = _html_re.sub(r' {2,}', ' ', t)      # collapse multiple spaces
-            t = _html_re.sub(r'\n{3,}', '\n\n', t)  # collapse 3+ newlines to 2
+            """Preserve newlines for recording text; do not use strategy flatten."""
+            if not t:
+                return ''
+            t = _html_re.sub(r'</p>\s*<p[^>]*>', '\n', t, flags=_html_re.IGNORECASE)
+            t = _html_re.sub(r'<br\s*/?>', '\n', t, flags=_html_re.IGNORECASE)
+            t = _html_re.sub(r'</?[a-zA-Z][^>]*>', '', t)
+            t = _html_mod.unescape(t)
+            t = _html_re.sub(r' {2,}', ' ', t)
+            t = _html_re.sub(r'\n{3,}', '\n\n', t)
             return t.strip()
+
+        # C5: clear prior load so reconnect/set change never merges stale keys
+        self.answers = {}
+        self.recording_answers = []
+        self.total_questions = 0
+
         if not self.set_id:
             print("ERROR: No set_id available (not in Pinia, not in URL)")
             return False
-        exam_dir = os.path.join(self.ets_base, self.set_id)
-        if not os.path.exists(exam_dir):
-            url_set_id = self._get_url_set_id()
-            if url_set_id and url_set_id != str(self.set_id):
-                alt_dir = os.path.join(self.ets_base, url_set_id)
-                if os.path.exists(alt_dir):
-                    self.debug("Pinia set_id %s not found, using URL set_id: %s" % (self.set_id, url_set_id))
-                    self.set_id = url_set_id
-                    exam_dir = alt_dir
-        if not os.path.exists(exam_dir):
-            print("ERROR: Exam data not found: " + exam_dir)
+        # Path-safe resolve (same guards as strategy.load_set): digits-only
+        # set_id and exam_dir must stay under ets_base (no traversal).
+        if not self.ets_base:
+            print("ERROR: No ets_base (ETS data root) available")
             return False
+        safe_id = _safe_set_id(self.set_id)
+        exam_dir = _resolve_exam_dir(safe_id, self.ets_base) if safe_id else None
+        if exam_dir is None:
+            url_set_id = _safe_set_id(self._get_url_set_id())
+            if url_set_id and url_set_id != safe_id:
+                alt_dir = _resolve_exam_dir(url_set_id, self.ets_base)
+                if alt_dir is not None:
+                    self.debug("Pinia set_id %s not found, using URL set_id: %s" % (
+                        self.set_id, url_set_id))
+                    safe_id = url_set_id
+                    exam_dir = alt_dir
+        if exam_dir is None:
+            print("ERROR: Exam data not found for set_id=%s under %s" % (
+                self.set_id, self.ets_base))
+            return False
+        self.set_id = safe_id
 
         self.debug("Loading from: " + exam_dir)
         for d in sorted(os.listdir(exam_dir)):
@@ -497,20 +553,31 @@ class ETSAutoAnswer(ETSBase):
             if not os.path.exists(cj):
                 continue
             try:
-                with open(cj, 'r', encoding='utf-8') as _f:
-                    data = json.load(_f)
+                data = _read_json(cj)
                 stype = data.get('structure_type', '')
                 info = data.get('info', {})
                 stid = info.get('stid', '')
                 if stype == 'collector.choose':
                     for xt in info.get('xtlist', []):
-                        key = stid + '_' + xt['xt_xh']
+                        if not isinstance(xt, dict):
+                            continue
+                        xt_xh = xt.get('xt_xh')
+                        if xt_xh is None or xt_xh == '':
+                            self.debug("Skip choose item missing xt_xh in %s" % d)
+                            continue
+                        key = stid + '_' + str(xt_xh)
                         ans = xt.get('answer', '')
                         if ans:
                             self.answers[key] = {'type': 'choose', 'answer': ans}
                 elif stype == 'collector.fill':
                     for std in info.get('std', []):
-                        key = stid + '_' + std['xth']
+                        if not isinstance(std, dict):
+                            continue
+                        xth = std.get('xth')
+                        if xth is None or xth == '':
+                            self.debug("Skip fill item missing xth in %s" % d)
+                            continue
+                        key = stid + '_' + str(xth)
                         ans = std.get('value', '')
                         if ans:
                             alternatives = []
@@ -535,7 +602,8 @@ class ETSAutoAnswer(ETSBase):
                     ref_text = _strip_html(info.get('value', ''))
                     topic = info.get('topic', '')
                     if not ref_text:
-                        ref_text = info.get('keypoint', '')
+                        # H8: strip keypoint the same way as value
+                        ref_text = _strip_html(info.get('keypoint', ''))
                     if not ref_text:
                         ref_text = '\n\n'.join([
                             _strip_html(s.get('value', '')) for s in info.get('std', []) if s.get('value', '')
@@ -543,13 +611,15 @@ class ETSAutoAnswer(ETSBase):
                     if ref_text:
                         self.answers[key] = {'type': 'picture', 'answer': ref_text, 'topic': topic}
                         self.recording_answers.append({'stid': stid, 'type': 'picture', 'topic': topic, 'answer': ref_text})
-                elif stype == 'collector.dialogue':
+                elif stype in ('collector.dialogue', 'collector.role'):
+                    # H7: role uses same q_answers / recording_answers build as dialogue
                     key = stid
+                    rec_type = 'role' if stype == 'collector.role' else 'dialogue'
                     questions = info.get('question', [])
-                    # Build per-question reference answers from std[0] (shortest standard variant)
+                    # Build per-question reference answers from std (shortest standard variant)
                     q_answers = []
                     for qi, q in enumerate(questions):
-                        q_ask = q.get('ask', '')
+                        q_ask = _strip_html(q.get('ask', ''))
                         q_std_list = q.get('std', [])
                         # std is a list of acceptable answer variants; pick shortest clean one
                         best_ans = ''
@@ -569,28 +639,32 @@ class ETSAutoAnswer(ETSBase):
 
                     if q_answers:
                         q_texts = [qa['ask'] for qa in q_answers]
-                        self.answers[key] = {'type': 'dialogue', 'answer': material_plain, 'questions': q_texts, 'q_answers': q_answers}
-                        self.recording_answers.append({'stid': stid, 'type': 'dialogue', 'questions': q_texts, 'answer': material_plain, 'q_answers': q_answers})
+                        self.answers[key] = {'type': rec_type, 'answer': material_plain, 'questions': q_texts, 'q_answers': q_answers}
+                        self.recording_answers.append({'stid': stid, 'type': rec_type, 'questions': q_texts, 'answer': material_plain, 'q_answers': q_answers})
                     elif material_plain:
                         # Fallback: no per-question answers, use material text only
-                        self.answers[key] = {'type': 'dialogue', 'answer': material_plain, 'questions': [], 'q_answers': []}
-                        self.recording_answers.append({'stid': stid, 'type': 'dialogue', 'questions': [], 'answer': material_plain, 'q_answers': []})
+                        self.answers[key] = {'type': rec_type, 'answer': material_plain, 'questions': [], 'q_answers': []}
+                        self.recording_answers.append({'stid': stid, 'type': rec_type, 'questions': [], 'answer': material_plain, 'q_answers': []})
             except Exception as e:
                 self.debug("Error loading %s: %s" % (d, e))
 
-        self.total_questions = len(self.answers)
-        print("Loaded %d answers (set_id=%s)" % (self.total_questions, self.set_id))
+        # H22: auto progress denominator is choose+fill only (recording stays separate)
+        self.total_questions = sum(
+            1 for v in self.answers.values() if v.get('type') in ('choose', 'fill')
+        )
+        print("Loaded %d auto answers + %d recording (set_id=%s)" % (
+            self.total_questions, len(self.recording_answers), self.set_id))
 
         # ── Load strategy layer (composite key index + fallback chain) ──
         if self.set_id:
-            strat_ok = self.strategy.load_set(self.set_id)
+            strat_ok = self.strategy.load_set(self.set_id, data_dir=self.ets_base)
             if strat_ok:
                 print("Strategy layer: %d sections, %d indexed answers" % (
                     len(self.strategy.sections), len(self.strategy.answer_index)))
             else:
                 self.debug("Strategy layer: no cache data for set_id=%s" % self.set_id)
 
-        return self.total_questions > 0
+        return self.total_questions > 0 or len(self.recording_answers) > 0
 
     # ── Page State ────────────────────────────────────────────
 
@@ -633,7 +707,7 @@ class ETSAutoAnswer(ETSBase):
         });
         return JSON.stringify({
             choices: choiceInfo, question_groups: groupList, inputs: inputInfo,
-            hasChoice: choices.length > 0, hasInput: inputs.length > 0,
+            hasChoice: choiceInfo.length > 0, hasInput: inputInfo.length > 0,
             inReviewMode: hasReviewMode
         });
         })()''' % self._IFRAME_FINDER
@@ -782,6 +856,7 @@ class ETSAutoAnswer(ETSBase):
                 continue
             target_id = qid + '_' + target_idx
             print("  Choose Q:%s -> %s" % (qid, answer_letter))
+            safe_tid = self.js_escape(target_id)
 
             # Click via setPCChoose2 → jQuery → native
             js_click = r'''(function(){
@@ -798,7 +873,7 @@ class ETSAutoAnswer(ETSBase):
             }
             try { el.click(); } catch(e) {}
             return JSON.stringify({method: "native"});
-            })()''' % (target_id, target_id, target_id)
+            })()''' % (safe_tid, safe_tid, safe_tid)
             click_result = self.eval_js(js_click)
             self.debug("Click method: " + str(click_result))
 
@@ -811,7 +886,7 @@ class ETSAutoAnswer(ETSBase):
                 var doc = iframe.contentDocument || iframe.contentWindow.document;
                 var el = doc.getElementById("%s");
                 return el ? el.classList.contains("choose_selected") : false;
-                })()''' % (target_id)
+                })()''' % (safe_tid)
                 if self.eval_js(js_check):
                     selected = True
                     break
@@ -892,6 +967,7 @@ class ETSAutoAnswer(ETSBase):
                 print(" (alts: %s)" % ', '.join(alternatives), end='')
             print()
             safe_val = self.js_escape(value)
+            safe_id = self.js_escape(inp_id)
 
             js_fill = '''(function(){
             %s;
@@ -918,7 +994,7 @@ class ETSAutoAnswer(ETSBase):
                 } catch(e) {}
             }
             return JSON.stringify({filled: true, value: target.value, shadow: !!inp.shadowRoot});
-            })()''' % (self._IFRAME_FINDER, inp_id, inp_id, inp_id, safe_val)
+            })()''' % (self._IFRAME_FINDER, safe_id, safe_id, safe_id, safe_val)
             r1 = json.loads(self.eval_js(js_fill) or "{}")
             self.debug("Fill result: " + str(r1))
 
@@ -994,8 +1070,8 @@ class ETSAutoAnswer(ETSBase):
         )
         st.pack(fill='both', expand=True)
 
-        type_labels = {'picture': '听后转述', 'dialogue': '回答问题', 'read': '短文朗读'}
-        type_icons = {'picture': '📖', 'dialogue': '💬', 'read': '📚'}
+        type_labels = {'picture': '听后转述', 'dialogue': '回答问题', 'role': '口语问答', 'read': '短文朗读'}
+        type_icons = {'picture': '📖', 'dialogue': '💬', 'role': '🗣', 'read': '📚'}
 
         all_text = []
         for idx_r, rec in enumerate(self.recording_answers):
@@ -1007,8 +1083,8 @@ class ETSAutoAnswer(ETSBase):
             all_text.append('%s %s %s' % (icon, label, ('— ' + topic) if topic else ''))
             all_text.append('=' * 40)
 
-            # Dialogue: show per-question answers (question + reference answer)
-            if rtype == 'dialogue' and rec.get('q_answers'):
+            # Dialogue/role: show per-question answers (question + reference answer)
+            if rtype in ('dialogue', 'role') and rec.get('q_answers'):
                 for qi, qa in enumerate(rec['q_answers']):
                     all_text.append('Q%d: %s' % (qi + 1, qa.get('ask', '')))
                     ref = qa.get('answer', '')
@@ -1025,8 +1101,8 @@ class ETSAutoAnswer(ETSBase):
             else:
                 answer_text = rec['answer']
                 all_text.append(answer_text)
-                # Add questions for dialogue type (fallback, no q_answers)
-                if rtype == 'dialogue' and rec.get('questions'):
+                # Add questions for dialogue/role type (fallback, no q_answers)
+                if rtype in ('dialogue', 'role') and rec.get('questions'):
                     all_text.append('')
                     all_text.append('参考问题：')
                     for qi, q in enumerate(rec['questions']):
@@ -1051,8 +1127,7 @@ class ETSAutoAnswer(ETSBase):
 
         def on_close():
             # Signal stop_event so worker thread exits cleanly
-            if self.stop_event:
-                self.stop_event.set()
+            self._signal_stop()
             root.destroy()
 
         btn = tk.Button(bar, text='✅ 关闭并停止脚本', command=on_close,
@@ -1095,22 +1170,29 @@ class ETSAutoAnswer(ETSBase):
         if existing_root is not None:
             # GUI mode: create Toplevel on existing root, schedule on main thread
             # The worker thread (which called run()) will block here until the
-            # window is closed. We use a threading.Event to synchronize.
+            # window is closed OR the exam worker finishes (poll_worker done.set).
             import threading as _th
             done = _th.Event()
+            self._rec_done_event = done  # C2: poll destroy / finish can unblock wait
+            user_closed = {'v': False}
 
             def _create_on_main():
                 try:
                     win = tk.Toplevel(existing_root)
                     self._build_recording_window(win, poll_worker_fn)
-                    # When Toplevel is destroyed, signal done
-                    win.protocol('WM_DELETE_WINDOW', lambda: (self.stop_event.set() if self.stop_event else None, win.destroy()))
                     existing_root.bind('<<RecWindowClosed>>', lambda e: done.set(), add='+')
-                    # Override on_close to also signal done
+                    # C2: also unblock on Destroy (poll_worker destroy path)
+                    def _on_destroy(e):
+                        if e.widget is win:
+                            done.set()
+                    win.bind('<Destroy>', _on_destroy)
                     def _on_close():
-                        if self.stop_event:
-                            self.stop_event.set()
-                        win.destroy()
+                        user_closed['v'] = True
+                        self._signal_stop()
+                        try:
+                            win.destroy()
+                        except Exception:
+                            pass
                         done.set()
                     win.protocol('WM_DELETE_WINDOW', _on_close)
                 except Exception as e:
@@ -1118,9 +1200,15 @@ class ETSAutoAnswer(ETSBase):
                     done.set()
 
             existing_root.after(0, _create_on_main)
-            # Block worker thread until window is closed
-            done.wait(timeout=86400)  # 24h safety timeout
-            self._recording_window_closed = True
+            # C2: wait for window close, stop_event, or poll_worker finish
+            while not done.is_set():
+                if self.stop_event and self.stop_event.is_set():
+                    break
+                done.wait(timeout=0.5)
+            # Only treat as user-stop when they closed the window (not normal complete)
+            if user_closed['v']:
+                self._recording_window_closed = True
+            self._rec_done_event = None
             return True
         else:
             # CLI mode: create new Tk root + mainloop (blocks main thread)
@@ -1161,7 +1249,8 @@ class ETSAutoAnswer(ETSBase):
         // not-ready so the caller waits.
         var parent = ni.parentElement;
         if (parent && getComputedStyle(parent).display === "none") {
-            return JSON.stringify({success: false, reason: "next_icon hidden (waiting for audio/timer)"});
+            // C3: stable reason code for callers (startswith / exact match)
+            return JSON.stringify({success: false, reason: "next_icon hidden"});
         }
         ni.click();
         return JSON.stringify({success: true, method: "iframe .next_icon"});
@@ -1258,190 +1347,447 @@ class ETSAutoAnswer(ETSBase):
             if nr2.get('success'):
                 self.interruptible_sleep(0.6)
                 return True
-            if nr2.get('reason') in ('not found', 'next_icon hidden'):
-                # Page may still be loading / answer not yet selected — keep waiting
+            reason = nr2.get('reason') or ''
+            if reason == 'not found' or self._is_next_waiting(reason):
+                # Page may still be loading / audio/timer hiding next — keep waiting
                 continue
-            if nr2.get('reason') != 'disabled':
-                # Unexpected reason — treat as complete
-                return False
+            # Unexpected reason — treat as complete
+            return False
         # Exhausted wait — exam likely complete
         return False
 
-    def _run_rw_loop(self, max_steps=999):
-        """Read-Write (读写同步) mode loop. Different DOM, different navigation."""
-
-        # Get showData for answers
-        show_data = self.get_rw_show_data()
-        if not show_data or show_data.get('error'):
-            print("ERROR: Cannot read showData from iframe: %s" % (show_data or {}).get('error', 'unknown'))
-            print("Make sure the read-write page is fully loaded.")
-            return {'total_answered': 0, 'mode': 'read-write', 'errors': 1}
-
-        questions = show_data.get('question', [])
-        print("Questions in showData: %d" % len(questions))
-
-        # Build answer summary from showData
+    def _build_rw_answers_from_showdata(self, show_data, verbose=True):
+        """OPEN-H6: (re)build self.answers rw_* keys from iframe showData."""
+        # Drop previous rw_ keys only; keep any non-rw entries if mixed
+        self.answers = {k: v for k, v in self.answers.items()
+                        if not str(k).startswith('rw_')}
+        questions = (show_data or {}).get('question', []) or []
         rw_count = 0
         for q in questions:
+            if not isinstance(q, dict):
+                continue
             qid = q.get('id', '')
             info_list = q.get('info', [])
+            if not isinstance(info_list, list):
+                continue
             for idx_i, info_item in enumerate(info_list):
+                if not isinstance(info_item, dict):
+                    continue
                 ans = info_item.get('answer', '')
                 if ans:
                     key = 'rw_' + str(qid) + ('_%d' % idx_i if len(info_list) > 1 else '')
                     self.answers[key] = {'type': 'choose', 'answer': ans.upper()}
-                    print("  Q:%s [%d] → %s" % (qid, idx_i, ans.upper()))
+                    if verbose:
+                        print("  Q:%s [%d] → %s" % (qid, idx_i, ans.upper()))
                     rw_count += 1
-
         self.total_questions = rw_count
-        print("Total RW answers: %d" % self.total_questions)
+        return rw_count
 
-        step = 0
-        consecutive_empty = 0
-        consecutive_no_progress = 0  # pages where we couldn't answer anything
+    def _rw_post_reconnect(self):
+        """Shared RW reconnect tail: pinia, mode, bridge, cache, rebuild answers.
 
-        while True:
-            if self.stop_event and self.stop_event.is_set():
-                break
+        Returns False if mode is lost or showData cannot be refreshed, so the
+        caller does not resume with empty/stale RW answers.
+        """
+        self._read_pinia_config()
+        self._detect_rw_mode()
+        try:
+            self.inject_bridge()
+        except Exception as br_err:
+            self.debug("RW inject_bridge after reconnect: %s" % br_err)
+        self.rw_show_data = None
+        self._rw_cache_time = 0
+        if not self.rw_mode:
+            return False
+        # OPEN-H6: rebuild answer table from fresh showData; retry once if empty
+        show_data = self.get_rw_show_data()
+        if not show_data or show_data.get('error'):
+            self.debug("RW: showData missing after reconnect, retrying once...")
+            self.interruptible_sleep(0.5)
+            self.rw_show_data = None
+            self._rw_cache_time = 0
+            show_data = self.get_rw_show_data()
+        if not show_data or show_data.get('error'):
+            self.debug("RW: showData still empty/failed after reconnect: %s" % (
+                (show_data or {}).get('error', 'empty')))
+            return False
+        n = self._build_rw_answers_from_showdata(show_data, verbose=False)
+        self.debug("RW: rebuilt %d answers after reconnect" % n)
+        if n <= 0:
+            self.debug("RW: rebuilt 0 answers after reconnect; refusing to resume")
+            return False
+        return True
 
-            step += 1
-            if step > max_steps:
-                print("Safety limit reached (%d steps)" % max_steps)
-                break
+    def _handle_rw_reconnect(self, conn_err, consecutive_conn_errors, *, label='RW'):
+        """Shared RW reconnect control flow. Returns 'continue' | 'break'.
 
-            # Read current page state
-            state = self.get_rw_page_state()
-            if state.get('error'):
-                self.debug("RW step %d: state error: %s" % (step, state.get('error')))
-                consecutive_empty += 1
-                if consecutive_empty >= 10:
-                    print("Too many errors, stopping.")
-                    break
-                self.interruptible_sleep(1)
-                continue
+        Low-risk simplify: collapses copy-pasted reconnect tails in _run_rw_loop.
+        """
+        self.debug("%s connection error #%d: %s" % (label, consecutive_conn_errors, conn_err))
+        if consecutive_conn_errors >= 3:
+            print("\n%s: Connection lost repeatedly, stopping." % label)
+            return 'break'
+        print("\n%s: Connection lost (%s). Reconnecting..." % (label, str(conn_err)[:80]))
+        try:
+            self.reconnect()
+            if not self._rw_post_reconnect():
+                print("%s: Mode lost after reconnect, leaving RW loop." % label)
+                return 'break'
+            print("%s: Reconnected successfully, resuming..." % label)
+            self.interruptible_sleep(1)
+            return 'continue'
+        except InterruptedError:
+            raise
+        except Exception as recon_err:
+            print("%s: Reconnect failed: %s" % (label, recon_err))
+            return 'break'
 
-            page_qs = state.get('questions', [])
-            if not page_qs:
-                consecutive_empty += 1
-                if consecutive_empty >= 5:
-                    self.debug("RW: No questions visible for %d steps" % consecutive_empty)
-                    nr = self.click_rw_next()
-                    if nr.get('success'):
-                        consecutive_empty = 0
-                        self.rw_show_data = None  # clear cache for next page group
-                        self.interruptible_sleep(1)
-                        continue
-                    print("RW: No more questions visible.")
-                    break
-                self.interruptible_sleep(1)
-                continue
 
+    def _run_rw_loop(self, max_steps=999):
+        """Read-Write (读写同步) mode loop. Different DOM, different navigation."""
+
+        # H3: hotkeys + reconnect (aligned with _run_loop, without huge rewrite)
+        hotkey = None
+        try:
+            from ets_hotkey import ETSHotkey
+            hotkey = ETSHotkey(on_stop=self._signal_stop)
+            hotkey.register()
+        except Exception as e:
+            self.debug("RW hotkey init failed: %s" % e)
+            hotkey = None
+
+        try:
+            # Get showData for answers
+            show_data = self.get_rw_show_data()
+            if not show_data or show_data.get('error'):
+                print("ERROR: Cannot read showData from iframe: %s" % (show_data or {}).get('error', 'unknown'))
+                print("Make sure the read-write page is fully loaded.")
+                return {'total_answered': 0, 'mode': 'read-write', 'errors': 1}
+
+            print("Questions in showData: %d" % len(show_data.get('question', []) or []))
+            rw_count = self._build_rw_answers_from_showdata(show_data, verbose=True)
+            print("Total RW answers: %d" % rw_count)
+
+            step = 0
             consecutive_empty = 0
-            any_new, all_done = self.answer_rw_choose()
+            consecutive_no_progress = 0  # pages where we couldn't answer anything
+            consecutive_conn_errors = 0
+            consecutive_next_fail = 0  # next not found / stuck on same page
 
-            if any_new:
-                consecutive_no_progress = 0
-                self.interruptible_sleep(0.5)
-
-            # Only try to advance when all visible questions are answered
-            if not all_done:
-                # Some questions not yet answerable — wait and retry
-                consecutive_no_progress += 1
-                if consecutive_no_progress >= 20:
-                    print("RW: No progress after %d attempts, stopping." % consecutive_no_progress)
+            while True:
+                if self.stop_event and self.stop_event.is_set():
                     break
-                self.interruptible_sleep(1)
-                continue
 
-            # All questions on this page are done — advance
-            consecutive_no_progress = 0
-            nr = self.click_rw_next()
-            if nr.get('success'):
-                method = nr.get('method', '')
-                if method == '提交':
-                    print("RW: 提交 clicked, task complete.")
+                # H3: hotkey checks
+                if hotkey and hotkey.should_stop:
+                    print("\n🛑 Emergency stop (F12)")
+                    self._signal_stop()
                     break
-                self.rw_show_data = None  # clear cache for next page group
-                self.interruptible_sleep(1)
-            elif nr.get('reason') == 'disabled':
-                # Still processing current step
-                self.debug("RW: Next disabled, waiting...")
-                for _ in range(15):
+                if hotkey and hotkey.should_skip:
+                    hotkey.clear_skip()
+                    print("\n⏭ Skipping current RW page (F10)")
+                    try:
+                        nr = self.click_rw_next()
+                    except (ConnectionError, TimeoutError) as conn_err:
+                        consecutive_conn_errors += 1
+                        action = self._handle_rw_reconnect(conn_err, consecutive_conn_errors)
+                        if action == 'break':
+                            break
+                        continue
+                    consecutive_conn_errors = 0
+                    if nr.get('success'):
+                        self.rw_show_data = None
+                        consecutive_next_fail = 0
+                        self.interruptible_sleep(1)
+                    continue
+                if hotkey and hotkey.is_paused:
+                    self.interruptible_sleep(0.5)
+                    continue
+
+                step += 1
+                if step > max_steps:
+                    print("Safety limit reached (%d steps)" % max_steps)
+                    break
+
+                # H3: reconnect on ConnectionError/TimeoutError (state + answer + next)
+                try:
+                    state = self.get_rw_page_state()
+                    consecutive_conn_errors = 0
+                except (ConnectionError, TimeoutError) as conn_err:
+                    consecutive_conn_errors += 1
+                    action = self._handle_rw_reconnect(conn_err, consecutive_conn_errors)
+                    if action == 'break':
+                        break
+                    continue
+
+                if state.get('error'):
+                    self.debug("RW step %d: state error: %s" % (step, state.get('error')))
+                    consecutive_empty += 1
+                    if consecutive_empty >= 10:
+                        print("Too many errors, stopping.")
+                        break
                     self.interruptible_sleep(1)
+                    continue
+
+                page_qs = state.get('questions', [])
+                if not page_qs:
+                    consecutive_empty += 1
+                    if consecutive_empty >= 5:
+                        self.debug("RW: No questions visible for %d steps" % consecutive_empty)
+                        try:
+                            nr = self.click_rw_next()
+                        except (ConnectionError, TimeoutError) as conn_err:
+                            consecutive_conn_errors += 1
+                            action = self._handle_rw_reconnect(conn_err, consecutive_conn_errors)
+                            if action == 'break':
+                                break
+                            continue
+                        consecutive_conn_errors = 0
+                        if nr.get('success'):
+                            consecutive_empty = 0
+                            consecutive_next_fail = 0
+                            self.rw_show_data = None  # clear cache for next page group
+                            self.interruptible_sleep(1)
+                            continue
+                        print("RW: No more questions visible.")
+                        break
+                    self.interruptible_sleep(1)
+                    continue
+
+                consecutive_empty = 0
+                try:
+                    any_new, all_done = self.answer_rw_choose()
+                except (ConnectionError, TimeoutError) as conn_err:
+                    consecutive_conn_errors += 1
+                    action = self._handle_rw_reconnect(conn_err, consecutive_conn_errors)
+                    if action == 'break':
+                        break
+                    continue
+
+                if any_new:
+                    consecutive_no_progress = 0
+                    self.interruptible_sleep(0.5)
+
+                # Only try to advance when all visible questions are answered
+                if not all_done:
+                    # Some questions not yet answerable — wait and retry
+                    consecutive_no_progress += 1
+                    if consecutive_no_progress >= 20:
+                        print("RW: No progress after %d attempts, stopping." % consecutive_no_progress)
+                        break
+                    self.interruptible_sleep(1)
+                    continue
+
+                # All questions on this page are done — advance
+                consecutive_no_progress = 0
+                try:
+                    nr = self.click_rw_next()
+                except (ConnectionError, TimeoutError) as conn_err:
+                    consecutive_conn_errors += 1
+                    action = self._handle_rw_reconnect(conn_err, consecutive_conn_errors)
+                    if action == 'break':
+                        break
+                    continue
+                if nr.get('success'):
+                    method = nr.get('method', '')
+                    if method == '提交':
+                        print("RW: 提交 clicked, task complete.")
+                        break
+                    self.rw_show_data = None  # clear cache for next page group
+                    consecutive_next_fail = 0
+                    self.interruptible_sleep(1)
+                elif nr.get('reason') == 'disabled':
+                    # Still processing current step
+                    self.debug("RW: Next disabled, waiting...")
+                    nr2 = {'method': ''}
+                    rw_finished = False
+                    wait_conn_errors = 0
+                    for _ in range(15):
+                        self.interruptible_sleep(1)
+                        try:
+                            if self._all_sidebar_correct():
+                                print("RW: All sidebar items correct, exam complete.")
+                                rw_finished = True
+                                break
+                            nr2 = self.click_rw_next()
+                        except (ConnectionError, TimeoutError) as conn_err:
+                            wait_conn_errors += 1
+                            consecutive_conn_errors += 1
+                            self.debug("RW next-wait connection error #%d: %s" % (
+                                wait_conn_errors, conn_err))
+                            if consecutive_conn_errors >= 3 or wait_conn_errors >= 3:
+                                print("\nRW: Connection lost during next-wait, stopping.")
+                                rw_finished = True
+                                break
+                            action = self._handle_rw_reconnect(conn_err, consecutive_conn_errors)
+                            if action == 'break':
+                                rw_finished = True
+                                break
+                            continue
+                        if nr2.get('success'):
+                            method = nr2.get('method', '')
+                            if method == '提交':
+                                print("RW: 提交 clicked, task complete.")
+                                rw_finished = True
+                            else:
+                                self.rw_show_data = None
+                                consecutive_next_fail = 0
+                                consecutive_conn_errors = 0
+                            break
+                    else:
+                        # Final sidebar check before giving up
+                        try:
+                            if self._all_sidebar_correct():
+                                print("RW: All sidebar items correct, exam complete.")
+                            else:
+                                print("RW: Next button disabled too long, may be complete.")
+                        except (ConnectionError, TimeoutError):
+                            print("RW: Next button disabled too long, may be complete.")
+                        rw_finished = True
+                    if rw_finished or nr2.get('method') == '提交':
+                        break
+                elif nr.get('reason') == 'not found':
+                    # Maybe on last step or page changed
+                    self.debug("RW: Next button not found")
+                    consecutive_next_fail += 1
+                    # Check sidebar first
                     if self._all_sidebar_correct():
                         print("RW: All sidebar items correct, exam complete.")
                         break
-                    nr2 = self.click_rw_next()
-                    if nr2.get('success'):
-                        method = nr2.get('method', '')
-                        if method == '提交':
-                            print("RW: 提交 clicked, task complete.")
+                    self.interruptible_sleep(2)
+                    # Check if still on rw page
+                    try:
+                        url = self.eval_js('document.location.hash')
+                        if not url or 'readingWriting' not in (url or ''):
+                            print("RW: Page changed, task may be complete.")
                             break
-                        self.rw_show_data = None
+                    except Exception:
+                        pass
+                    if consecutive_next_fail >= 8:
+                        print("RW: Next button not found repeatedly, stopping.")
                         break
                 else:
-                    # Final sidebar check before giving up
-                    if self._all_sidebar_correct():
-                        print("RW: All sidebar items correct, exam complete.")
-                    else:
-                        print("RW: Next button disabled too long, may be complete.")
-                    break
-                if nr2.get('method') == '提交':
-                    break
-            elif nr.get('reason') == 'not found':
-                # Maybe on last step or page changed
-                self.debug("RW: Next button not found")
-                # Check sidebar first
-                if self._all_sidebar_correct():
-                    print("RW: All sidebar items correct, exam complete.")
-                    break
-                self.interruptible_sleep(2)
-                # Check if still on rw page
-                try:
-                    url = self.eval_js('document.location.hash')
-                    if not url or 'readingWriting' not in (url or ''):
-                        print("RW: Page changed, task may be complete.")
+                    consecutive_next_fail += 1
+                    if consecutive_next_fail >= 8:
+                        print("RW: Next failed repeatedly (%s), stopping." % nr.get('reason'))
                         break
+
+            # Summary
+            choose_count = self.stats['choose_answered']
+            result = {
+                'mode': 'read-write',
+                'total_questions': self.total_questions,
+                'choose_answered': choose_count,
+                'total_answered': choose_count,
+                'errors': self.stats['errors']
+            }
+            print("\n" + "=" * 40)
+            print("Done: %d questions answered" % choose_count)
+            if self.total_questions:
+                print("Coverage: %d/%d (%.0f%%)" % (choose_count, self.total_questions, choose_count / self.total_questions * 100))
+
+            self._fire_complete(result)
+            return result
+        finally:
+            if self.ws:
+                try:
+                    self.ws.close()
                 except Exception:
                     pass
-
-        # Summary
-        choose_count = self.stats['choose_answered']
-        result = {
-            'mode': 'read-write',
-            'total_questions': self.total_questions,
-            'choose_answered': choose_count,
-            'total_answered': choose_count,
-            'errors': self.stats['errors']
-        }
-        print("\n" + "=" * 40)
-        print("Done: %d questions answered" % choose_count)
-        if self.total_questions:
-            print("Coverage: %d/%d (%.0f%%)" % (choose_count, self.total_questions, choose_count / self.total_questions * 100))
-
-        if self.ws:
-            try:
-                self.ws.close()
-            except Exception:
-                pass
-
-        return result
+            if hotkey:
+                try:
+                    hotkey.unregister()
+                except Exception:
+                    pass
 
     def _run_loop(self, max_steps=999):
         """Inner business-logic loop. Called by run(); separated so that
         run() can put this in a worker thread when a GUI is present."""
         print("-" * 40)
 
-        # ── Register global hotkeys (Windows only) ──
+        # Register global hotkeys (Windows only)
         hotkey = None
         try:
             from ets_hotkey import ETSHotkey
-            hotkey = ETSHotkey()
+            hotkey = ETSHotkey(on_stop=self._signal_stop)
             hotkey.register()
         except Exception as e:
             self.debug("Hotkey init failed (non-Windows?): %s" % e)
             hotkey = None
 
+        try:
+            return self._run_loop_body(max_steps, hotkey)
+        except InterruptedError:
+            # CLI F12 / stop_event during interruptible_sleep — clean exit
+            print("\n" + "\u5df2\u505c\u6b62")
+            return {
+                'set_id': self.set_id,
+                'mode': 'HOMEWORK' if self.homework_mode else 'PRACTICE',
+                'total_questions': self.total_questions,
+                'choose_answered': self.stats.get('choose_answered', 0),
+                'fill_answered': self.stats.get('fill_answered', 0),
+                'total_answered': (
+                    self.stats.get('choose_answered', 0)
+                    + self.stats.get('fill_answered', 0)
+                ),
+                'coverage_pct': 0,
+                'errors': self.stats.get('errors', 0),
+                'next_clicks': self.stats.get('next_click', 0),
+                'stopped': True,
+            }
+        finally:
+            # Always cleanup hotkey + ws even on InterruptedError / CDP crash
+            self._drop_connection()
+            if hotkey:
+                try:
+                    hotkey.unregister()
+                except Exception:
+                    pass
+
+
+    def _handle_exam_reconnect(self, conn_err, consecutive_conn_errors):
+        """Reconnect after eval_js timeout / WS drop mid exam step.
+
+        eval_js invalidates ws on timeout; answer_choose/fill/click_next must
+        call this (not only wait_iframe_ready). Returns True to continue the
+        main loop, False to stop.
+        """
+        self.debug("Connection error #%d: %s" % (consecutive_conn_errors, conn_err))
+        if consecutive_conn_errors >= 3:
+            print("\n4. Connection lost repeatedly, stopping.")
+            return False
+        print("\n4. Connection lost (%s). Reconnecting..." % str(conn_err)[:80])
+        try:
+            old_set_id = self.set_id
+            self.reconnect()
+            self._read_pinia_config()
+            self._detect_rw_mode()
+            # OPEN-H5: re-wrap kttb bridge immediately after new CDP session
+            try:
+                self.inject_bridge()
+            except Exception as br_err:
+                self.debug("inject_bridge after reconnect: %s" % br_err)
+            # Clear RW cache so stale showData isn't used after reconnect
+            self.rw_show_data = None
+            self._rw_cache_time = 0
+            # Reload answers if set_id changed during reconnect
+            if self.set_id != old_set_id:
+                self.debug("set_id changed after reconnect: %s → %s" % (
+                    old_set_id, self.set_id))
+                self.load_answers()
+                if self.strategy:
+                    self.strategy.load_set(self.set_id, data_dir=self.ets_base)
+            print("Reconnected successfully, resuming...")
+            self.interruptible_sleep(1)
+            return True
+        except InterruptedError:
+            raise
+        except Exception as recon_err:
+            print("Reconnect failed: %s" % recon_err)
+            return False
+
+    def _run_loop_body(self, max_steps, hotkey):
+        """Core exam loop body (cleanup handled by _run_loop finally)."""
         consecutive_empty = 0
         step = 0
         consecutive_conn_errors = 0  # #3: track connection drops for reconnect logic
@@ -1464,12 +1810,19 @@ class ETSAutoAnswer(ETSBase):
             # ── Hotkey checks ──
             if hotkey and hotkey.should_stop:
                 print("\n🛑 Emergency stop (F12)")
-                self.stop_event.set()
+                self._signal_stop()
                 break
             if hotkey and hotkey.should_skip:
                 hotkey.clear_skip()
                 print("\n⏭ Skipping current question (F10)")
-                nr = self.click_next()
+                try:
+                    nr = self.click_next()
+                except (ConnectionError, TimeoutError) as conn_err:
+                    consecutive_conn_errors += 1
+                    if self._handle_exam_reconnect(conn_err, consecutive_conn_errors):
+                        continue
+                    break
+                consecutive_conn_errors = 0
                 if nr.get('success'):
                     self.interruptible_sleep(1)
                 continue
@@ -1480,16 +1833,18 @@ class ETSAutoAnswer(ETSBase):
             # Check if recording window was closed (user signal to stop)
             if self._recording_window_closed:
                 print("\nRecording window closed - stopping script")
-                self.stop_event.set()
+                self._signal_stop()
                 break
 
             step += 1
             if step > max_steps:
                 print("\nSafety limit reached (%d steps)" % max_steps)
-                self.stop_event.set()
+                self._signal_stop()
                 break
 
-            # ── #3: Connection resilience — wrap page state read with reconnect ──
+            # ── #3: Connection resilience — page state + answer + next ──
+            # eval_js timeout invalidates ws; answer_choose/fill/click_next
+            # must also reconnect (not only the initial wait_iframe_ready).
             try:
                 ready, _ = self.wait_iframe_ready()
                 self.inject_bridge()
@@ -1523,193 +1878,184 @@ class ETSAutoAnswer(ETSBase):
                     consecutive_unreachable = 0
                     consecutive_empty = 0
                     state = self.get_page_state()
-                consecutive_conn_errors = 0  # reset on successful page state read
+
+                # ── Real-time question info for GUI ──
+                if self._on_question:
+                    try:
+                        q_info = {'step': step, 'total_questions': self.total_questions}
+                        if state.get('hasChoice'):
+                            q_info['type'] = 'choose'
+                            q_info['type_label'] = '选择题'
+                        elif state.get('hasInput'):
+                            q_info['type'] = 'fill'
+                            q_info['type_label'] = '填空题'
+                        else:
+                            q_info['type'] = 'transition'
+                            q_info['type_label'] = '过渡页'
+                        self._on_question(q_info)
+                    except Exception:
+                        pass
+
+                if state.get('hasChoice'):
+                    any_new, likely_done = self.answer_choose()
+                    if likely_done and not any_new:
+                        # Review mode or all choices already answered — check completion then advance
+                        if self._all_sidebar_correct():
+                            print("Exam completed (all %d questions answered and correct)" % self.total_questions)
+                            break
+                        nr = self.click_next()
+                        if nr.get('success'):
+                            self.interruptible_sleep(0.6)
+                            consecutive_conn_errors = 0
+                            continue
+                        elif self._is_next_waiting(nr.get('reason')):
+                            # Button temporarily disabled / hidden — check sidebar then wait
+                            if self._all_sidebar_correct():
+                                print("Exam completed (all questions correct)")
+                                break
+                            self.debug("  Next disabled/hidden after choices, waiting...")
+                            if self._wait_for_next(max_wait_loops=30, wait_sec=2, label="choices"):
+                                consecutive_conn_errors = 0
+                                continue
+                            print("Exam completed (next disabled/hidden after choices)")
+                            break
+                        elif nr.get('reason') == 'not found':
+                            # Page may still be loading
+                            self.debug("  Next button not found after choices, waiting...")
+                            if self._wait_for_next(max_wait_loops=10, wait_sec=2, label="choices-load"):
+                                consecutive_conn_errors = 0
+                                continue
+                            print("Exam completed (next not found after choices)")
+                            break
+                        else:
+                            print("Exam completed")
+                            break
+                    if not any_new:
+                        consecutive_choose_empty += 1
+                        consecutive_empty += 1
+                        if consecutive_choose_empty >= 3 and self._all_sidebar_correct():
+                            print("All choices correct but next not advancing — exam may be complete")
+                            break
+                        nr = self.click_next()
+                        if nr.get('success'):
+                            self.interruptible_sleep(0.6)
+                            consecutive_conn_errors = 0
+                            continue
+                        elif self._is_next_waiting(nr.get('reason')):
+                            # Audio may still be playing / answer not yet selected — wait
+                            self.debug("  Next disabled/hidden (no choice answer), waiting...")
+                            if self._wait_for_next(max_wait_loops=30, wait_sec=2, label="choice-no-answer"):
+                                consecutive_empty = 0
+                                consecutive_choose_empty = 0
+                                consecutive_conn_errors = 0
+                                continue
+                            print("Exam completed (next disabled/hidden, no answer)")
+                            break
+                        elif nr.get('reason') == 'not found':
+                            if self._wait_for_next(max_wait_loops=10, wait_sec=2, label="choice-no-ans-load"):
+                                consecutive_empty = 0
+                                consecutive_choose_empty = 0
+                                consecutive_conn_errors = 0
+                                continue
+                            consecutive_empty = max_empty
+                            consecutive_choose_empty = max_empty
+                        else:
+                            consecutive_empty = max_empty
+                            consecutive_choose_empty = max_empty
+                elif state.get('hasInput'):
+                    any_new, has_fills = self.answer_fill()
+                    if any_new:
+                        consecutive_empty = 0
+                    if has_fills and not any_new:
+                        nr = self.click_next()
+                        if nr.get('success'):
+                            self.interruptible_sleep(0.6)
+                            consecutive_conn_errors = 0
+                            continue
+                        elif self._is_next_waiting(nr.get('reason')):
+                            # Button disabled/hidden during fill section (ETS replays audio)
+                            # Could also be a fill+recording hybrid page
+                            if self.is_recording_page():
+                                self.debug("Recording page detected (fill + stopRecord visible)")
+                                if self.wait_for_recording_done():
+                                    consecutive_empty = 0
+                                    consecutive_conn_errors = 0
+                                    continue
+                                else:
+                                    print("Recording wait ended, stopping script.")
+                                    self._signal_stop()
+                                    break
+                            self.debug("  Next disabled (fill audio replay), waiting for button...")
+                            if self._wait_for_next(max_wait_loops=60, wait_sec=4, label="fill-audio"):
+                                consecutive_conn_errors = 0
+                                continue
+                            print("Exam completed (fill section, next disabled too long)")
+                            break
+                        elif nr.get('reason') == 'not found':
+                            if self._wait_for_next(max_wait_loops=10, wait_sec=2, label="fill-load"):
+                                consecutive_conn_errors = 0
+                                continue
+                            print("Exam completed (fill section, next not found)")
+                            break
+                        consecutive_conn_errors = 0
+                        continue
+                else:
+                    # No choices AND no inputs — could be section transition OR recording page
+                    # Check for recording page first (btn-stopRecord visible)
+                    if self.is_recording_page():
+                        self.debug("Recording page detected (no choice/input, stopRecord visible)")
+                        if self.wait_for_recording_done():
+                            consecutive_empty = 0
+                            consecutive_conn_errors = 0
+                            continue  # next button is ready, loop will click it
+                        else:
+                            print("Recording wait ended, stopping script.")
+                            self._signal_stop()
+                            break
+
+                    # Not a recording page — treat as section transition
+                    consecutive_empty += 1
+                    self.debug("Section transition, waiting... (empty %d/%d)" % (consecutive_empty, max_empty))
+                    if consecutive_empty >= max_empty:
+                        # Before stopping, do one last check — maybe we're on result page
+                        url = (self.tab or {}).get('url', '')
+                        if 'Result' in url or 'mockExamResult' in url:
+                            print("Exam completed (result page reached)")
+                            break
+                        print("Too many empty pages (%d), stopping." % consecutive_empty)
+                        break
+                    # Gentle backoff for section transitions: 2s, 2.5s, 3s...
+                    backoff = min(2 + consecutive_empty * 0.5, 6)
+                    self.interruptible_sleep(backoff)
+                    consecutive_conn_errors = 0
+                    continue
+
+                self.interruptible_sleep(0.3)
+                nr = self.click_next()
+                consecutive_conn_errors = 0  # full step succeeded
+                if nr.get('success'):
+                    self.interruptible_sleep(0.6)
+                elif self._is_next_waiting(nr.get('reason')):
+                    # Don't immediately break — audio may still be playing / answer pending
+                    self.debug("  Next disabled/hidden after answering, waiting...")
+                    if self._wait_for_next(max_wait_loops=30, wait_sec=2, label="post-answer"):
+                        continue
+                    print("Exam completed (next disabled/hidden)")
+                    break
+                elif nr.get('reason') == 'not found':
+                    # Page may still be loading — wait instead of breaking
+                    self.debug("  Next button not found, waiting for page load...")
+                    if self._wait_for_next(max_wait_loops=10, wait_sec=2, label="post-answer-load"):
+                        continue
+                    print("Exam completed (next not found)")
+                    break
+                else:
+                    print("Exam completed")
+                    break
             except (ConnectionError, TimeoutError) as conn_err:
                 consecutive_conn_errors += 1
-                self.debug("Connection error #%d: %s" % (consecutive_conn_errors, conn_err))
-                if consecutive_conn_errors >= 3:
-                    print("\n4. Connection lost repeatedly, stopping.")
-                    break
-                print("\n4. Connection lost (%s). Reconnecting..." % str(conn_err)[:80])
-                try:
-                    old_set_id = self.set_id
-                    self.reconnect()
-                    self._read_pinia_config()
-                    self._detect_rw_mode()
-                    # Bug fix: clear RW cache so stale showData isn't used after reconnect
-                    self.rw_show_data = None
-                    self._rw_cache_time = 0
-                    # Bug fix: reload answers if set_id changed during reconnect
-                    if self.set_id != old_set_id:
-                        self.debug("set_id changed after reconnect: %s → %s" % (old_set_id, self.set_id))
-                        self.load_answers()
-                        if self.strategy:
-                            self.strategy.load_set(self.set_id)
-                    print("Reconnected successfully, resuming...")
-                    self.interruptible_sleep(1)
+                if self._handle_exam_reconnect(conn_err, consecutive_conn_errors):
                     continue
-                except Exception as recon_err:
-                    print("Reconnect failed: %s" % recon_err)
-                    break
-
-            # ── Real-time question info for GUI ──
-            if self._on_question:
-                try:
-                    q_info = {'step': step, 'total_questions': self.total_questions}
-                    if state.get('hasChoice'):
-                        q_info['type'] = 'choose'
-                        q_info['type_label'] = '选择题'
-                    elif state.get('hasInput'):
-                        q_info['type'] = 'fill'
-                        q_info['type_label'] = '填空题'
-                    else:
-                        q_info['type'] = 'transition'
-                        q_info['type_label'] = '过渡页'
-                    self._on_question(q_info)
-                except Exception:
-                    pass
-
-            if state.get('hasChoice'):
-                any_new, likely_done = self.answer_choose()
-                if likely_done and not any_new:
-                    # Review mode or all choices already answered — check completion then advance
-                    if self._all_sidebar_correct():
-                        print("Exam completed (all %d questions answered and correct)" % self.total_questions)
-                        break
-                    nr = self.click_next()
-                    if nr.get('success'):
-                        self.interruptible_sleep(0.6)
-                        continue
-                    elif nr.get('reason') in ('disabled', 'next_icon hidden'):
-                        # Button temporarily disabled / hidden — check sidebar then wait
-                        if self._all_sidebar_correct():
-                            print("Exam completed (all questions correct)")
-                            break
-                        self.debug("  Next disabled/hidden after choices, waiting...")
-                        if self._wait_for_next(max_wait_loops=30, wait_sec=2, label="choices"):
-                            continue
-                        print("Exam completed (next disabled/hidden after choices)")
-                        break
-                    elif nr.get('reason') == 'not found':
-                        # Page may still be loading
-                        self.debug("  Next button not found after choices, waiting...")
-                        if self._wait_for_next(max_wait_loops=10, wait_sec=2, label="choices-load"):
-                            continue
-                        print("Exam completed (next not found after choices)")
-                        break
-                    else:
-                        print("Exam completed")
-                        break
-                if not any_new:
-                    consecutive_choose_empty += 1
-                    consecutive_empty += 1
-                    if consecutive_choose_empty >= 3 and self._all_sidebar_correct():
-                        print("All choices correct but next not advancing — exam may be complete")
-                        break
-                    nr = self.click_next()
-                    if nr.get('success'):
-                        self.interruptible_sleep(0.6)
-                        continue
-                    elif nr.get('reason') in ('disabled', 'next_icon hidden'):
-                        # Audio may still be playing / answer not yet selected — wait
-                        self.debug("  Next disabled/hidden (no choice answer), waiting...")
-                        if self._wait_for_next(max_wait_loops=30, wait_sec=2, label="choice-no-answer"):
-                            consecutive_empty = 0
-                            consecutive_choose_empty = 0
-                            continue
-                        print("Exam completed (next disabled/hidden, no answer)")
-                        break
-                    elif nr.get('reason') == 'not found':
-                        if self._wait_for_next(max_wait_loops=10, wait_sec=2, label="choice-no-ans-load"):
-                            consecutive_empty = 0
-                            consecutive_choose_empty = 0
-                            continue
-                        consecutive_empty = max_empty
-                        consecutive_choose_empty = max_empty
-                    else:
-                        consecutive_empty = max_empty
-                        consecutive_choose_empty = max_empty
-            elif state.get('hasInput'):
-                any_new, has_fills = self.answer_fill()
-                if any_new:
-                    consecutive_empty = 0
-                if has_fills and not any_new:
-                    nr = self.click_next()
-                    if nr.get('success'):
-                        self.interruptible_sleep(0.6)
-                        continue
-                    elif nr.get('reason') == 'disabled':
-                        # Button disabled during fill section (ETS replays audio)
-                        # Could also be a fill+recording hybrid page
-                        if self.is_recording_page():
-                            self.debug("Recording page detected (fill + stopRecord visible)")
-                            if self.wait_for_recording_done():
-                                consecutive_empty = 0
-                                continue
-                            else:
-                                print("Recording wait ended, stopping script.")
-                                self.stop_event.set()
-                                break
-                        self.debug("  Next disabled (fill audio replay), waiting for button...")
-                        if self._wait_for_next(max_wait_loops=60, wait_sec=4, label="fill-audio"):
-                            continue
-                        print("Exam completed (fill section, next disabled too long)")
-                        break
-                    elif nr.get('reason') == 'not found':
-                        if self._wait_for_next(max_wait_loops=10, wait_sec=2, label="fill-load"):
-                            continue
-                        print("Exam completed (fill section, next not found)")
-                        break
-                    continue
-            else:
-                # No choices AND no inputs — could be section transition OR recording page
-                # Check for recording page first (btn-stopRecord visible)
-                if self.is_recording_page():
-                    self.debug("Recording page detected (no choice/input, stopRecord visible)")
-                    if self.wait_for_recording_done():
-                        consecutive_empty = 0
-                        continue  # next button is ready, loop will click it
-                    else:
-                        print("Recording wait ended, stopping script.")
-                        self.stop_event.set()
-                        break
-
-                # Not a recording page — treat as section transition
-                consecutive_empty += 1
-                self.debug("Section transition, waiting... (empty %d/%d)" % (consecutive_empty, max_empty))
-                if consecutive_empty >= max_empty:
-                    # Before stopping, do one last check — maybe we're on result page
-                    url = self.tab.get('url', '')
-                    if 'Result' in url or 'mockExamResult' in url:
-                        print("Exam completed (result page reached)")
-                        break
-                    print("Too many empty pages (%d), stopping." % consecutive_empty)
-                    break
-                # Gentle backoff for section transitions: 2s, 2.5s, 3s...
-                backoff = min(2 + consecutive_empty * 0.5, 6)
-                self.interruptible_sleep(backoff)
-                continue
-
-            self.interruptible_sleep(0.3)
-            nr = self.click_next()
-            if nr.get('success'):
-                self.interruptible_sleep(0.6)
-            elif nr.get('reason') in ('disabled', 'next_icon hidden'):
-                # Don't immediately break — audio may still be playing / answer pending
-                self.debug("  Next disabled/hidden after answering, waiting...")
-                if self._wait_for_next(max_wait_loops=30, wait_sec=2, label="post-answer"):
-                    continue
-                print("Exam completed (next disabled/hidden)")
-                break
-            elif nr.get('reason') == 'not found':
-                # Page may still be loading — wait instead of breaking
-                self.debug("  Next button not found, waiting for page load...")
-                if self._wait_for_next(max_wait_loops=10, wait_sec=2, label="post-answer-load"):
-                    continue
-                print("Exam completed (next not found)")
-                break
-            else:
-                print("Exam completed")
                 break
 
         # ── Summary ──
@@ -1733,7 +2079,7 @@ class ETSAutoAnswer(ETSBase):
                     print("\nAll questions answered. Exam complete!")
         else:
             print("No questions answered this run")
-            if 'mockExamResult' in self.tab.get('url', ''):
+            if 'mockExamResult' in self._tab_url():
                 print("Note: You are on a completed exam result page.")
                 print("Open a mock exam or homework page to auto-answer.")
         if self.stats['errors']:
@@ -1754,7 +2100,9 @@ class ETSAutoAnswer(ETSBase):
 
         # #2: Save statistics report to file for later analysis
         try:
-            stats_path = os.path.join(self.ets_base or '.', 'ets_stats.json')
+                        # OPEN-M11: do not pollute APPDATA ETS — write beside project/exe
+            from ets_common import user_data_path
+            stats_path = user_data_path('ets_stats.json', anchor_file=__file__)
             report = {
                 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'set_id': self.set_id,
@@ -1770,20 +2118,7 @@ class ETSAutoAnswer(ETSBase):
         except Exception as e:
             self.debug("Stats report save failed: %s" % e)
 
-        # Cleanup WebSocket
-        if self.ws:
-            try:
-                self.ws.close()
-            except Exception:
-                pass
-
-        # Unregister hotkeys
-        if hotkey:
-            try:
-                hotkey.unregister()
-            except Exception:
-                pass
-
+        # Cleanup (ws/hotkey) is in _run_loop finally
         return result
 
     def run(self, max_steps=999):
@@ -1798,7 +2133,7 @@ class ETSAutoAnswer(ETSBase):
             print("\n❌ 连接失败: %s" % e)
             print("诊断：")
             print("  1. e听说PC端是否已启动？")
-            print("  2. 调试端口 %d 是否正确？")
+            print("  2. 调试端口 %d 是否正确？" % self.port)
             print("  3. Chrome --remote-debugging-port=%d 是否开启？" % self.port)
             return
         except ConnectionRefusedError:
@@ -1810,7 +2145,7 @@ class ETSAutoAnswer(ETSBase):
             print("诊断：请确认 e听说PC端已启动且调试端口 %d 正确" % self.port)
             return
 
-        if 'Result' in self.tab.get('url', ''):
+        if 'Result' in self._tab_url():
             print("Already on a result page — open a mock exam to auto-answer")
             return
 
@@ -1853,7 +2188,12 @@ class ETSAutoAnswer(ETSBase):
             # Monitor worker thread from main thread: auto-destroy window when done
             def _poll_worker():
                 if not t.is_alive():
-                    # Worker finished — destroy window to exit mainloop
+                    # Worker finished — destroy window and unblock GUI wait (C2)
+                    try:
+                        if self._rec_done_event is not None:
+                            self._rec_done_event.set()
+                    except Exception:
+                        pass
                     try:
                         if self._tk_root and self._tk_root.winfo_exists():
                             self._tk_root.destroy()
@@ -1972,7 +2312,7 @@ if __name__ == "__main__":
         tee_err = TeeOutput(args.log, original_stream=sys.stderr, shared_handle=tee.log)
         sys.stderr = tee_err
     try:
-        auto = ETSAutoAnswer(debug_mode=args.debug)
+        auto = ETSAutoAnswer(debug_mode=args.debug, stop_event=threading.Event())
         if args.show_answers:
             auto.connect()
             auto.load_answers()

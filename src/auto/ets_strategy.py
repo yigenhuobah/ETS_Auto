@@ -22,10 +22,11 @@ Composite Key design (avoids index-based mismatch):
 Usage:
   from ets_strategy import ETSStrategy
   strategy = ETSStrategy()
-  strategy.load_set(set_id)   # pre-load all sections for this set
+  strategy.load_set(set_id)                 # default: %APPDATA%\\ETS
+  strategy.load_set(set_id, data_dir=base)  # optional custom ETS data root
   ans = strategy.lookup('collector.choose', stid, qid='1')
 """
-import sys, os, json, re, hashlib
+import sys, os, json, re, hashlib, copy
 from urllib.parse import urlparse, parse_qs
 
 # ── Path setup ───────────────────────────────────────────────
@@ -82,6 +83,62 @@ def _html_to_text(html_str):
     return text.strip()
 
 
+def _safe_set_id(set_id):
+    """Return set_id if it is a safe relative id (digits only), else None.
+
+    Rejects path traversal, absolute paths, empty ids, and non-digit names
+    so load paths cannot escape the ETS data root.
+    """
+    if set_id is None:
+        return None
+    s = str(set_id).strip()
+    if not s or not s.isdigit():
+        return None
+    return s
+
+
+def _resolve_exam_dir(set_id, data_dir):
+    """Join data_dir/set_id and ensure the resolved path stays under data_dir.
+
+    Returns the absolute exam_dir path, or None if the path escapes data_dir
+    or does not exist as a directory.
+    """
+    base = os.path.realpath(os.path.abspath(data_dir))
+    exam_dir = os.path.realpath(os.path.abspath(os.path.join(base, set_id)))
+    # Require exam_dir to be base or a strict subdirectory of base
+    try:
+        common = os.path.commonpath([base, exam_dir])
+    except ValueError:
+        # Different drives on Windows
+        return None
+    if common != base:
+        return None
+    if not os.path.isdir(exam_dir):
+        return None
+    return exam_dir
+
+
+def _dir_mtime(exam_dir):
+    """Cheap invalidation stamp: max mtime of exam_dir and content_*/content.json."""
+    try:
+        stamp = os.path.getmtime(exam_dir)
+    except OSError:
+        return None
+    try:
+        names = os.listdir(exam_dir)
+    except OSError:
+        return stamp
+    for d in names:
+        if not d.startswith('content_'):
+            continue
+        cj = os.path.join(exam_dir, d, 'content.json')
+        try:
+            stamp = max(stamp, os.path.getmtime(cj))
+        except OSError:
+            continue
+    return stamp
+
+
 class ETSStrategy:
     """
     Strategy layer: loads and indexes answer data for a set_id.
@@ -99,43 +156,83 @@ class ETSStrategy:
         self.sections = []        # list of section dicts
         self.answer_index = {}    # composite_key → answer_dict
         self.recording_answers = []
-        # Class-level LRU cache: set_id → (sections, answer_index, recording_answers)
-        # Avoids re-reading content.json when switching between sets
+        # Class-level LRU cache:
+        #   cache_key → (sections, answer_index, recording_answers, mtime)
+        # Avoids re-reading content.json when switching between sets.
+        # Stored entries are deep-copied on both store and load so callers
+        # cannot mutate shared cache state (H9).
         if not hasattr(self.__class__, '_set_cache'):
             self.__class__._set_cache = {}
         if not hasattr(self.__class__, '_set_cache_order'):
-            self.__class__._set_cache_order = []  # list of set_ids, MRU at end
+            self.__class__._set_cache_order = []  # list of cache keys, MRU at end
 
     # ── Public API ────────────────────────────────────────────
 
-    def load_set(self, set_id):
+    def load_set(self, set_id, data_dir=None):
         """
         Load all sections for a set_id from ETS cache.
-        Returns True on success, False if no data found.
-        Uses class-level cache to avoid re-reading content.json files.
-        """
-        set_id = str(set_id)
 
-        # Check cache first (and update LRU order)
-        cached = self.__class__._set_cache.get(set_id)
-        if cached is not None:
+        Args:
+          set_id:   exam/set identifier. Must be digits-only (path-safe).
+          data_dir: optional ETS data root. When None (default), uses
+                    ETS_DATA_DIR (%APPDATA%\\ETS). Pass the same root as
+                    exam loading (e.g. Pinia ets_base) so strategy and
+                    load_answers share one data tree (H5).
+
+        Returns:
+          True on success, False if set_id is unsafe, missing, or empty.
+
+        Uses a class-level LRU cache (deep-copied on hit/store). Cache
+        entries are keyed by (set_id, resolved data_dir) and invalidated
+        when content.json mtimes change (H9).
+        """
+        set_id = _safe_set_id(set_id)
+        if set_id is None:
+            self.set_id = None
+            self.sections = []
+            self.answer_index = {}
+            self.recording_answers = []
+            return False
+
+        root = data_dir if data_dir is not None else ETS_DATA_DIR
+        root = os.path.abspath(root)
+        cache_key = "%s\0%s" % (set_id, root)
+
+        exam_dir = _resolve_exam_dir(set_id, root)
+        if exam_dir is None:
             self.set_id = set_id
-            self.sections, self.answer_index, self.recording_answers = cached
-            # Move to end (most recently used)
+            self.sections = []
+            self.answer_index = {}
+            self.recording_answers = []
+            return False
+
+        mtime = _dir_mtime(exam_dir)
+
+        # Check cache first (and update LRU order); invalidate on mtime change
+        cached = self.__class__._set_cache.get(cache_key)
+        if cached is not None:
+            c_sections, c_index, c_recs, c_mtime = cached
+            if c_mtime == mtime:
+                self.set_id = set_id
+                # Return deep copies so callers cannot mutate the cache (H9)
+                self.sections = copy.deepcopy(c_sections)
+                self.answer_index = copy.deepcopy(c_index)
+                self.recording_answers = copy.deepcopy(c_recs)
+                order = self.__class__._set_cache_order
+                if cache_key in order:
+                    order.remove(cache_key)
+                order.append(cache_key)
+                return len(self.sections) > 0
+            # Stale: drop and reload
+            self.__class__._set_cache.pop(cache_key, None)
             order = self.__class__._set_cache_order
-            if set_id in order:
-                order.remove(set_id)
-            order.append(set_id)
-            return len(self.sections) > 0
+            if cache_key in order:
+                order.remove(cache_key)
 
         self.set_id = set_id
         self.sections = []
         self.answer_index = {}
         self.recording_answers = []
-
-        exam_dir = os.path.join(ETS_DATA_DIR, self.set_id)
-        if not os.path.isdir(exam_dir):
-            return False
 
         for d in sorted(os.listdir(exam_dir)):
             if not d.startswith('content_'):
@@ -161,18 +258,23 @@ class ETSStrategy:
             self.sections.append(section)
             self._index_section(section)
 
-        # Store in cache with LRU eviction
+        # Store deep copies in cache with LRU eviction (H9)
         if self.sections:
             cache = self.__class__._set_cache
             order = self.__class__._set_cache_order
-            cache[set_id] = (self.sections, self.answer_index, self.recording_answers)
-            if set_id in order:
-                order.remove(set_id)
-            order.append(set_id)
+            cache[cache_key] = (
+                copy.deepcopy(self.sections),
+                copy.deepcopy(self.answer_index),
+                copy.deepcopy(self.recording_answers),
+                mtime,
+            )
+            if cache_key in order:
+                order.remove(cache_key)
+            order.append(cache_key)
             # Evict oldest entries beyond max size
             while len(order) > self.__class__._SET_CACHE_MAX:
-                old_id = order.pop(0)
-                cache.pop(old_id, None)
+                old_key = order.pop(0)
+                cache.pop(old_key, None)
 
         return len(self.sections) > 0
 
@@ -296,7 +398,9 @@ class ETSStrategy:
                     'variants': variants,
                     'title_text': ask,
                 }
-            # Also index std fill answers for dialogue inside fill loop
+            # Also index std answers as fill-like keys for dialogue/role
+            # sections that embed blanks. Never overwrite an existing
+            # collector.fill_* entry (real fill section wins) — C6.
             for std in info.get('std', []):
                 qid = str(std.get('xth', std.get('th', '')))
                 answer = std.get('value', '')
@@ -304,6 +408,8 @@ class ETSStrategy:
                     answer = answer.split('/')[0].strip()
                 if answer:
                     key = "collector.fill_%s_%s" % (stid, qid)
+                    if key in self.answer_index:
+                        continue
                     self.answer_index[key] = {
                         'type': 'fill',
                         'answer': answer,

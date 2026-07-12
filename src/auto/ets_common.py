@@ -10,6 +10,28 @@ Provides ETSBase class with:
 """
 import json, time, urllib.request, websocket, os, sys, threading
 
+# Single source of truth for app version (imported by exam/PK/GUI/remote)
+APP_VERSION = "0.6.5"
+
+
+def user_data_path(filename, anchor_file=None):
+    """Resolve a user-writable path (beside exe when frozen; project root in dev).
+
+    Shared by PK (pk_extra/misses), remote (pk_extra download), and exam stats.
+    Only the basename of filename is used so absolute paths cannot escape base.
+    """
+    raw = str(filename or '')
+    raw = raw.replace(chr(92), '/').rstrip('/')
+    name = os.path.basename(raw)
+    if not name or name in ('.', '..'):
+        name = 'data.bin'
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(sys.executable)
+    else:
+        anchor = anchor_file or __file__
+        base = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(anchor))))
+    return os.path.join(base, name)
 
 def force_utf8_stdio(line_buffering=False):
     """Force stdout/stderr to UTF-8 on Windows to avoid GBK encoding errors.
@@ -51,13 +73,35 @@ class ETSBase:
         self.mid = 0
         self.debug_mode = debug_mode
         self.tab = None
-        # Optional threading.Event: when set, interruptible_sleep raises InterruptedError
+        # When set, interruptible_sleep raises InterruptedError.
+        # Exam/PK call ensure_stop_event() so CLI always has a real Event.
         self.stop_event = stop_event
         # Callback hooks
         self._on_connect = None
         self._on_question = None
         self._on_complete = None
         self._on_error = None
+
+    def ensure_stop_event(self):
+        """Install a threading.Event if stop_event is still None."""
+        if self.stop_event is None:
+            self.stop_event = threading.Event()
+        return self.stop_event
+
+    def signal_stop(self):
+        """Set stop_event if present (safe no-op when None)."""
+        if self.stop_event is not None:
+            self.stop_event.set()
+
+    def _drop_connection(self):
+        """Close socket and clear tab so callers never see a half-open pair."""
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+        self.ws = None
+        self.tab = None
 
     # ── Callback registration ─────────────────────────────────
 
@@ -122,59 +166,144 @@ class ETSBase:
     _RECONNECT_MAX_RETRIES = 3
     _RECONNECT_DELAY = 2  # seconds between retries
 
+    def _pick_ets_tab(self, ets_tabs):
+        """Prefer an active exam/homework tab over a bare portal home page.
+
+        OPEN-H3: multiple ets100.com targets may exist; picking [0] alone can
+        attach to the wrong page. Prefer URLs that look like exam/PK/homework.
+
+        Also prefer targets with a non-empty webSocketDebuggerUrl (attachable
+        via CDP) and type "page" when present. Never return a tab without
+        webSocketDebuggerUrl if any candidate has one.
+        """
+        if not ets_tabs:
+            return None
+        prefer_keys = (
+            'mockExam', 'doHomework', 'readingWriting', 'homework',
+            'exam', 'pk', 'word', 'practice', 'detail',
+        )
+        any_has_ws = any((t.get('webSocketDebuggerUrl') or '').strip() for t in ets_tabs)
+        scored = []
+        for t in ets_tabs:
+            ws_url = (t.get('webSocketDebuggerUrl') or '').strip()
+            if any_has_ws and not ws_url:
+                # Skip non-attachable targets when attachable ones exist
+                continue
+            u = (t.get('url') or '').lower()
+            score = sum(1 for k in prefer_keys if k.lower() in u)
+            # Prefer non-blank titles and longer paths (more specific pages)
+            title = (t.get('title') or '')
+            score += 1 if title.strip() else 0
+            # Prefer type "page" when present (vs service_worker, iframe, etc.)
+            if (t.get('type') or '').lower() == 'page':
+                score += 10
+            # Prefer attachable debugger targets
+            if ws_url:
+                score += 100
+            scored.append((score, len(u), t))
+        if not scored:
+            return None
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return scored[0][2]
+
     def connect(self):
         """Find ETS tab and establish CDP WebSocket connection.
 
-        Discovers ETS tabs on the local CDP port and connects to the
-        first one found. Subclasses may override to add post-connect logic.
+        Discovers ETS tabs on the local CDP port and connects to a preferred
+        exam-related tab when several exist (OPEN-H3).
         """
         url = "http://localhost:%d/json" % self.port
         tabs = json.loads(urllib.request.urlopen(url, timeout=5).read())
         ets_tabs = [t for t in tabs if "ets100.com" in t.get("url", "")]
         if not ets_tabs:
             raise Exception("No ETS tab found on port %d" % self.port)
-        self.tab = ets_tabs[0]
-        self.ws = websocket.create_connection(self.tab["webSocketDebuggerUrl"], timeout=None)
+        self.tab = self._pick_ets_tab(ets_tabs)
+        if not self.tab:
+            raise Exception(
+                "No attachable ETS tab found on port %d "
+                "(no candidate with webSocketDebuggerUrl)" % self.port)
+        ws_url = (self.tab.get("webSocketDebuggerUrl") or "").strip()
+        if not ws_url:
+            raise Exception(
+                "Selected ETS tab has no webSocketDebuggerUrl on port %d "
+                "(url=%s)" % (self.port, (self.tab.get("url") or "")[:120]))
+        self.ws = websocket.create_connection(ws_url, timeout=None)
+        # Fresh socket: always start mid at 0 (matches reconnect; avoids stale ids
+        # if connect() is called again after a prior session without a new instance).
+        self.mid = 0
         print("ETS connected")
         self.debug("URL: " + self.tab['url'][:120])
+        if len(ets_tabs) > 1:
+            self.debug("Multiple ETS tabs (%d); selected preferred target" % len(ets_tabs))
 
     def reconnect(self):
         """Attempt to re-establish CDP WebSocket after disconnection.
 
         Tries up to _RECONNECT_MAX_RETRIES times with _RECONNECT_DELAY second
-        intervals. Updates self.tab and self.ws on success.
-        Raises ConnectionError if all retries fail.
+        intervals. Uses interruptible_sleep when stop_event is set so GUI stop
+        can abort mid-retry; falls back to time.sleep when stop_event is None.
+        On success, resets mid so CDP message ids stay consistent with the new
+        socket. On total failure (or stop), leaves ws/tab as None so callers
+        never see a half-open tab without a live socket.
+        Raises ConnectionError if all retries fail; InterruptedError if stopped.
         """
         last_err = None
         for attempt in range(1, self._RECONNECT_MAX_RETRIES + 1):
             self.debug("Reconnect attempt %d/%d..." % (attempt, self._RECONNECT_MAX_RETRIES))
             try:
-                # Close stale WebSocket if still open
-                if self.ws:
-                    try:
-                        self.ws.close()
-                    except Exception:
-                        pass
-                    self.ws = None
+                self._drop_connection()
                 url = "http://localhost:%d/json" % self.port
                 tabs = json.loads(urllib.request.urlopen(url, timeout=5).read())
                 ets_tabs = [t for t in tabs if "ets100.com" in t.get("url", "")]
                 if not ets_tabs:
                     raise Exception("No ETS tab found")
-                self.tab = ets_tabs[0]
-                self.ws = websocket.create_connection(self.tab["webSocketDebuggerUrl"], timeout=None)
+                self.tab = self._pick_ets_tab(ets_tabs)
+                if not self.tab:
+                    raise Exception(
+                        "No attachable ETS tab found "
+                        "(no candidate with webSocketDebuggerUrl)")
+                ws_url = (self.tab.get("webSocketDebuggerUrl") or "").strip()
+                if not ws_url:
+                    raise Exception(
+                        "Selected ETS tab has no webSocketDebuggerUrl "
+                        "(url=%s)" % ((self.tab.get("url") or "")[:120]))
+                self.ws = websocket.create_connection(ws_url, timeout=None)
+                # New socket: reset mid so eval_js ids don't collide with stale state
+                self.mid = 0
                 print("ETS reconnected (attempt %d)" % attempt)
                 self.debug("URL: " + self.tab['url'][:120])
                 return True
+            except InterruptedError:
+                self._drop_connection()
+                raise
             except Exception as e:
                 last_err = e
                 self.debug("Reconnect attempt %d failed: %s" % (attempt, e))
+                self._drop_connection()
                 if attempt < self._RECONNECT_MAX_RETRIES:
-                    time.sleep(self._RECONNECT_DELAY)
+                    # interruptible when stop_event present; else plain sleep
+                    self.interruptible_sleep(self._RECONNECT_DELAY)
+        self._drop_connection()
         raise ConnectionError(
             "Reconnect failed after %d attempts: %s" % (self._RECONNECT_MAX_RETRIES, last_err))
 
     _EVAL_JS_TIMEOUT = 15  # seconds per eval_js call
+
+    def _invalidate_ws(self, reason=""):
+        """Close and drop the current WebSocket after timeout/poison state.
+
+        A timed-out Runtime.evaluate leaves a late response in the socket
+        buffer that would desync subsequent eval_js mid matching. Callers
+        should reconnect() before further CDP use.
+        """
+        if reason:
+            self.debug("Invalidating WebSocket: %s" % reason)
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
 
     def eval_js(self, expr):
         """Evaluate JavaScript expression via CDP Runtime.evaluate.
@@ -185,8 +314,13 @@ class ETSBase:
 
         Includes a safety timeout so a dead browser or blocked JS
         cannot deadlock the calling thread.
+        On timeout the socket is invalidated (closed) so a subsequent
+        reconnect() starts clean — never reuse a half-poisoned WS.
         Catches WebSocket disconnection gracefully.
         """
+        if self.ws is None:
+            raise ConnectionError(
+                "WebSocket not connected — call connect()/reconnect() first")
         self.mid += 1
         payload = json.dumps({
             "id": self.mid, "method": "Runtime.evaluate",
@@ -195,15 +329,18 @@ class ETSBase:
         try:
             self.ws.send(payload)
         except websocket.WebSocketConnectionClosedException:
+            self._invalidate_ws("closed before send")
             raise ConnectionError(
                 "WebSocket closed — browser disconnected before eval_js send")
         except OSError as e:
+            self._invalidate_ws("I/O error on send")
             raise ConnectionError(
                 "WebSocket I/O error during eval_js send: %s" % e)
         deadline = time.time() + self._EVAL_JS_TIMEOUT
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
+                self._invalidate_ws("eval_js deadline exceeded")
                 raise TimeoutError(
                     "eval_js timed out after %ds (browser may have crashed)"
                     % self._EVAL_JS_TIMEOUT)
@@ -211,13 +348,16 @@ class ETSBase:
             try:
                 raw = self.ws.recv()
             except websocket.WebSocketConnectionClosedException:
+                self._invalidate_ws("closed during recv")
                 raise ConnectionError(
                     "WebSocket closed — browser disconnected during eval_js")
             except websocket.WebSocketTimeoutException:
+                self._invalidate_ws("recv timeout")
                 raise TimeoutError(
                     "eval_js timed out after %ds (browser may have crashed)"
                     % self._EVAL_JS_TIMEOUT)
             except OSError as e:
+                self._invalidate_ws("I/O error on recv")
                 raise ConnectionError(
                     "WebSocket I/O error during eval_js: %s" % e)
             try:
@@ -271,6 +411,21 @@ class ETSBase:
 
     @staticmethod
     def js_escape(s):
-        """Escape string for safe JS single-quoted or double-quoted string injection."""
-        return (s.replace('\\', '\\\\').replace("'", "\\'")
-                 .replace('"', '\\"').replace('\n', '\\n').replace('\r', ''))
+        """Escape string for safe JS single/double-quoted string injection.
+
+        Also escapes U+2028/U+2029 (line/paragraph separators) which are valid
+        in JSON/Python strings but terminate JS string literals (OPEN-M3).
+        """
+        if s is None:
+            return ''
+        if not isinstance(s, str):
+            s = str(s)
+        s = s.replace('\\', '\\\\')
+        s = s.replace("'", "\\'")
+        s = s.replace('"', '\\"')
+        s = s.replace('\n', '\\n')
+        s = s.replace('\r', '')
+        s = s.replace('\u2028', '\\u2028')
+        s = s.replace('\u2029', '\\u2029')
+        return s
+

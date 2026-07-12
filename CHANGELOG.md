@@ -1,5 +1,71 @@
 # Changelog
 
+## [0.6.5] - 2026-07-12
+
+### Changed (low-risk simplify)
+- **版本单源** — `APP_VERSION` 只在 `ets_common` 定义；`ets_auto` / `ets_word_pk` / `ets_gui` 再导出
+- **RW 重连控制流** — `_handle_rw_reconnect()` 收口原 6 处复制粘贴
+- **GUI 远程阻断** — `_remote_is_blocked` / `_apply_remote_block` 统一 start/回调/结束路径
+- **用户数据路径单源** — `ets_common.user_data_path()`；PK/remote/stats 共用
+- **PK 重连控制流** — `_handle_pk_reconnect()` 收口两处复制；finally 用 `_drop_connection()`
+
+### Fixed (OPEN backlog — full pass)
+- **OPEN-H1** 版本对齐 — `ets_auto` / `ets_word_pk` / `ets_gui` / `info.json` → **0.6.5**
+- **OPEN-H2/M4** CLI PK `stop_event` — `run.py pk` 传 `Event()`；`ETSWordPK` 默认创建 Event
+- **OPEN-H3** 多 tab 连接 — `_pick_ets_tab()` 优先 exam/homework/PK URL，不再盲目 `[0]`
+- **OPEN-H4** 远程完整性（可选）— `verify_remote_payload_integrity()`；支持 `ETS_REMOTE_HMAC` / `ETS_REMOTE_PUBKEY`；未配置时保持 allowlist-only 兼容
+- **OPEN-H5** reconnect 后立即 `inject_bridge()`
+- **OPEN-H6** RW 重连重建答案 — `_rw_post_reconnect` + `_build_rw_answers_from_showdata`
+- **OPEN-H7** 热键注册失败可观测 — 全失败则 `_registered=False` + 警告；`GetLastError` 日志
+- **OPEN-H8** 移除 `HANDOVER.md` 明文账号/密码
+- **OPEN-M1** 热键 print 改为 ASCII `[PAUSE]/[SKIP]/[STOP]`
+- **OPEN-M3** `js_escape` 转义 U+2028/U+2029
+- **OPEN-M5** PK `_fire_question` 增加 `answered` / `total_questions`
+- **OPEN-M10** `tools/fix_*.py` 路径改为相对仓库，不再写死本机绝对路径
+- **OPEN-M11** `ets_stats.json` 写到项目根/exe 旁，不再写入 `%APPDATA%\\ETS`
+
+### Notes
+- 真机项（完整套卷 E2E、作业提交、多 tab 实机）仍需人工验收
+- 远程签名默认关闭（未设密钥时与 0.6.4 行为兼容）；生产加固请配置 `ETS_REMOTE_HMAC` 或 Ed25519 公钥
+
+## [Unreleased]
+
+### Fixed (deep audit 2026-07-12)
+- **C1** CLI `stop_event is None` 时 F12/上限/录音结束 `.set()` 崩溃 — 默认创建 `threading.Event()` + `_signal_stop()`
+- **C2** GUI 录音窗结束不 `done.set()` 导致 worker 挂起 — `_rec_done_event` + poll destroy 同步
+- **C3** `next_icon hidden` reason 长短串不匹配提前收卷 — 稳定匹配 `_is_next_waiting()`
+- **C4** `hasChoice`/`hasInput` 未过滤幽灵 DOM — 改用过滤后列表长度
+- **C5** `load_answers` 不清空导致换卷合并 — 加载前 clear
+- **C6** role/dialogue 覆盖 fill 索引 — 已有 fill key 不覆盖
+- **C7** PK Strategy1 仅「在词典」+50 抢答 — 要求题干重叠才计分
+- **C8** `tools/fix_*.py` 默认改写源码 — 需 `--apply` 才写入
+- **H1/H2** exam/PK 异常路径漏清理 hotkey/ws — `try/finally`
+- **H3** RW 模式无 reconnect/热键 — 对齐主循环
+- **H4** reconnect 阻塞 sleep / 半死状态 — interruptible + 失败清 tab/ws + mid 重置
+- **H5** strategy 写死 APPDATA — `load_set(..., data_dir=)`
+- **H6** Pinia homework set_id 无条件采用 — 仅作业模式
+- **H7** `collector.role` 未进录音答案 — 已加载
+- **H8** strip_html/keypoint — 安全标签正则 + strip keypoint
+- **H9/H10** strategy 缓存共享与 set_id 路径逃逸 — deepcopy/mtime + digits 校验
+- **H11–H15** PK 词库控制符/学习规范化/模糊子串/F10 skip
+- **H12/H16/H18/H19** pk_extra 路径统一、原子写+合并、URL allowlist
+- **H17** GUI 远程 block 竞态 — 检查后可 stop
+- **H20** 答案注入 JS 未 escape — choose/fill 使用 `js_escape`
+- **H21** PyInstaller hidden-import 补全
+- **H22** total_questions 含录音题 — 仅计 choose+fill
+- **M1–M3** run.py BOM、content.json 双编码、PK reconnect
+
+### Fixed (residual pass C)
+- **InterruptedError 被 reconnect 外层 `except Exception` 吞掉** — 用户在重连等待期间点停止时，`reconnect()` 抛出的 `InterruptedError` 被当成“重连失败”吞掉，导致 GUI/CLI 停止不干净。`ets_auto`（主循环+RW 三处）与 `ets_word_pk`（两处）改为 `except InterruptedError: raise` 后再接普通 Exception。
+
+### Notes
+- **全量遗漏细节清单（待一起修复）** 已写入 `docs/deep_bug_audit_20260712.md` **§8**（OPEN-H/M/L + 修复状态矩阵 + 测试缺口 + 真机项）。
+- **2026-07-12 选项2 重扫**：对照当前工作树更新 §8.0/§8.1（大审计+residual 多为 FIXED；仍开项仍为 OPEN-H1–H8 等）。**只更新文档，未改生产代码。**
+
+### Tests
+- `test_unit.py` 扩展（103 tests）
+- `pre_release_test.py` 含 strategy/hotkey 语法检查
+
 ## [0.6.4] - 2026-07-08
 
 ### Fixed

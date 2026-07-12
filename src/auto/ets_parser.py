@@ -34,14 +34,13 @@ if getattr(sys, 'frozen', False):
 else:
     _BASE = os.path.dirname(os.path.abspath(__file__))
 
-# ── Force UTF-8 on Windows ──────────────────────────────────
-if sys.platform == 'win32':
-    os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
-    try:
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-    except (AttributeError, LookupError):
-        pass
+# ── Force UTF-8 on Windows (shared helper) ──────────────────
+try:
+    from ets_common import force_utf8_stdio
+    force_utf8_stdio()
+except Exception:
+    if sys.platform == 'win32':
+        os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 
 # ── ETS data directory ──────────────────────────────────────
 ETS_DATA_DIR = os.path.join(os.environ.get('APPDATA', ''), 'ETS')
@@ -347,6 +346,35 @@ def render_section(section_data):
 #  Export helpers (used by the browser tab)
 # ═══════════════════════════════════════════════════════════
 
+def _safe_material_image_path(set_path, sec_dir, img_name):
+    """Resolve picture material path; reject traversal outside material/.
+
+    Only basenames are accepted (no path separators / ..). Returns realpath
+    when the file exists under material/, else None.
+    """
+    if not img_name or not isinstance(img_name, str):
+        return None
+    # Require a single path segment (no dirs / absolute / ..)
+    normalized = img_name.replace('\\', '/')
+    if '/' in normalized or normalized in ('.', '..'):
+        return None
+    base = os.path.basename(img_name)
+    if not base or base in ('.', '..'):
+        return None
+    material_root = os.path.realpath(
+        os.path.join(set_path or '', sec_dir or '', 'material'))
+    candidate = os.path.realpath(os.path.join(material_root, base))
+    try:
+        common = os.path.commonpath([material_root, candidate])
+    except ValueError:
+        return None
+    if common != material_root:
+        return None
+    if os.path.isfile(candidate):
+        return candidate
+    return None
+
+
 def _render_full_markdown(set_data):
     """"Render a full exam set as plain Markdown text (for export)."""
     import datetime
@@ -437,12 +465,13 @@ def _render_full_markdown(set_data):
             topic = info.get('topic', '')
             if topic:
                 lines.append("**话题：** %s" % topic)
-            # Reference picture image
+            # Reference picture image (basename only; no path traversal)
             img_name = info.get('image', '')
             if img_name:
                 sec_dir = sec.get('dir', '')
-                img_path = os.path.join(set_data.get('path', ''), sec_dir, 'material', img_name)
-                if os.path.exists(img_path):
+                img_path = _safe_material_image_path(
+                    set_data.get('path', ''), sec_dir, img_name)
+                if img_path:
                     lines.append('![图片](%s)' % img_path.replace('\\', '/'))
             keypoint = _html_to_text(info.get('keypoint', ''))
             if keypoint:
@@ -483,11 +512,14 @@ def _render_full_html(set_data):
     else:
         types_text = ' · '.join(TYPE_LABELS.get(t, t) for t in sorted(set_data['types']))
 
+    set_id_s = _esc_html(str(set_data.get('id', '')))
+    types_text_s = _esc_html(str(types_text))
+
     html_lines = ['<!DOCTYPE html>',
         '<html lang="zh">',
         '<head>',
         '<meta charset="UTF-8">',
-        '<title>ETS %s</title>' % set_data['id'],
+        '<title>ETS %s</title>' % set_id_s,
         '<style>',
         '  body { font-family: "Microsoft YaHei UI", "微软雅黑", sans-serif; '
         '         max-width: 800px; margin: 40px auto; padding: 0 20px; '
@@ -513,7 +545,7 @@ def _render_full_html(set_data):
         '</head>',
         '<body>',
         '<h1>📄 %s  ·  %s  ·  %d题%s</h1>' % (
-            set_data['id'], types_text, set_data['total_questions'],
+            set_id_s, types_text_s, set_data['total_questions'],
             ('  ·  %d分' % score if score else '')),
         '<p class="meta">导出时间: %s</p>' % datetime.datetime.now().strftime('%Y-%m-%d %H:%M'),
         '']
@@ -523,7 +555,7 @@ def _render_full_html(set_data):
         stype = sec['type']
         icon = TYPE_ICONS.get(stype, '📋')
         label = TYPE_LABELS.get(stype, stype)
-        html_lines.append('<h2>%s %s</h2>' % (icon, label))
+        html_lines.append('<h2>%s %s</h2>' % (icon, _esc_html(str(label))))
 
         data = sec.get('data', {})
         info = data.get('info', {})
@@ -535,7 +567,7 @@ def _render_full_html(set_data):
                 q_text = _strip_template_prefix(q_raw)
                 answer = xt.get('answer', '')
                 q_value = _html_to_text(xt.get('xt_value', ''))
-                html_lines.append('<h3>题 %s</h3>' % q_num)
+                html_lines.append('<h3>题 %s</h3>' % _esc_html(str(q_num)))
                 html_lines.append('<p class="q-text">%s</p>' % _esc_html(q_text))
                 if q_value:
                     html_lines.append('<p class="muted">📢 听力原文：</p>')
@@ -546,7 +578,8 @@ def _render_full_html(set_data):
                     cls = 'correct' if opt == answer else ''
                     mark = '✓ ' if opt == answer else ''
                     html_lines.append(
-                        '<p class="option %s">%s%s. %s</p>' % (cls, mark, opt, _esc_html(opt_text)))
+                        '<p class="option %s">%s%s. %s</p>' % (
+                            cls, mark, _esc_html(str(opt)), _esc_html(opt_text)))
 
         elif stype == 'collector.fill':
             passage = _html_to_text(info.get('value', ''))
@@ -556,7 +589,9 @@ def _render_full_html(set_data):
             for std in info.get('std', []):
                 q_num = std.get('xth', std.get('th', ''))
                 answer = _html_to_text(std.get('value', ''))
-                html_lines.append('<p class="blank">第%s空 → %s</p>' % (q_num, _esc_html(answer)))
+                html_lines.append(
+                    '<p class="blank">第%s空 → %s</p>' % (
+                        _esc_html(str(q_num)), _esc_html(answer)))
 
         elif stype in ('collector.role', 'collector.dialogue'):
             passage = _html_to_text(info.get('value', ''))
@@ -584,24 +619,27 @@ def _render_full_html(set_data):
             topic = info.get('topic', '')
             if topic:
                 html_lines.append('<p><b>话题：</b>%s</p>' % _esc_html(topic))
-            # Embed picture image as base64
+            # Embed picture image as base64 (basename only; no path traversal)
             img_name = info.get('image', '')
             if img_name:
                 sec_dir = sec.get('dir', '')
-                img_path = os.path.join(set_data.get('path', ''), sec_dir, 'material', img_name)
-                if os.path.exists(img_path):
+                img_path = _safe_material_image_path(
+                    set_data.get('path', ''), sec_dir, img_name)
+                if img_path:
                     import base64
                     try:
                         with open(img_path, 'rb') as _f:
                             _b64 = base64.b64encode(_f.read()).decode('ascii')
-                        _ext = os.path.splitext(img_name)[1].lstrip('.').lower()
+                        safe_name = os.path.basename(img_name)
+                        _ext = os.path.splitext(safe_name)[1].lstrip('.').lower()
                         _mime = {'jpg': 'jpeg', 'jpeg': 'jpeg', 'png': 'png', 'gif': 'gif'}.get(_ext, 'jpeg')
                         html_lines.append(
                             '<div style="margin:8px 0"><img src="data:image/%s;base64,%s" '
                             'style="max-width:500px;border-radius:8px;box-shadow:0 2px 8px #aaa" /></div>'
                             % (_mime, _b64))
                     except Exception:
-                        html_lines.append('<p class="muted">[图片: %s]</p>' % _esc_html(img_name))
+                        html_lines.append(
+                            '<p class="muted">[图片: %s]</p>' % _esc_html(os.path.basename(str(img_name))))
             keypoint = _html_to_text(info.get('keypoint', ''))
             if keypoint:
                 html_lines.append('<p class="muted">要点：</p>')
@@ -626,7 +664,7 @@ def _render_full_html(set_data):
 
 def _esc_html(text):
     """Escape HTML special characters."""
-    return (html.escape(text, quote=True)
+    return (html.escape(str(text) if text is not None else '', quote=True)
              .replace('\n', '<br>')
              .replace('  ', ' &nbsp;'))
 

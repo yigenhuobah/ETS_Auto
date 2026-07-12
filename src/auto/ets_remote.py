@@ -36,9 +36,11 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import time
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
 
 
 # ── Mirror sources (ordered by priority for Chinese users) ──
@@ -50,6 +52,18 @@ _MIRROR_TEMPLATES = [
     ("github",   "https://raw.githubusercontent.com/{owner}/{repo}/main/info.json"),
 ]
 
+# H18/H19: only these hosts may be contacted for info.json / pkExtraUrl.
+# Rejects file://, arbitrary IPs, and random domains (supply-chain write path).
+_ALLOWED_URL_HOSTS = frozenset({
+    'raw.githubusercontent.com',
+    'gitee.com',
+    'ghfast.top',
+    'github.com',  # downloadUrl display / release pages
+})
+
+# Max body size for pk_extra.json download (bytes)
+_PK_EXTRA_MAX_BYTES = 2 * 1024 * 1024
+
 # Default GitHub repo for ETS_Auto
 DEFAULT_OWNER = "yigenhuobah"
 DEFAULT_REPO = "ETS_Auto"
@@ -59,6 +73,196 @@ _REQUEST_TIMEOUT = 8
 
 # Local cache path (beside the exe or script)
 _CACHE_FILENAME = "remote_info_cache.json"
+
+
+def is_url_allowed(url):
+    """Return True only for https URLs whose host is on the remote allowlist.
+
+    H18/H19: blocks file://, http://, non-allowlisted hosts, and empty/malformed
+    URLs. Mirror hosts used by this module (ghfast.top, gitee.com,
+    raw.githubusercontent.com) are explicitly permitted.
+    """
+    if not url or not isinstance(url, str):
+        return False
+    url = url.strip()
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme != 'https':
+        return False
+    host = (parsed.hostname or '').lower()
+    if not host or host not in _ALLOWED_URL_HOSTS:
+        return False
+    # Reject credentials in URL
+    if parsed.username or parsed.password:
+        return False
+    return True
+
+
+def verify_remote_payload_integrity(data, signature_hex=None, public_key_pem=None):
+    """OPEN-H4: optional integrity check for remote info.json / pk_extra.
+
+    Modes (first match wins):
+      1) ETS_REMOTE_HMAC set → require HMAC-SHA256 hex over canonical JSON
+      2) ETS_REMOTE_PUBKEY / public_key_pem set → require Ed25519 signature
+      3) neither configured → allowlist-only success (backward compatible)
+
+    Canonical body: json.dumps(..., sort_keys=True, separators=(',', ':')).
+
+    Returns (ok: bool, reason: str).
+    """
+    # Cheap exit: only serialize when a verifier is actually configured
+    hmac_secret = os.environ.get('ETS_REMOTE_HMAC', '').strip()
+    pem = public_key_pem
+    if not pem:
+        pem = os.environ.get('ETS_REMOTE_PUBKEY', '').strip()
+        if pem and os.path.isfile(pem):
+            try:
+                with open(pem, 'r', encoding='utf-8') as f:
+                    pem = f.read()
+            except OSError:
+                return False, 'cannot read ETS_REMOTE_PUBKEY file'
+    if not hmac_secret and not pem:
+        return True, 'no public key configured (allowlist only)'
+
+    try:
+        body = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        body_b = body.encode('utf-8')
+    except Exception as e:
+        return False, 'cannot serialize payload: %s' % e
+
+    if hmac_secret:
+        if not signature_hex:
+            return False, 'missing remote signature'
+        import hmac as _hmac
+        import hashlib
+        expected = _hmac.new(hmac_secret.encode('utf-8'), body_b, hashlib.sha256).hexdigest()
+        sig = str(signature_hex).strip().lower()
+        exp = expected.lower()
+        # compare_digest(str,str) requires ASCII on CPython — reject non-ASCII early
+        try:
+            sig_b = sig.encode('ascii')
+            exp_b = exp.encode('ascii')
+        except UnicodeEncodeError:
+            return False, 'HMAC signature not ASCII'
+        if not _hmac.compare_digest(exp_b, sig_b):
+            return False, 'HMAC signature mismatch'
+        return True, 'hmac ok'
+
+    if not signature_hex:
+        return False, 'missing remote signature'
+
+    try:
+        from cryptography.hazmat.primitives.serialization import load_pem_public_key
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        import binascii
+        pub = load_pem_public_key(pem.encode('utf-8') if isinstance(pem, str) else pem)
+        if not isinstance(pub, Ed25519PublicKey):
+            return False, 'public key is not Ed25519'
+        sig = binascii.unhexlify(str(signature_hex).strip())
+        pub.verify(sig, body_b)
+        return True, 'ed25519 ok'
+    except ImportError:
+        return False, 'cryptography not installed and ETS_REMOTE_HMAC not set'
+    except Exception as e:
+        return False, 'signature verify failed: %s' % e
+
+
+def _split_remote_signature(data):
+    """Split optional signature/sig fields from a remote JSON object.
+
+    Returns (payload_without_sig, signature_hex_or_None).
+    Non-dict input is returned unchanged with no signature.
+    """
+    if not isinstance(data, dict):
+        return data, None
+    sig = data.get('signature') or data.get('sig')
+    payload = {k: v for k, v in data.items() if k not in ('signature', 'sig')}
+    return payload, sig
+
+
+def _verify_remote_dict(data):
+    """Verify a remote JSON dict the same way as check() / download_pk_extra.
+
+    Returns (ok: bool, reason: str, payload).
+    payload has signature/sig keys stripped when data is a dict.
+    When no integrity keys are configured, ok is always True (allowlist only).
+    """
+    payload, sig = _split_remote_signature(data)
+    ok, why = verify_remote_payload_integrity(payload, signature_hex=sig)
+    return ok, why, payload
+
+
+def resolve_pk_extra_path(filename='pk_extra.json'):
+    """User-writable pk_extra path — delegates to ets_common.user_data_path."""
+    from ets_common import user_data_path
+    return user_data_path(filename, anchor_file=__file__)
+
+
+def _filter_pk_extra_schema(data):
+    """Validate/normalize pk_extra payload: must be dict[str, str].
+
+    Returns a new dict with only string keys and string values, or None if
+    the top-level value is not a dict (reject lists/scalars entirely).
+    """
+    if not isinstance(data, dict):
+        return None
+    out = {}
+    for k, v in data.items():
+        if isinstance(k, str) and isinstance(v, str):
+            out[k] = v
+    return out
+
+
+def _load_local_pk_extra(path):
+    """Load existing local pk_extra.json; return {} if missing/invalid."""
+    try:
+        if not path or not os.path.exists(path):
+            return {}
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        filtered = _filter_pk_extra_schema(data)
+        return filtered if filtered is not None else {}
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
+        return {}
+
+
+def _merge_pk_extra(local_data, remote_data):
+    """Merge remote pk_extra into local learn map (H16).
+
+    Policy (documented choice):
+      - Remote keys upsert (remote wins on conflict — intentional hot-update).
+      - Local-only keys are preserved (do not wipe self-learned mappings).
+      - Pure remote wipe is intentionally avoided so offline learn_miss results
+        survive a remote refresh.
+    """
+    merged = dict(local_data) if local_data else {}
+    if remote_data:
+        merged.update(remote_data)
+    return merged
+
+
+def _atomic_write_json(path, data):
+    """Write JSON via temp file + os.replace (crash-safe; matches learn_miss)."""
+    dir_name = os.path.dirname(path) or '.'
+    os.makedirs(dir_name, exist_ok=True)
+    tmp_path = ''
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix='.json', dir=dir_name)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write('\n')
+        os.replace(tmp_path, path)
+        tmp_path = ''
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 class RemoteInfo:
@@ -196,7 +400,10 @@ class ETSRemote:
         """Fetch JSON from a single URL with timeout.
 
         Returns parsed dict or None on failure.
+        H18: only allowlisted https hosts are contacted.
         """
+        if not is_url_allowed(url):
+            return None
         try:
             req = urllib.request.Request(url, headers={
                 'User-Agent': 'ETS_Auto/%s' % self.current_version,
@@ -208,7 +415,7 @@ class ETSRemote:
                 raw = resp.read()
                 return json.loads(raw.decode('utf-8'))
         except (urllib.error.URLError, urllib.error.HTTPError,
-                json.JSONDecodeError, OSError, TimeoutError):
+                json.JSONDecodeError, OSError, TimeoutError, ValueError):
             return None
 
     def _save_cache(self, data):
@@ -287,35 +494,68 @@ class ETSRemote:
         now = time.time()
 
         if data is not None:
-            # Fresh data from mirror — wrap and cache
-            cache_entry = {
-                'data': data,
-                '_fetched_at': now,
-                '_source': source,
-            }
-            self._save_cache(cache_entry)
-        elif use_cache:
+            # OPEN-H4: optional signature field on payload
+            ok_int, why, payload = _verify_remote_dict(data)
+            if not ok_int:
+                # Reject poisoned remote; fall through to cache if allowed
+                data = None
+                source = None
+                if not use_cache:
+                    return None
+            else:
+                # Persist full signed payload (incl. signature/sig) so cache
+                # can be re-verified later when integrity keys are configured.
+                cache_entry = {
+                    'data': data if isinstance(data, dict) else payload,
+                    '_fetched_at': now,
+                    '_source': source,
+                    '_integrity': why,
+                }
+                self._save_cache(cache_entry)
+                # Use stripped payload for schema parse
+                data = payload
+        if data is None and use_cache:
             cache_entry = self._load_cache()
             if cache_entry is None:
                 return None
-            data = cache_entry.get('data', {})
+            cached_data = cache_entry.get('data', {})
+            # Fail-closed for kill-switch: when HMAC/pubkey is configured,
+            # re-verify the cache payload instead of trusting it blindly.
+            # Without keys configured this is a no-op allowlist-only success.
+            ok_cache, _why_cache, cached_payload = _verify_remote_dict(cached_data)
+            if not ok_cache:
+                return None
+            data = cached_payload
             source = cache_entry.get('_source', 'cache')
             now = cache_entry.get('_fetched_at', now)
-        else:
+        elif data is None:
             return None
 
+        if not isinstance(data, dict):
+            return None
         info = self._parse_remote_info(data, source, now)
         self._last_info = info
         return info
 
     def _parse_remote_info(self, data, source, fetched_at):
-        """Parse raw JSON dict into RemoteInfo with version logic applied."""
+        """Parse raw JSON dict into RemoteInfo with version logic applied.
+
+        H18/H19: pkExtraUrl / downloadUrl that fail the host allowlist are
+        cleared (empty string) so callers never act on disallowed hosts.
+        """
         latest = data.get('version', '0.0.0')
         min_ver = data.get('minVer', '0.0.0')
         allow_start = data.get('allowStart', True)
         announcement = data.get('announcement', '')
-        pk_extra_url = data.get('pkExtraUrl', '')
-        download_url = data.get('downloadUrl', '')
+        pk_extra_url = data.get('pkExtraUrl', '') or ''
+        download_url = data.get('downloadUrl', '') or ''
+
+        # H19: drop non-allowlisted pkExtraUrl (supply-chain write path)
+        if pk_extra_url and not is_url_allowed(pk_extra_url):
+            pk_extra_url = ''
+        # downloadUrl is display-only; still strip disallowed schemes/hosts
+        if download_url and not is_url_allowed(download_url):
+            download_url = ''
 
         # Version comparisons
         update_available = compare_versions(latest, self.current_version) > 0
@@ -337,11 +577,21 @@ class ETSRemote:
     def download_pk_extra(self, url=None, target_path=None):
         """Download updated pk_extra.json from remote URL.
 
+        H12: default target_path matches ETSWordPK._exe_dir_path
+             (project root in dev; beside exe when frozen).
+        H16: schema validate dict[str,str]; merge remote into local
+             (remote upserts; keep local-only learn keys); atomic write.
+        H19: only allowlisted https hosts; reject file:// and random hosts.
+        H17: race with GUI worker is owned by GUI (late block does not stop
+             an already-running worker); this method only hardens download.
+
+        Offline: on total download failure, existing local file is left
+        untouched (no wipe). Offline cache for info.json is unchanged.
+
         Args:
             url: Direct URL to pk_extra.json. If None, uses the pkExtraUrl
                  from the last successful check().
-            target_path: Local file path. If None, defaults to pk_extra.json
-                         beside the exe or script.
+            target_path: Local file path. If None, uses resolve_pk_extra_path().
 
         Returns:
             (success: bool, message: str)
@@ -353,15 +603,14 @@ class ETSRemote:
             else:
                 return False, "无法获取 pk_extra.json 下载地址"
 
-        # Resolve target path
-        if target_path is None:
-            if getattr(sys, 'frozen', False):
-                base = os.path.dirname(sys.executable)
-            else:
-                base = os.path.dirname(os.path.abspath(__file__))
-            target_path = os.path.join(base, 'pk_extra.json')
+        if not is_url_allowed(url):
+            return False, "pkExtraUrl 主机不在允许列表中（拒绝下载）"
 
-        # Backup existing file
+        # H12: same path semantics as ets_word_pk._exe_dir_path
+        if target_path is None:
+            target_path = resolve_pk_extra_path('pk_extra.json')
+
+        # Backup existing file (best-effort; write path is atomic separately)
         backup_path = target_path + '.bak'
         if os.path.exists(target_path):
             try:
@@ -369,44 +618,73 @@ class ETSRemote:
             except OSError:
                 pass  # Backup failure is non-critical
 
-        # Build download URL list with mirror fallback
+        # Build download URL list with mirror fallback (all must pass allowlist)
         download_urls = [url]
         if 'raw.githubusercontent.com' in url:
-            download_urls.insert(0, url.replace(
+            ghfast_url = url.replace(
                 'https://raw.githubusercontent.com',
-                'https://ghfast.top/https://raw.githubusercontent.com'))
-            # Also try gitee mirror (same pattern as info.json)
+                'https://ghfast.top/https://raw.githubusercontent.com')
             gitee_url = url.replace(
                 'https://raw.githubusercontent.com',
                 'https://gitee.com').replace('/main/', '/raw/main/')
-            download_urls.append(gitee_url)
+            # Prefer Chinese mirror first
+            download_urls = [ghfast_url, url, gitee_url]
 
+        # Dedup while preserving order; drop non-allowlisted mirrors
+        seen = set()
+        filtered_urls = []
         for dl_url in download_urls:
+            if dl_url in seen:
+                continue
+            seen.add(dl_url)
+            if is_url_allowed(dl_url):
+                filtered_urls.append(dl_url)
+        if not filtered_urls:
+            return False, "pkExtraUrl 主机不在允许列表中（拒绝下载）"
+
+        local_data = _load_local_pk_extra(target_path)
+
+        for dl_url in filtered_urls:
             try:
                 req = urllib.request.Request(dl_url, headers={
                     'User-Agent': 'ETS_Auto/%s' % self.current_version,
+                    'Accept': 'application/json',
                 })
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     if resp.status != 200:
                         continue
-                    raw = resp.read()
-                # Validate it's valid JSON
-                json.loads(raw.decode('utf-8'))
-                # Write to target
-                with open(target_path, 'wb') as f:
-                    f.write(raw)
-                return True, "pk_extra.json 已更新 (%d bytes)" % len(raw)
+                    # Bound body size (supply-chain / DoS)
+                    raw = resp.read(_PK_EXTRA_MAX_BYTES + 1)
+                if len(raw) > _PK_EXTRA_MAX_BYTES:
+                    continue
+                remote_obj = json.loads(raw.decode('utf-8'))
+                # OPEN-H4: verify signed pk_extra the same way as check()
+                # when ETS_REMOTE_HMAC / ETS_REMOTE_PUBKEY is set; allowlist
+                # only (ok) when neither is configured.
+                ok_int, _why_int, remote_payload = _verify_remote_dict(remote_obj)
+                if not ok_int:
+                    continue
+                remote_data = _filter_pk_extra_schema(remote_payload)
+                if remote_data is None:
+                    # Invalid top-level schema — try next mirror
+                    continue
+                # H16: merge — remote updates; preserve local-only learn keys
+                merged = _merge_pk_extra(local_data, remote_data)
+                _atomic_write_json(target_path, merged)
+                local_only = sum(1 for k in (local_data or {}) if k not in remote_data)
+                return True, "pk_extra.json 已更新（merge %d remote + %d local-only → %d keys）" % (
+                    len(remote_data),
+                    local_only,
+                    len(merged),
+                )
             except (urllib.error.URLError, urllib.error.HTTPError,
-                    json.JSONDecodeError, OSError, TimeoutError):
+                    json.JSONDecodeError, OSError, TimeoutError, ValueError,
+                    UnicodeDecodeError, TypeError):
                 continue
 
-        # Restore backup if download failed
-        if os.path.exists(backup_path):
-            try:
-                shutil.copy2(backup_path, target_path)
-            except OSError:
-                pass
-
+        # Download failed: leave existing local file intact (offline cache safe).
+        # Do NOT restore backup over a still-valid local file that we never
+        # truncated (atomic write either fully replaced or left original).
         return False, "pk_extra.json 下载失败（所有镜像源均不可用）"
 
 
@@ -454,6 +732,10 @@ def should_block_start(info):
 
     Returns (blocked: bool, reason: str).
     Delegates to classify_info() for unified decision logic.
+
+    H17 note: this is a pure decision helper. The GUI race (user can Start
+    while remote check is still in flight; late allowStart=false does not
+    stop an already-running worker) is owned by ets_gui.py — not fixed here.
     """
     level, reason = classify_info(info)
     if level == "block":

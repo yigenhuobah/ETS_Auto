@@ -1,8 +1,8 @@
 {
-  "version": "0.6.1",
+  "version": "0.6.5",
   "minVer": "0.4.0",
   "allowStart": true,
-  "announcement": "v0.6.1 修复：移除敏感文件、版本号修正",
+  "announcement": "v0.6.5：审计修复合入（stop_event/导航/PK/远程加固等），详见 CHANGELOG",
   "pkExtraUrl": "https://raw.githubusercontent.com/yigenhuobah/ETS_Auto/main/pk_extra.json",
   "downloadUrl": "https://github.com/yigenhuobah/ETS_Auto/releases/latest"
 }

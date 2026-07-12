@@ -5,11 +5,11 @@ ETS Word PK Auto Answer v5 — e听说单词PK自动答题
 """
 import json, os, time, re, sys
 from urllib.error import URLError
-from ets_common import ETSBase, force_utf8_stdio
+from ets_common import APP_VERSION, ETSBase, force_utf8_stdio, user_data_path
 from ets_hotkey import ETSHotkey
 
-# Version constant — keep in sync with ets_gui.py APP_VERSION
-__version__ = "0.6.4"
+# Re-export for packaging / external importers (single source: ets_common)
+__version__ = APP_VERSION
 
 
 def _edit_dist(a, b):
@@ -65,20 +65,51 @@ def _resource_path(filename):
 
 
 def _exe_dir_path(filename):
-    """Resolve user-writable file path next to the executable (or script dir in dev).
+    """Resolve user-writable path (alias of ets_common.user_data_path)."""
+    return user_data_path(filename, anchor_file=__file__)
 
-    pk_extra.json and pk_misses.jsonl must be writable and persist across runs,
-    so they go next to the exe, NOT inside the PyInstaller bundle.
+
+def _norm_opt_text(text):
+    """Normalize option text the same way as get_pk_state (last line + strip A./1. prefix)."""
+    if not text:
+        return ''
+    text = text.strip()
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    picked = lines[-1] if lines else text
+    picked = re.sub(r'^[A-Z][.)]\s*', '', picked)
+    picked = re.sub(r'^\d+[.)]\s*', '', picked).strip()
+    return picked or text
+
+
+def _fuzzy_opt_match(opt_s, ans_s):
+    """Safe fuzzy option match: exact first; bare substring only with ratio>=0.8 or word boundary.
+
+    Prevents 'in' matching 'inside' / 'book' matching 'notebook'.
     """
-    if getattr(sys, 'frozen', False):
-        return os.path.join(os.path.dirname(sys.executable), filename)
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__)))), filename)
+    if not opt_s or not ans_s:
+        return False
+    opt_s = opt_s.strip().lower()
+    ans_s = ans_s.strip().lower()
+    if not opt_s or not ans_s:
+        return False
+    if opt_s == ans_s:
+        return True
+    # Word-boundary containment (space / hyphen / slash as separators)
+    if re.search(r'(?:^|[\s\-/])' + re.escape(ans_s) + r'(?:$|[\s\-/])', opt_s):
+        return True
+    if re.search(r'(?:^|[\s\-/])' + re.escape(opt_s) + r'(?:$|[\s\-/])', ans_s):
+        return True
+    shorter, longer = (opt_s, ans_s) if len(opt_s) <= len(ans_s) else (ans_s, opt_s)
+    if shorter in longer and len(longer) > 0 and (len(shorter) / len(longer)) >= 0.8:
+        return True
+    return False
 
 
 class ETSWordPK(ETSBase):
     def __init__(self, port=10086, debug_mode=False, stop_event=None):
         super().__init__(port=port, debug_mode=debug_mode, stop_event=stop_event)
+        # OPEN-M4: always have Event so interruptible_sleep / F12 paths match exam
+        self.ensure_stop_event()
         self.ets_base = os.path.join(os.path.expandvars(r'%APPDATA%'), 'ETS')
         # ETS client changed dict location/format around 2026-06:
         #   Old: pc_xst_dict/pc_xst_dict.json  (pure JSON [{Word, Trans}])
@@ -100,6 +131,25 @@ class ETSWordPK(ETSBase):
         self.stats = {'answered': 0, 'no_match': 0, 'errors': 0, 'learned': 0}
 
     # ── Dictionary Loading ──────────────────────────────────
+
+    def _index_trans_senses(self, word, trans):
+        """Split multi-sense translations and index clean Chinese keys.
+
+        New ETS dict encodes senses with \\x01 separators and POS tags per sense.
+        Control chars must not pollute trans_index keys.
+        """
+        if not trans:
+            return
+        for sense in re.split(r'[\x01\n]+', trans):
+            sense = sense.strip()
+            if not sense:
+                continue
+            # Strip leading POS tags: "n. ", "v. , vt. ", etc.
+            cn = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', sense, flags=re.I).strip()
+            # Drop control characters from index keys
+            cn = re.sub(r'[\x00-\x1f\x7f]', '', cn).strip()
+            if cn:
+                self.trans_index.setdefault(cn, []).append(word)
 
     def _load_dict_new_format(self, path):
         """Load new ETS dict format: JS variable assignment with Base64-encoded trans.
@@ -134,13 +184,7 @@ class ETSWordPK(ETSBase):
             if not trans:
                 continue
             self.word_trans[word.lower()] = trans
-            for line in trans.split('\n'):
-                line = line.strip()
-                if not line:
-                    continue
-                cn = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', line).strip()
-                if cn:
-                    self.trans_index.setdefault(cn, []).append(word)
+            self._index_trans_senses(word, trans)
         return len(arr)
 
     def load_dictionary(self):
@@ -162,13 +206,7 @@ class ETSWordPK(ETSBase):
                 if not word or not trans:
                     continue
                 self.word_trans[word.lower()] = trans
-                for line in trans.split('\n'):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    cn = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', line).strip()
-                    if cn:
-                        self.trans_index.setdefault(cn, []).append(word)
+                self._index_trans_senses(word, trans)
             base_count = len(self.word_trans)
         base_count = len(self.word_trans)
 
@@ -180,9 +218,7 @@ class ETSWordPK(ETSBase):
             for word, trans in ecdict.items():
                 if word not in self.word_trans:
                     self.word_trans[word] = trans
-                    cn = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', trans).strip()
-                    if cn:
-                        self.trans_index.setdefault(cn, []).append(word)
+                    self._index_trans_senses(word, trans)
                     ecdict_count += 1
             print("  ECDICT supplement: +%d (%d total)" % (ecdict_count, len(self.word_trans)))
         else:
@@ -227,18 +263,12 @@ class ETSWordPK(ETSBase):
 
         for deriv, dtrans in new_deriv.items():
             self.word_trans[deriv] = dtrans
-            for line in dtrans.split('\n'):
-                line = line.strip()
-                if not line:
-                    continue
-                cn = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', line).strip()
-                if cn:
-                    self.trans_index.setdefault(cn, []).append(deriv)
+            self._index_trans_senses(deriv, dtrans)
 
         # ── Extract phrases from Trans ──
         compound_count = 0
         for word, trans in list(self.word_trans.items()):
-            for line in trans.split('\n'):
+            for line in re.split(r'[\x01\n]+', trans):
                 line = line.strip()
                 if not line:
                     continue
@@ -264,10 +294,8 @@ class ETSWordPK(ETSBase):
                         continue
                     if ' ' in phl and phl not in self.word_trans and len(phl) <= 40:
                         self.word_trans[phl] = line
-                        cn = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', line).strip()
-                        if cn:
-                            self.trans_index.setdefault(cn, []).append(ph)
-                            compound_count += 1
+                        self._index_trans_senses(ph, line)
+                        compound_count += 1
 
         # ── Load self-learned extra mappings ──
         extra_count = 0
@@ -341,11 +369,12 @@ class ETSWordPK(ETSBase):
                         lst.append(trans)
                         count += 1
                 continue
-            for line in trans.split('\n'):
+            for line in re.split(r'[\x01\n]+', trans):
                 line = line.strip()
                 if not line:
                     continue
-                cn = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', line).strip()
+                cn = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', line, flags=re.I).strip()
+                cn = re.sub(r'[\x00-\x1f\x7f]', '', cn).strip()
                 if not cn:
                     continue
                 segs = self._cn_split(cn)
@@ -464,15 +493,15 @@ class ETSWordPK(ETSBase):
         if q in self.pk_extra:
             answer = self.pk_extra[q]
             ans_s = answer.strip().lower()
-            # Exact match
+            # Exact match first
             for i, opt in enumerate(options):
                 if opt.strip().lower() == ans_s:
                     self.debug("Learned: '%s' -> %s" % (q, answer))
                     return i
-            # Fuzzy: answer contained in option or vice versa
+            # Fuzzy: require word-boundary or length ratio >= 0.8 (H14)
             for i, opt in enumerate(options):
                 opt_s = opt.strip().lower()
-                if opt_s and ans_s and (opt_s in ans_s or ans_s in opt_s):
+                if _fuzzy_opt_match(opt_s, ans_s):
                     self.debug("Learned(fuzzy): '%s' -> %s ~ %s" % (q, answer, opt))
                     return i
         # Reverse lookup A: Chinese question matches pk_extra KEY (cn→en records)
@@ -505,7 +534,7 @@ class ETSWordPK(ETSBase):
                             cand_s = candidate.strip().lower()
                             for i, opt in enumerate(options):
                                 opt_s = opt.strip().lower()
-                                if opt_s == cand_s or (opt_s and cand_s and (opt_s in cand_s or cand_s in opt_s)):
+                                if opt_s == cand_s or _fuzzy_opt_match(opt_s, cand_s):
                                     best_score = overlap
                                     best_idx = i
                                     best_answer = candidate
@@ -560,6 +589,8 @@ class ETSWordPK(ETSBase):
                     return best_idx
 
         # ── Strategy 1: Option reverse lookup (with stem expansion) ──
+        # C7: do NOT award points for mere dictionary presence; require
+        # stem/term/bigram overlap between question and option translation.
         matches = []
         for i, opt in enumerate(options):
             trans_result = self.get_opt_trans(opt)
@@ -567,19 +598,25 @@ class ETSWordPK(ETSBase):
             if not combined_trans:
                 continue
             score = 0
-            if trans_result['phrase_trans']:
-                score += 50
-            if q_clean in combined_trans.replace(' ', ''):
+            has_overlap = False
+            if q_clean and q_clean in combined_trans.replace(' ', ''):
                 score += 100
+                has_overlap = True
             for term in q_terms:
-                if term in combined_trans:
+                if term and term in combined_trans:
                     score += len(term) * 2
-            if score == 0 and len(q_clean) >= 4:
+                    has_overlap = True
+            # Bigram / 2-char overlap as weak signal (only when q long enough)
+            if len(q_clean) >= 2:
                 for start in range(0, len(q_clean) - 1):
                     sub2 = q_clean[start:start+2]
-                    if sub2 in combined_trans:
+                    if sub2 and sub2 in combined_trans:
                         score += 1
-            if score > 0:
+                        has_overlap = True
+            # Optional bonus once overlap is established (not for presence alone)
+            if has_overlap and trans_result['phrase_trans']:
+                score += 50
+            if has_overlap and score > 0:
                 matches.append((i, opt, score))
                 self.debug("OptRev: '%s' (stems=%s) score=%d" % (
                     opt, trans_result['stems'][:3], score))
@@ -809,17 +846,22 @@ class ETSWordPK(ETSBase):
         var isWrong = clickedCls.indexOf('wrong') >= 0 || clickedCls.indexOf('error') >= 0;
         var correctOpt = '';
         var allOpts = [];
+        function normOpt(text){
+            var lines=text.split(/\n/).map(function(l){return l.trim();}).filter(function(l){return l;});
+            var picked=lines.length?lines[lines.length-1]:text;
+            picked=picked.replace(/^[A-Z][.)]\s*/, '').replace(/^\d+[.)]\s*/, '').trim();
+            return picked||text;
+        }
         for (var i = 0; i < items.length; i++) {
             var cls = items[i].className || '';
             var html = items[i].innerHTML || '';
             var c = items[i].querySelector('.select-item-content');
             var text = c ? c.innerText.trim() : items[i].innerText.trim();
-            allOpts.push(text);
+            /* H13: normalize allOpts same as get_pk_state */
+            allOpts.push(normOpt(text));
             if (i !== %d && (cls.indexOf('correct') >= 0 || cls.indexOf('right') >= 0 ||
                 cls.indexOf('success') >= 0 || (html.indexOf('svg-icon') >= 0 && cls.indexOf('correct') >= 0))) {
-                var lines = text.split(/\n/).map(function(l){return l.trim();}).filter(function(l){return l;});
-                correctOpt = lines.length ? lines[lines.length-1] : text;
-                correctOpt = correctOpt.replace(/^[A-Z][.)]\s*/, '').replace(/^\d+[.)]\s*/, '').trim() || text;
+                correctOpt = normOpt(text);
             }
         }
         return JSON.stringify({isWrong: isWrong, correctAnswer: correctOpt, allOpts: allOpts});
@@ -839,8 +881,9 @@ class ETSWordPK(ETSBase):
                         return ''
                     # Content validation: prevent stale-page pollution when option count matches
                     # (e.g. both old and new questions have 4 options)
-                    expected_texts = set(o.strip().lower() for o in current_options)
-                    actual_texts = set(o.strip().lower() for o in dom_opts)
+                    # H13: normalize both sides same as get_pk_state
+                    expected_texts = set(_norm_opt_text(o).lower() for o in current_options)
+                    actual_texts = set(_norm_opt_text(o).lower() for o in dom_opts)
                     if expected_texts != actual_texts:
                         self.debug("capture_wrong_answer: DOM option content mismatch, page likely transitioned, skipping")
                         return ''
@@ -963,7 +1006,8 @@ class ETSWordPK(ETSBase):
             return
 
         # Register global hotkeys (F9=Pause, F10=Skip, F12=Emergency Stop)
-        self._hotkey = ETSHotkey()
+        # F12 must set stop_event immediately so interruptible_sleep / GUI see it
+        self._hotkey = ETSHotkey(on_stop=self.signal_stop)
         self._hotkey.register()
 
         print("-" * 45)
@@ -974,12 +1018,41 @@ class ETSWordPK(ETSBase):
         last_question_hash = ''
         same_count = 0
         no_q_count = 0
+        consecutive_conn_errors = 0
+
+        def _handle_pk_reconnect(err):
+            """Shared PK reconnect control flow. Returns 'continue' | 'break'."""
+            nonlocal consecutive_conn_errors
+            consecutive_conn_errors += 1
+            print("\nConnection lost: %s" % err)
+            if consecutive_conn_errors >= 3:
+                print("Connection lost repeatedly, stopping.")
+                return 'break'
+            try:
+                print("  Reconnecting (%d/3)..." % consecutive_conn_errors)
+                self.reconnect()
+                print("  Reconnected, resuming...")
+                self.interruptible_sleep(0.5)
+                return 'continue'
+            except InterruptedError:
+                raise
+            except Exception as recon_err:
+                print("  Reconnect failed: %s" % recon_err)
+                if consecutive_conn_errors >= 3:
+                    return 'break'
+                self.interruptible_sleep(1)
+                return 'continue'
 
         try:
             while answered + no_match < max_q:
                 # Check stop signal (hotkey F12 or external stop_event)
-                if (self.stop_event and self.stop_event.is_set()) or (self._hotkey and self._hotkey.should_stop):
-                    print("\n  🛑 Stopped by user")
+                # F12 must also set stop_event so GUI shows "已停止" and no restart race
+                if self._hotkey and self._hotkey.should_stop:
+                    print("\n  Stopped by user (F12)")
+                    self.signal_stop()
+                    break
+                if self.stop_event and self.stop_event.is_set():
+                    print("\n  Stopped by user")
                     break
 
                 # Check pause (F9)
@@ -987,7 +1060,23 @@ class ETSWordPK(ETSBase):
                     self.interruptible_sleep(0.3)
                     continue
 
-                state = self.get_pk_state()
+                # Check skip (F10) — H15: skip current question like exam
+                if self._hotkey and self._hotkey.should_skip:
+                    self._hotkey.clear_skip()
+                    print("\n  Skipping current question (F10)")
+                    no_match += 1
+                    last_question_hash = ''
+                    same_count = 0
+                    self.interruptible_sleep(0.5)
+                    continue
+
+                try:
+                    state = self.get_pk_state()
+                    consecutive_conn_errors = 0
+                except (ConnectionError, TimeoutError) as e:
+                    if _handle_pk_reconnect(e) == 'break':
+                        break
+                    continue
 
                 if not state.get('hasQuestion'):
                     no_q_count += 1
@@ -1038,43 +1127,62 @@ class ETSWordPK(ETSBase):
                     self.interruptible_sleep(0.3)
                     continue
 
-                idx = self.find_answer(title, options)
-                n = answered + no_match + 1
+                try:
+                    idx = self.find_answer(title, options)
+                    n = answered + no_match + 1
 
-                if idx >= 0:
-                    source = 'learned' if (title in self.pk_extra and options[idx].strip() == self.pk_extra[title].strip()) else 'dict'
-                    print("  #%s -> %s [%s]" % (progress or n, options[idx], source))
-                    self._fire_question({'type': 'pk', 'type_label': '单词PK',
-                                         'index': n, 'answer': options[idx],
-                                         'source': source, 'title': title})
-                    r = self.click_option(idx)
-                    if r.get('ok'):
-                        answered += 1
-                        if source == 'learned':
-                            self.stats['learned'] += 1
+                    if idx >= 0:
+                        source = 'learned' if (title in self.pk_extra and options[idx].strip() == self.pk_extra[title].strip()) else 'dict'
+                        print("  #%s -> %s [%s]" % (progress or n, options[idx], source))
+                        self._fire_question({
+                            'type': 'pk', 'type_label': '单词PK',
+                            'index': n, 'answer': options[idx],
+                            'source': source, 'title': title,
+                            # OPEN-M5: GUI progress uses answered/total_questions
+                            'answered': answered + 1,
+                            'total_questions': max_q if max_q < 999 else max(n, answered + no_match + 1),
+                        })
+                        r = self.click_option(idx)
+                        if r.get('ok'):
+                            answered += 1
+                            if source == 'learned':
+                                self.stats['learned'] += 1
+                        else:
+                            self.stats['errors'] += 1
+                        # Check if answer was wrong → try to capture correct answer
+                        self.interruptible_sleep(0.5)
+                        correct = self.capture_wrong_answer(idx, current_options=options)
+                        if correct:
+                            self.learn_miss(title, correct)
                     else:
-                        self.stats['errors'] += 1
-                    # Check if answer was wrong → try to capture correct answer
-                    self.interruptible_sleep(0.5)
-                    correct = self.capture_wrong_answer(idx, current_options=options)
-                    if correct:
-                        self.learn_miss(title, correct)
-                else:
-                    print("  #%s -> ??? [%s]" % (progress or n, ' / '.join(options)))
-                    self._fire_question({'type': 'pk', 'type_label': '单词PK',
-                                         'index': n, 'answer': None,
-                                         'source': 'miss', 'title': title})
-                    no_match += 1
-                    self.record_miss(title, options)
+                        print("  #%s -> ??? [%s]" % (progress or n, ' / '.join(options)))
+                        self._fire_question({
+                            'type': 'pk', 'type_label': '单词PK',
+                            'index': n, 'answer': None,
+                            'source': 'miss', 'title': title,
+                            'answered': answered,
+                            'total_questions': max_q if max_q < 999 else max(n, answered + no_match + 1),
+                        })
+                        no_match += 1
+                        self.record_miss(title, options)
 
-                self.interruptible_sleep(0.8)
+                    self.interruptible_sleep(0.8)
+                except (ConnectionError, TimeoutError) as e:
+                    if _handle_pk_reconnect(e) == 'break':
+                        break
+                    continue
 
-        except (ConnectionError, TimeoutError) as e:
-            print("\nConnection lost: %s" % e)
-
-        # Cleanup hotkey
-        if hasattr(self, '_hotkey') and self._hotkey:
-            self._hotkey.unregister()
+        except InterruptedError:
+            print("\n  Stopped (interrupted)")
+        finally:
+            # H2: always unregister hotkey + close ws (InterruptedError-safe)
+            if hasattr(self, '_hotkey') and self._hotkey:
+                try:
+                    self._hotkey.unregister()
+                except Exception:
+                    pass
+                self._hotkey = None
+            self._drop_connection()
 
         total = answered + no_match
         rate = (answered * 100 / total) if total > 0 else 0
@@ -1089,13 +1197,6 @@ class ETSWordPK(ETSBase):
                              'rate': rate, 'miss': no_match,
                              'errors': self.stats.get('errors', 0),
                              'learned': self.stats.get('learned', 0)})
-
-        # Cleanup WebSocket
-        if self.ws:
-            try:
-                self.ws.close()
-            except Exception:
-                pass
 
 
 if __name__ == "__main__":
