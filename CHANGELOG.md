@@ -2,6 +2,9 @@
 
 ## [0.6.5] - 2026-07-12
 
+### Docs & Tooling (2026-07-12)
+- **`scripts/sync_to_auto.py`** — Project→Auto 白名单同步；默认 dry-run，`--apply` 写入；防误拷 docs/tools/探测脚本
+
 ### Docs & Tests (2026-07-12 补全)
 - **文档对齐 0.6.5** — `CLAUDE.md` 版本单源；`src/auto/README` 重写；根 `README` 功能/FAQ/Roadmap/自检命令；`HANDOVER` 头+§3.3/3.4/录音结论；`docs/testing.md` + `docs/release.md` 新建；`deep_bug_audit` §8.1 状态刷新；`dev_log` 页首现状注记
 - **`test_unit.py`** — APP_VERSION / user_data_path / stop_event / tab / PK 新词典 / fuzzy / RW rebuild / drop_connection；**另补** reconnect 控制流、录音 wait、词典路径选择、remote allowlist、GUI 进度公式；失败时 **exit≠0**
