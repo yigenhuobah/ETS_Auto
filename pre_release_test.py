@@ -202,13 +202,19 @@ print("\n=== Syntax Check ===")
 def t_syntax_all():
     import py_compile
     py_files = []
-    for name in ['ets_common.py', 'ets_auto.py', 'ets_word_pk.py', 'ets_parser.py', 'ets_browser_ui.py', 'ets_remote.py', 'ets_gui.py', 'run.py']:
+    for name in [
+        'ets_common.py', 'ets_auto.py', 'ets_word_pk.py', 'ets_parser.py',
+        'ets_browser_ui.py', 'ets_remote.py', 'ets_gui.py', 'run.py',
+        'ets_strategy.py', 'ets_hotkey.py',
+    ]:
         fpath = os.path.join(SRC, name)
         if os.path.exists(fpath):
             py_files.append((name, fpath))
+        else:
+            raise AssertionError("required module missing for py_compile: %s" % name)
     for name, fpath in py_files:
         py_compile.compile(fpath, doraise=True)
-test("all .py files pass py_compile", t_syntax_all)
+test("all .py files pass py_compile (incl. strategy/hotkey)", t_syntax_all)
 
 # ── 7. Strategy layer tests ────────────────────────────────
 print("\n=== Strategy Layer Tests ===")
@@ -368,7 +374,7 @@ def _make_bare_auto(ets_base, set_id):
 def t_load_answers_choose():
     """Test load_answers parses collector.choose correctly."""
     tmp_base = tempfile.mkdtemp(prefix='ets_test_')
-    set_id = 'test_set_choose'
+    set_id = '900001'  # digits-only (matches _safe_set_id)
     content_dir = os.path.join(tmp_base, set_id, 'content_001')
     os.makedirs(content_dir)
     data = _make_content_json('collector.choose', {
@@ -393,7 +399,7 @@ def t_load_answers_fill():
     """Test load_answers parses collector.fill with slash-separated alternatives."""
     from ets_auto import ETSAutoAnswer
     tmp_base = tempfile.mkdtemp(prefix='ets_test_')
-    set_id = 'test_set_fill'
+    set_id = '900002'  # digits-only (matches _safe_set_id)
     content_dir = os.path.join(tmp_base, set_id, 'content_001')
     os.makedirs(content_dir)
     data = _make_content_json('collector.fill', {
@@ -464,7 +470,7 @@ def t_load_answers_empty_answer():
     """load_answers should skip empty answers gracefully."""
     from ets_auto import ETSAutoAnswer
     tmp_base = tempfile.mkdtemp(prefix='ets_test_')
-    set_id = 'test_set_empty'
+    set_id = '900003'  # digits-only (matches _safe_set_id)
     content_dir = os.path.join(tmp_base, set_id, 'content_001')
     os.makedirs(content_dir)
     data = _make_content_json('collector.choose', {
