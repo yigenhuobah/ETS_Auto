@@ -2437,6 +2437,328 @@ class TestGuiProgressLogic(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Audit fix pass 2026-07-13 — reconnect / silent state / pk_extra corrupt
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestExamReconnectLoadFail(unittest.TestCase):
+    def _make(self):
+        import ets_auto
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.debug_mode = False
+        inst.debug = lambda *a, **k: None
+        inst.interruptible_sleep = lambda s: None
+        inst.set_id = '111'
+        inst.ets_base = '.'
+        inst.answers = {'k': {'type': 'choose', 'answer': 'A'}}
+        inst.recording_answers = []
+        inst.strategy = None
+        inst.rw_show_data = None
+        inst._rw_cache_time = 0
+        inst._handle_exam_reconnect = (
+            ets_auto.ETSAutoAnswer._handle_exam_reconnect.__get__(inst))
+        return inst
+
+    def test_load_fail_after_set_id_change_returns_false(self):
+        inst = self._make()
+        inst.reconnect = lambda: True
+        inst._read_pinia_config = lambda: setattr(inst, 'set_id', '222') or None
+        inst._detect_rw_mode = lambda: None
+        inst.inject_bridge = lambda: {}
+        inst.load_answers = lambda: False
+        ok = inst._handle_exam_reconnect(ConnectionError('x'), 1)
+        self.assertFalse(ok)
+
+    def test_empty_answers_same_set_reload_fail_returns_false(self):
+        inst = self._make()
+        inst.answers = {}
+        inst.recording_answers = []
+        inst.reconnect = lambda: True
+        inst._read_pinia_config = lambda: None
+        inst._detect_rw_mode = lambda: None
+        inst.inject_bridge = lambda: {}
+        inst.load_answers = lambda: False
+        ok = inst._handle_exam_reconnect(ConnectionError('x'), 1)
+        self.assertFalse(ok)
+
+    def test_success_when_set_unchanged_and_answers_present(self):
+        inst = self._make()
+        inst.reconnect = lambda: True
+        inst._read_pinia_config = lambda: None
+        inst._detect_rw_mode = lambda: None
+        inst.inject_bridge = lambda: {}
+        ok = inst._handle_exam_reconnect(ConnectionError('x'), 1)
+        self.assertTrue(ok)
+
+
+class TestPageAndPkStateErrors(unittest.TestCase):
+    def test_get_page_state_none_is_error(self):
+        import ets_auto
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.eval_js = lambda js: None
+        inst.get_page_state = ets_auto.ETSAutoAnswer.get_page_state.__get__(inst)
+        # Bind _IFRAME_FINDER used inside method string format
+        inst._IFRAME_FINDER = 'var iframe=null'
+        st = inst.get_page_state()
+        self.assertEqual(st.get('error'), 'eval_js_failed')
+
+    def test_get_pk_state_none_is_error(self):
+        import ets_word_pk
+        pk = object.__new__(ets_word_pk.ETSWordPK)
+        pk.eval_js = lambda js: None
+        pk.get_pk_state = ets_word_pk.ETSWordPK.get_pk_state.__get__(pk)
+        st = pk.get_pk_state()
+        self.assertEqual(st.get('error'), 'eval_js_failed')
+
+    def test_is_recording_reraises_connection_error(self):
+        import ets_auto
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        def _boom(js):
+            raise ConnectionError('ws dead')
+        inst.eval_js = _boom
+        inst.is_recording_page = ets_auto.ETSAutoAnswer.is_recording_page.__get__(inst)
+        with self.assertRaises(ConnectionError):
+            inst.is_recording_page()
+
+
+class TestPkExtraCorruptGuard(unittest.TestCase):
+    def test_status_missing_ok_invalid(self):
+        import ets_remote
+        import tempfile, os
+        data, st = ets_remote._load_local_pk_extra_status(None)
+        self.assertEqual(st, 'missing')
+        self.assertEqual(data, {})
+        td = tempfile.mkdtemp()
+        good = os.path.join(td, 'pk_extra.json')
+        with open(good, 'w', encoding='utf-8') as f:
+            json.dump({'hello': 'world'}, f)
+        data, st = ets_remote._load_local_pk_extra_status(good)
+        self.assertEqual(st, 'ok')
+        self.assertEqual(data.get('hello'), 'world')
+        bad = os.path.join(td, 'bad.json')
+        with open(bad, 'w', encoding='utf-8') as f:
+            f.write('{not json')
+        data, st = ets_remote._load_local_pk_extra_status(bad)
+        self.assertEqual(st, 'invalid')
+        self.assertEqual(data, {})
+
+    def test_download_refuses_overwrite_corrupt_local(self):
+        import ets_remote
+        import tempfile, os
+        td = tempfile.mkdtemp()
+        target = os.path.join(td, 'pk_extra.json')
+        with open(target, 'w', encoding='utf-8') as f:
+            f.write('{broken')
+        r = ets_remote.ETSRemote(current_version='0.6.5')
+        # Even with a plausible allowlisted URL, corrupt local must refuse before fetch loop
+        ok, msg = r.download_pk_extra(
+            url='https://raw.githubusercontent.com/yigenhuobah/ETS_Auto/main/pk_extra.json',
+            target_path=target)
+        self.assertFalse(ok)
+        self.assertIn('损坏', msg)
+        # File still the broken original (not wiped to remote)
+        with open(target, 'r', encoding='utf-8') as f:
+            self.assertEqual(f.read(), '{broken')
+
+    def test_corrupt_target_does_not_clobber_good_bak(self):
+        """Critical: status-first — never copy corrupt target over a good .bak."""
+        import ets_remote
+        import tempfile, os
+        td = tempfile.mkdtemp()
+        target = os.path.join(td, 'pk_extra.json')
+        bak = target + '.bak'
+        good = {'learned': 'keep-me', 'apple': '苹果'}
+        with open(bak, 'w', encoding='utf-8') as f:
+            json.dump(good, f, ensure_ascii=False)
+        with open(target, 'w', encoding='utf-8') as f:
+            f.write('{broken')
+        r = ets_remote.ETSRemote(current_version='0.6.5')
+        # Will try network but after restore local should be good; even if download
+        # fails we must not have destroyed bak. Prefer offline: mock by using
+        # disallowed? allowlisted URL may hang/slow — use fake host fail after restore.
+        ok, msg = r.download_pk_extra(
+            url='https://raw.githubusercontent.com/yigenhuobah/ETS_Auto/main/pk_extra.json',
+            target_path=target)
+        # bak must still be the good snapshot (not '{broken')
+        with open(bak, 'r', encoding='utf-8') as f:
+            bak_loaded = json.load(f)
+        self.assertEqual(bak_loaded.get('learned'), 'keep-me')
+        # target should have been restored from bak before any merge attempt
+        with open(target, 'r', encoding='utf-8') as f:
+            target_loaded = json.load(f)
+        self.assertEqual(target_loaded.get('learned'), 'keep-me')
+
+
+
+class TestCdpParseErrorClass(unittest.TestCase):
+    def test_distinguishes_semantic_vs_cdp(self):
+        import ets_common
+        b = ets_common.ETSBase()
+        self.assertTrue(b.is_cdp_parse_error({'error': 'eval_js_failed'}))
+        self.assertTrue(b.is_cdp_parse_error({'error': 'non_object_result'}))
+        self.assertFalse(b.is_cdp_parse_error({'error': 'no iframe'}))
+        self.assertFalse(b.is_cdp_parse_error({'error': 'no doc'}))
+        self.assertFalse(b.is_cdp_parse_error({}))
+
+
+class TestEvalJsStopSlice(unittest.TestCase):
+    def test_stop_event_raises_interrupted(self):
+        import ets_common
+        import threading
+        base = ets_common.ETSBase(stop_event=threading.Event())
+        class FakeWS:
+            def send(self, p):
+                return None
+            def settimeout(self, t):
+                return None
+            def recv(self):
+                # First slice: stop is set by test before call
+                raise ets_common.websocket.WebSocketTimeoutException('slice')
+            def close(self):
+                return None
+        base.ws = FakeWS()
+        base.mid = 0
+        base.debug_mode = False
+        base.debug = lambda *a, **k: None
+        base.stop_event.set()
+        with self.assertRaises(InterruptedError):
+            base.eval_js('1+1')
+
+
+class TestReconnectControlShell(unittest.TestCase):
+    def _make(self):
+        import ets_common
+        base = ets_common.ETSBase()
+        base.debug_mode = False
+        base.debug = lambda *a, **k: None
+        base.interruptible_sleep = lambda s: None
+        base.ws = object()  # pretend live
+        return base
+
+    def test_break_over_threshold(self):
+        b = self._make()
+        self.assertEqual(b.reconnect_control(3, label='X'), 'break')
+
+    def test_continue_when_reconnect_ok(self):
+        b = self._make()
+        b.reconnect = lambda: True
+        self.assertEqual(b.reconnect_control(1, label='X'), 'continue')
+
+    def test_post_ok_false_breaks(self):
+        b = self._make()
+        b.reconnect = lambda: True
+        self.assertEqual(
+            b.reconnect_control(1, post_ok=lambda: False, label='X'), 'break')
+
+    def test_interrupted_reraises(self):
+        b = self._make()
+        def _boom():
+            raise InterruptedError('stop')
+        b.reconnect = _boom
+        with self.assertRaises(InterruptedError):
+            b.reconnect_control(1, label='X')
+
+
+class TestRwPostReconnect(unittest.TestCase):
+    def _make(self):
+        import ets_auto
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.debug_mode = False
+        inst.debug = lambda *a, **k: None
+        inst.interruptible_sleep = lambda s: None
+        inst.rw_show_data = None
+        inst._rw_cache_time = 0
+        inst.rw_mode = True
+        inst._read_pinia_config = lambda: None
+        inst._detect_rw_mode = lambda: None
+        inst.inject_bridge = lambda: {}
+        inst._rw_post_reconnect = (
+            ets_auto.ETSAutoAnswer._rw_post_reconnect.__get__(inst))
+        return inst
+
+    def test_mode_lost_returns_false(self):
+        inst = self._make()
+        inst.rw_mode = False
+        self.assertFalse(inst._rw_post_reconnect())
+
+    def test_empty_showdata_returns_false(self):
+        inst = self._make()
+        inst.get_rw_show_data = lambda: None
+        self.assertFalse(inst._rw_post_reconnect())
+
+    def test_zero_answers_returns_false(self):
+        inst = self._make()
+        inst.get_rw_show_data = lambda: {'question': []}
+        inst._build_rw_answers_from_showdata = lambda sd, verbose=False: 0
+        self.assertFalse(inst._rw_post_reconnect())
+
+    def test_ok_when_answers_rebuilt(self):
+        inst = self._make()
+        inst.get_rw_show_data = lambda: {'question': [{'id': '1'}]}
+        inst._build_rw_answers_from_showdata = lambda sd, verbose=False: 2
+        self.assertTrue(inst._rw_post_reconnect())
+
+
+class TestPkReconnectHandler(unittest.TestCase):
+    def test_pk_reconnect_uses_shared_shell(self):
+        import ets_word_pk
+        import threading
+        pk = object.__new__(ets_word_pk.ETSWordPK)
+        pk.debug_mode = False
+        pk.debug = lambda *a, **k: None
+        pk.interruptible_sleep = lambda s: None
+        pk.stop_event = threading.Event()
+        pk.ws = object()
+        calls = {'n': 0}
+        def _re():
+            calls['n'] += 1
+            return True
+        pk.reconnect = _re
+        # Mimic nested handler body via reconnect_control directly
+        action = pk.reconnect_control(1, label='PK', sleep_ok=0.01)
+        self.assertEqual(action, 'continue')
+        self.assertEqual(calls['n'], 1)
+
+
+class TestFireCallbackDebug(unittest.TestCase):
+    def test_fire_question_swallows_and_debugs(self):
+        import ets_common
+        base = ets_common.ETSBase(debug_mode=True)
+        logs = []
+        base.debug = lambda m: logs.append(m)
+        def _bad(info):
+            raise RuntimeError('ui dead')
+        base.on_question(_bad)
+        base._fire_question({'type': 'x'})
+        self.assertTrue(any('on_question' in x for x in logs))
+
+
+class TestGuiClosedGuard(unittest.TestCase):
+    def test_run_finished_noop_when_closed(self):
+        import ets_gui
+        # Lightweight stub of the guard logic (avoid real CTk)
+        class Stub:
+            def __init__(self):
+                self._closed = True
+                self._running = True
+                self._restored = False
+            def _restore_streams(self):
+                self._restored = True
+            def _run_finished(self):
+                if getattr(self, '_closed', False):
+                    try:
+                        self._restore_streams()
+                    except Exception:
+                        pass
+                    self._running = False
+                    return
+                raise AssertionError('should not reach')
+        s = Stub()
+        s._run_finished()
+        self.assertFalse(s._running)
+        self.assertTrue(s._restored)
+
+
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 

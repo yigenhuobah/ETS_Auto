@@ -11,7 +11,7 @@ Provides ETSBase class with:
 import json, time, urllib.request, websocket, os, sys, threading
 
 # Single source of truth for app version (imported by exam/PK/GUI/remote)
-APP_VERSION = "0.6.5"
+APP_VERSION = "0.6.6"
 
 
 def user_data_path(filename, anchor_file=None):
@@ -129,32 +129,62 @@ class ETSBase:
         if self._on_connect:
             try:
                 self._on_connect(self)
-            except Exception:
-                pass
+            except Exception as e:
+                self.debug("on_connect callback error: %s" % e)
 
     def _fire_question(self, info):
         """Fire on_question callback if registered."""
         if self._on_question:
             try:
                 self._on_question(info)
-            except Exception:
-                pass
+            except Exception as e:
+                self.debug("on_question callback error: %s" % e)
 
     def _fire_complete(self, stats):
         """Fire on_complete callback if registered."""
         if self._on_complete:
             try:
                 self._on_complete(stats)
-            except Exception:
-                pass
+            except Exception as e:
+                self.debug("on_complete callback error: %s" % e)
 
     def _fire_error(self, msg):
         """Fire on_error callback if registered."""
         if self._on_error:
             try:
                 self._on_error(msg)
-            except Exception:
-                pass
+            except Exception as e:
+                self.debug("on_error callback error: %s" % e)
+
+    def reconnect_control(self, consecutive_conn_errors, *, post_ok=None,
+                          label='', max_errors=3, sleep_ok=1.0, sleep_fail=1.0):
+        """Shared reconnect shell for exam/RW/PK loops.
+
+        Returns 'continue' | 'break'. post_ok is optional callable() -> bool;
+        if it returns False after a successful reconnect(), the loop breaks.
+        """
+        self.debug("%s connection error #%d" % (label or 'CDP', consecutive_conn_errors))
+        if consecutive_conn_errors >= max_errors:
+            print("\n%s: Connection lost repeatedly, stopping." % (label or 'Connection'))
+            return 'break'
+        print("\n%s: Connection lost. Reconnecting (%d/%d)..." % (
+            label or 'CDP', consecutive_conn_errors, max_errors))
+        try:
+            self.reconnect()
+            if post_ok is not None and not post_ok():
+                print("%s: post-reconnect check failed, stopping." % (label or 'CDP'))
+                return 'break'
+            print("%s: Reconnected successfully, resuming..." % (label or 'CDP'))
+            self.interruptible_sleep(sleep_ok)
+            return 'continue'
+        except InterruptedError:
+            raise
+        except Exception as recon_err:
+            print("%s: Reconnect failed: %s" % (label or 'CDP', recon_err))
+            # Budget already checked at entry; failed reconnect always retries
+            # via outer loop until consecutive_conn_errors hits max_errors.
+            self.interruptible_sleep(sleep_fail)
+            return 'continue'
 
     # ── Utilities ──────────────────────────────────────────────
 
@@ -162,6 +192,40 @@ class ETSBase:
         """Print debug message if debug_mode is enabled."""
         if self.debug_mode:
             print("  [D] " + msg)
+
+    def parse_eval_json(self, result, empty_error='eval_js_failed'):
+        """Parse eval_js JSON result; never collapse failure to {}.
+
+        Returns a dict. On missing/empty result → {'error': empty_error}.
+        On JSON parse failure → {'error': str(result)}.
+        """
+        if not result:
+            return {'error': empty_error}
+        try:
+            data = json.loads(result)
+            return data if isinstance(data, dict) else {'error': 'non_object_result'}
+        except Exception:
+            return {'error': str(result)}
+
+    # CDP/parse failures from parse_eval_json — not semantic page states like "no iframe"
+    _CDP_PARSE_ERRORS = frozenset({
+        'eval_js_failed', 'non_object_result',
+    })
+
+    def is_cdp_parse_error(self, state):
+        """True when state['error'] means CDP/JSON failure (reconnect), not page shell."""
+        if not isinstance(state, dict):
+            return False
+        err = state.get('error')
+        if not err:
+            return False
+        if err in self._CDP_PARSE_ERRORS:
+            return True
+        # parse_eval_json uses str(raw) for JSON decode failures
+        if isinstance(err, str) and (
+                err.startswith('{') or err.startswith('[') or 'Expecting' in err):
+            return True
+        return False
 
     _RECONNECT_MAX_RETRIES = 3
     _RECONNECT_DELAY = 2  # seconds between retries
@@ -337,6 +401,9 @@ class ETSBase:
             raise ConnectionError(
                 "WebSocket I/O error during eval_js send: %s" % e)
         deadline = time.time() + self._EVAL_JS_TIMEOUT
+        # Recv slices so stop_event / F12 can abort mid-wait without full 15s block.
+        # 1.0s balances stop latency vs exception/settimeout churn on every eval_js.
+        _recv_slice = 1.0
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
@@ -344,7 +411,10 @@ class ETSBase:
                 raise TimeoutError(
                     "eval_js timed out after %ds (browser may have crashed)"
                     % self._EVAL_JS_TIMEOUT)
-            self.ws.settimeout(remaining)
+            if self.stop_event is not None and self.stop_event.is_set():
+                self._invalidate_ws("stop_event during eval_js")
+                raise InterruptedError("User stopped")
+            self.ws.settimeout(min(remaining, _recv_slice))
             try:
                 raw = self.ws.recv()
             except websocket.WebSocketConnectionClosedException:
@@ -352,10 +422,16 @@ class ETSBase:
                 raise ConnectionError(
                     "WebSocket closed — browser disconnected during eval_js")
             except websocket.WebSocketTimeoutException:
-                self._invalidate_ws("recv timeout")
-                raise TimeoutError(
-                    "eval_js timed out after %ds (browser may have crashed)"
-                    % self._EVAL_JS_TIMEOUT)
+                # Slice timeout: re-check stop + overall deadline, then keep waiting
+                if self.stop_event is not None and self.stop_event.is_set():
+                    self._invalidate_ws("stop_event during eval_js recv")
+                    raise InterruptedError("User stopped")
+                if time.time() >= deadline:
+                    self._invalidate_ws("recv timeout")
+                    raise TimeoutError(
+                        "eval_js timed out after %ds (browser may have crashed)"
+                        % self._EVAL_JS_TIMEOUT)
+                continue
             except OSError as e:
                 self._invalidate_ws("I/O error on recv")
                 raise ConnectionError(

@@ -95,6 +95,7 @@ class ETSApp(ctk.CTk):
         self._stop_event = threading.Event()
         self._log_queue = queue.Queue()
         self._running = False
+        self._closed = False  # set in _on_close; _run_finished no-ops after destroy
         self._original_stdout = sys.stdout
         self._original_stderr = sys.stderr
 
@@ -481,18 +482,22 @@ class ETSApp(ctk.CTk):
     # ── Remote Check ────────────────────────────────────
     def _check_remote_async(self):
         """Start background thread to check remote info.
-        Network failures are logged but never crash the GUI."""
+        Network failures are logged but never crash the GUI.
+
+        Publish _remote_info only on the Tk main thread (after()) so start/
+        block paths never race a background write.
+        """
         def _worker():
             try:
-                from ets_remote import ETSRemote, should_block_start, format_update_message
+                from ets_remote import ETSRemote
                 remote = ETSRemote(current_version=APP_VERSION)
                 info = remote.check()
-                self._remote_info = info
-                if info is not None:
-                    self.after(0, self._on_remote_checked, info)
+                # Always hop to main thread for assignment + UI
+                self.after(0, self._on_remote_checked, info)
             except Exception as e:
                 # Log to terminal but don't crash GUI — remote check is non-critical
                 print("[Remote] Check failed: %s" % e)
+                self.after(0, self._on_remote_checked, None)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -503,6 +508,11 @@ class ETSApp(ctk.CTk):
         set stop_event so the automation exits cleanly (do not only
         disable the Start button).
         """
+        # Main-thread publish (None clears / keeps fail-open start policy)
+        self._remote_info = info
+        if info is None:
+            return
+
         from ets_remote import classify_info, format_update_message
 
         level, reason = classify_info(info)
@@ -542,7 +552,8 @@ class ETSApp(ctk.CTk):
                     self.after(0, lambda m=message: self._append_log(
                         "[远程] ⚠️ %s\n" % m))
             except Exception as e:
-                pass  # pk_extra update is non-critical
+                # Non-critical, but do not hide failures completely
+                print("[Remote] pk_extra update error: %s" % e)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -555,9 +566,13 @@ class ETSApp(ctk.CTk):
 
     def _on_close(self):
         """Handle window close: stop worker, wait briefly, then destroy."""
+        self._closed = True
         if self._running:
             self._stop_event.set()
-            self._status_var.set("正在停止...")
+            try:
+                self._status_var.set("正在停止...")
+            except Exception:
+                pass
             # Wait for worker to exit (max 3s)
             if self._worker and self._worker.is_alive():
                 self._worker.join(timeout=3)
@@ -566,12 +581,14 @@ class ETSApp(ctk.CTk):
 
     def _restore_streams(self):
         """Restore stdout/stderr to original, drain remaining log queue.
-        Bug fix: join worker thread briefly first to close the race window
-        where QueueWriter still writes after streams are restored."""
-        # Wait briefly for worker thread to fully exit so it stops writing
-        # to QueueWriter (which may still reference this queue).
+        Bug fix: join worker thread first to close the race window where
+        QueueWriter still writes after streams are restored.
+
+        Join budget raised to 8s so stop during eval_js/reconnect is less
+        likely to flip streams under a still-live worker.
+        """
         if self._worker and self._worker.is_alive() and self._worker is not threading.current_thread():
-            self._worker.join(timeout=2)
+            self._worker.join(timeout=8)
 
         # Drain remaining log messages (already written to original by QueueWriter)
         while not self._log_queue.empty():
@@ -580,23 +597,57 @@ class ETSApp(ctk.CTk):
             except queue.Empty:
                 break
 
+        # If worker still alive, leave QueueWriter in place to avoid lost/racy writes
+        if self._worker and self._worker.is_alive() and self._worker is not threading.current_thread():
+            return
+
         sys.stdout = self._original_stdout
         sys.stderr = self._original_stderr
 
     def _run_finished(self):
         """Called on main thread when worker finishes."""
+        # Window may already be destroyed (_on_close); never touch dead widgets.
+        if getattr(self, '_closed', False):
+            try:
+                self._restore_streams()
+            except Exception:
+                pass
+            self._running = False
+            return
+        try:
+            if not self.winfo_exists():
+                try:
+                    self._restore_streams()
+                except Exception:
+                    pass
+                self._running = False
+                return
+        except Exception:
+            try:
+                self._restore_streams()
+            except Exception:
+                pass
+            self._running = False
+            return
+
         self._restore_streams()
 
         self._running = False
-        self._hotkey_var.set("")
+        try:
+            self._hotkey_var.set("")
+        except Exception:
+            return
         # H17: keep Start disabled if remote still blocks after run ends
         remote_blocked, reason = self._remote_is_blocked()
-        if remote_blocked:
-            self._start_btn.configure(state="disabled")
-            self._status_var.set("⛔ %s" % reason)
-        else:
-            self._start_btn.configure(state="normal")
-        self._stop_btn.configure(state="disabled")
+        try:
+            if remote_blocked:
+                self._start_btn.configure(state="disabled")
+                self._status_var.set("⛔ %s" % reason)
+            else:
+                self._start_btn.configure(state="normal")
+            self._stop_btn.configure(state="disabled")
+        except Exception:
+            return
         # Bug fix: detect error state from worker thread
         had_error = getattr(self, '_worker_error', False)
         last = getattr(self, '_last_progress', (0, 0))
@@ -703,11 +754,18 @@ class ETSApp(ctk.CTk):
 
     def _append_log(self, text):
         """Append text to the log widget."""
-        self._log_text.configure(state="normal")
-        self._log_text.insert("end", text)
-        self._log_text.configure(state="disabled")
-        # Auto-scroll to bottom
-        self._log_text.see("end")
+        if getattr(self, '_closed', False):
+            return
+        try:
+            if not self.winfo_exists():
+                return
+            self._log_text.configure(state="normal")
+            self._log_text.insert("end", text)
+            self._log_text.configure(state="disabled")
+            # Auto-scroll to bottom
+            self._log_text.see("end")
+        except Exception:
+            pass
 
     def _show_error(self, title, message):
         """Show error messagebox on main thread (call via self.after)."""

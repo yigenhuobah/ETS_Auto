@@ -218,16 +218,34 @@ def _filter_pk_extra_schema(data):
 
 
 def _load_local_pk_extra(path):
-    """Load existing local pk_extra.json; return {} if missing/invalid."""
+    """Load existing local pk_extra.json; return {} if missing/invalid.
+
+    Prefer _load_local_pk_extra_status() when callers must distinguish
+    missing vs corrupt (download merge must not wipe a corrupt local file).
+    """
+    data, _status = _load_local_pk_extra_status(path)
+    return data
+
+
+def _load_local_pk_extra_status(path):
+    """Load local pk_extra.json.
+
+    Returns (data: dict, status: 'ok'|'missing'|'invalid').
+    - missing: no file → empty dict is safe to merge onto
+    - invalid: file exists but unreadable/schema-bad → do not overwrite blindly
+    - ok: valid filtered dict (may be empty object)
+    """
+    if not path or not os.path.exists(path):
+        return {}, 'missing'
     try:
-        if not path or not os.path.exists(path):
-            return {}
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         filtered = _filter_pk_extra_schema(data)
-        return filtered if filtered is not None else {}
+        if filtered is None:
+            return {}, 'invalid'
+        return filtered, 'ok'
     except (OSError, json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
-        return {}
+        return {}, 'invalid'
 
 
 def _merge_pk_extra(local_data, remote_data):
@@ -610,9 +628,26 @@ class ETSRemote:
         if target_path is None:
             target_path = resolve_pk_extra_path('pk_extra.json')
 
-        # Backup existing file (best-effort; write path is atomic separately)
         backup_path = target_path + '.bak'
-        if os.path.exists(target_path):
+
+        # Status FIRST — never clobber a good .bak with a corrupt target
+        local_data, local_status = _load_local_pk_extra_status(target_path)
+        if local_status == 'invalid':
+            bak_data, bak_status = _load_local_pk_extra_status(backup_path)
+            if bak_status == 'ok':
+                try:
+                    _atomic_write_json(target_path, bak_data)
+                    local_data, local_status = bak_data, 'ok'
+                except OSError:
+                    return False, (
+                        "本地 pk_extra.json 损坏，且无法从 .bak 恢复；"
+                        "已拒绝远程覆盖以免丢失学习记录")
+            else:
+                return False, (
+                    "本地 pk_extra.json 损坏/格式无效；"
+                    "已拒绝远程覆盖以免丢失学习记录（可手动删除后重试）")
+        elif local_status == 'ok':
+            # Only snapshot healthy local before remote merge write
             try:
                 shutil.copy2(target_path, backup_path)
             except OSError:
@@ -641,8 +676,6 @@ class ETSRemote:
                 filtered_urls.append(dl_url)
         if not filtered_urls:
             return False, "pkExtraUrl 主机不在允许列表中（拒绝下载）"
-
-        local_data = _load_local_pk_extra(target_path)
 
         for dl_url in filtered_urls:
             try:

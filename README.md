@@ -120,7 +120,7 @@ python src/auto/tests/test_unit.py
 
 ```text
 # ── 套卷答题 ──
-ETS Auto v0.6.5
+ETS Auto v0.6.6
 ========================================
 ETS connected
 Loaded 21 answers (set_id=721920)

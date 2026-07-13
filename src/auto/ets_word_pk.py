@@ -815,10 +815,7 @@ class ETSWordPK(ETSBase):
         return JSON.stringify(r);
         })()'''
         result = self.eval_js(js)
-        try:
-            return json.loads(result) if result else {}
-        except Exception:
-            return {}
+        return self.parse_eval_json(result)
 
     def click_option(self, index):
         js = '''(function(){
@@ -827,11 +824,7 @@ class ETSWordPK(ETSBase):
         items[%d].click();
         return JSON.stringify({ok:true,i:%d});
         })()''' % (index, index, index)
-        result = self.eval_js(js)
-        try:
-            return json.loads(result or "{}")
-        except Exception:
-            return {"error": str(result)}
+        return self.parse_eval_json(self.eval_js(js))
 
     # ── Self-Learning ─────────────────────────────────────────
 
@@ -868,7 +861,9 @@ class ETSWordPK(ETSBase):
         })()''' % (clicked_idx, clicked_idx)
         result = self.eval_js(js)
         try:
-            info = json.loads(result) if result else {}
+            info = self.parse_eval_json(result)
+            if info.get('error'):
+                return ''
             if info.get('isWrong') and info.get('correctAnswer'):
                 captured = info['correctAnswer']
                 # Bug 18: Validate captured answer is among current options
@@ -1021,27 +1016,18 @@ class ETSWordPK(ETSBase):
         consecutive_conn_errors = 0
 
         def _handle_pk_reconnect(err):
-            """Shared PK reconnect control flow. Returns 'continue' | 'break'."""
+            """PK reconnect control flow via shared shell. Returns 'continue'|'break'."""
             nonlocal consecutive_conn_errors
             consecutive_conn_errors += 1
-            print("\nConnection lost: %s" % err)
-            if consecutive_conn_errors >= 3:
-                print("Connection lost repeatedly, stopping.")
-                return 'break'
-            try:
-                print("  Reconnecting (%d/3)..." % consecutive_conn_errors)
-                self.reconnect()
-                print("  Reconnected, resuming...")
-                self.interruptible_sleep(0.5)
-                return 'continue'
-            except InterruptedError:
-                raise
-            except Exception as recon_err:
-                print("  Reconnect failed: %s" % recon_err)
-                if consecutive_conn_errors >= 3:
-                    return 'break'
-                self.interruptible_sleep(1)
-                return 'continue'
+            self.debug("PK connection error detail: %s" % err)
+            return self.reconnect_control(
+                consecutive_conn_errors,
+                post_ok=None,
+                label='PK',
+                max_errors=3,
+                sleep_ok=0.5,
+                sleep_fail=1.0,
+            )
 
         try:
             while answered + no_match < max_q:
@@ -1075,6 +1061,13 @@ class ETSWordPK(ETSBase):
                     consecutive_conn_errors = 0
                 except (ConnectionError, TimeoutError) as e:
                     if _handle_pk_reconnect(e) == 'break':
+                        break
+                    continue
+
+                # CDP/JS failure is not "quiz ended" — retry / reconnect
+                if state.get('error'):
+                    print("\nPK state error: %s" % state.get('error'))
+                    if _handle_pk_reconnect(ConnectionError(state.get('error'))) == 'break':
                         break
                     continue
 

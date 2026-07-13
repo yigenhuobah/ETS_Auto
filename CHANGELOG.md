@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.6.6] - 2026-07-13
+
+### Fixed
+- **Exam reconnect 空答案 resume** — `set_id` 变化后 `load_answers()` 失败不再假成功；同卷答案表为空 fail-closed
+- **page state 语义错误 vs CDP 失败** — 仅 `eval_js_failed` 等触发 reconnect；`no iframe`/`no doc` 仍作过渡页
+- **页面/PK 状态静默 `{}`** — `parse_eval_json()`；choose/fill/wait_iframe/next 对齐错误形状
+- **录音路径** — GUI 无嵌套 worker + `ready_event`；CLI zombie join；wait 重抛 ConnectionError
+- **eval_js 可被停止打断** — recv 切片（1s）检查 `stop_event`
+- **pk_extra 损坏** — status-first；禁止坏文件覆盖好 `.bak`；invalid 拒绝盲远程覆盖
+- **GUI 关闭竞态** — `_closed`、stream restore 守卫；remote_info 主线程发布
+
+### Changed
+- **`ets_auto` 拆分** — `ets_recording_ui` / `ets_rw_mode` / `ets_tee` mixin；公开 import 兼容
+- **共享壳** — `reconnect_control()`、`parse_eval_json()`、`is_cdp_parse_error()`
+- **CI** — exam/GUI hidden-import 补新模块
+- **删除** 死脚本 `_bug_check.py`
+
+### Tests
+- unit：**186+**（reconnect 壳、page/PK error、pk_extra bak、eval stop、GUI closed）
+- pre_release：**58** 项
+
 ## [0.6.5] - 2026-07-12
 
 ### Docs & Tooling (2026-07-12)
@@ -36,44 +57,6 @@
 ### Notes
 - 真机项（完整套卷 E2E、作业提交、多 tab 实机）仍需人工验收
 - 远程签名默认关闭（未设密钥时与 0.6.4 行为兼容）；生产加固请配置 `ETS_REMOTE_HMAC` 或 Ed25519 公钥
-
-## [Unreleased]
-
-### Fixed (deep audit 2026-07-12)
-- **C1** CLI `stop_event is None` 时 F12/上限/录音结束 `.set()` 崩溃 — 默认创建 `threading.Event()` + `_signal_stop()`
-- **C2** GUI 录音窗结束不 `done.set()` 导致 worker 挂起 — `_rec_done_event` + poll destroy 同步
-- **C3** `next_icon hidden` reason 长短串不匹配提前收卷 — 稳定匹配 `_is_next_waiting()`
-- **C4** `hasChoice`/`hasInput` 未过滤幽灵 DOM — 改用过滤后列表长度
-- **C5** `load_answers` 不清空导致换卷合并 — 加载前 clear
-- **C6** role/dialogue 覆盖 fill 索引 — 已有 fill key 不覆盖
-- **C7** PK Strategy1 仅「在词典」+50 抢答 — 要求题干重叠才计分
-- **C8** `tools/fix_*.py` 默认改写源码 — 需 `--apply` 才写入
-- **H1/H2** exam/PK 异常路径漏清理 hotkey/ws — `try/finally`
-- **H3** RW 模式无 reconnect/热键 — 对齐主循环
-- **H4** reconnect 阻塞 sleep / 半死状态 — interruptible + 失败清 tab/ws + mid 重置
-- **H5** strategy 写死 APPDATA — `load_set(..., data_dir=)`
-- **H6** Pinia homework set_id 无条件采用 — 仅作业模式
-- **H7** `collector.role` 未进录音答案 — 已加载
-- **H8** strip_html/keypoint — 安全标签正则 + strip keypoint
-- **H9/H10** strategy 缓存共享与 set_id 路径逃逸 — deepcopy/mtime + digits 校验
-- **H11–H15** PK 词库控制符/学习规范化/模糊子串/F10 skip
-- **H12/H16/H18/H19** pk_extra 路径统一、原子写+合并、URL allowlist
-- **H17** GUI 远程 block 竞态 — 检查后可 stop
-- **H20** 答案注入 JS 未 escape — choose/fill 使用 `js_escape`
-- **H21** PyInstaller hidden-import 补全
-- **H22** total_questions 含录音题 — 仅计 choose+fill
-- **M1–M3** run.py BOM、content.json 双编码、PK reconnect
-
-### Fixed (residual pass C)
-- **InterruptedError 被 reconnect 外层 `except Exception` 吞掉** — 用户在重连等待期间点停止时，`reconnect()` 抛出的 `InterruptedError` 被当成“重连失败”吞掉，导致 GUI/CLI 停止不干净。`ets_auto`（主循环+RW 三处）与 `ets_word_pk`（两处）改为 `except InterruptedError: raise` 后再接普通 Exception。
-
-### Notes
-- **全量遗漏细节清单（待一起修复）** 已写入 `docs/deep_bug_audit_20260712.md` **§8**（OPEN-H/M/L + 修复状态矩阵 + 测试缺口 + 真机项）。
-- **2026-07-12 选项2 重扫**：对照当前工作树更新 §8.0/§8.1（大审计+residual 多为 FIXED；仍开项仍为 OPEN-H1–H8 等）。**只更新文档，未改生产代码。**
-
-### Tests
-- `test_unit.py`：**142** OK（无真机 CDP）
-- `pre_release_test.py`：**58** passed / 0 failed
 
 ## [0.6.4] - 2026-07-08
 

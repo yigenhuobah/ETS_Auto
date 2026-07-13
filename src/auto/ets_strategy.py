@@ -233,6 +233,7 @@ class ETSStrategy:
         self.sections = []
         self.answer_index = {}
         self.recording_answers = []
+        skipped = 0
 
         for d in sorted(os.listdir(exam_dir)):
             if not d.startswith('content_'):
@@ -242,7 +243,10 @@ class ETSStrategy:
                 continue
             try:
                 data = _read_json(cj)
-            except Exception:
+            except Exception as e:
+                skipped += 1
+                # Always surface — silent skip hides partial index holes
+                print("  ⚠ strategy skip %s: %s" % (d, e))
                 continue
 
             stype = data.get('structure_type', '')
@@ -275,6 +279,9 @@ class ETSStrategy:
             while len(order) > self.__class__._SET_CACHE_MAX:
                 old_key = order.pop(0)
                 cache.pop(old_key, None)
+
+        if skipped:
+            print("  ⚠ strategy.load_set skipped %d content_* dir(s)" % skipped)
 
         return len(self.sections) > 0
 

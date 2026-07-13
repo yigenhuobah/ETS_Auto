@@ -41,12 +41,15 @@ jobs:
           --hidden-import=ets_remote
           --hidden-import=ets_parser
           --hidden-import=ets_browser_ui
+          --hidden-import=ets_recording_ui
+          --hidden-import=ets_rw_mode
+          --hidden-import=ets_tee
           --hidden-import=customtkinter
           --hidden-import=darkdetect
           --collect-all customtkinter
           --name ets_gui src/auto/ets_gui.py
 
-      # Exam pulls strategy + hotkey at runtime
+      # Exam pulls strategy + hotkey + recording/RW mixins at runtime
       - name: Build exam
         run: >
           pyinstaller --onefile
@@ -54,6 +57,9 @@ jobs:
           --hidden-import=ets_common
           --hidden-import=ets_strategy
           --hidden-import=ets_hotkey
+          --hidden-import=ets_recording_ui
+          --hidden-import=ets_rw_mode
+          --hidden-import=ets_tee
           --name ets_auto src/auto/ets_auto.py
 
       # PK pulls hotkey at import time
