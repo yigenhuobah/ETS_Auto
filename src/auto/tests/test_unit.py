@@ -2531,6 +2531,206 @@ class TestExamReconnectLoadFail(unittest.TestCase):
         ok = inst._handle_exam_reconnect(ConnectionError('x'), 1)
         self.assertTrue(ok)
 
+    def test_threshold_break_without_reconnect(self):
+        inst = self._make()
+        called = []
+        inst.reconnect = lambda: called.append('reconnect')
+        ok = inst._handle_exam_reconnect(ConnectionError('x'), 3)
+        self.assertFalse(ok)
+        self.assertEqual(called, [])
+
+    def test_bridge_called_on_success_path(self):
+        inst = self._make()
+        bridge = []
+        inst.reconnect = lambda: True
+        inst._read_pinia_config = lambda: None
+        inst._detect_rw_mode = lambda: None
+        inst.inject_bridge = lambda: bridge.append('ok') or {}
+        ok = inst._handle_exam_reconnect(ConnectionError('x'), 1)
+        self.assertTrue(ok)
+        self.assertEqual(bridge, ['ok'])
+
+    def test_set_id_change_reloads_answers_and_strategy(self):
+        inst = self._make()
+        loaded = []
+        strat = []
+
+        class FakeStrat:
+            def load_set(self, set_id, data_dir=None):
+                strat.append((set_id, data_dir))
+
+        def _pinia():
+            inst.set_id = '222'
+
+        inst.reconnect = lambda: True
+        inst._read_pinia_config = _pinia
+        inst._detect_rw_mode = lambda: None
+        inst.inject_bridge = lambda: {}
+        inst.load_answers = lambda: loaded.append(inst.set_id) or True
+        inst.strategy = FakeStrat()
+        inst.ets_base = 'C:/tmp/ETS'
+        ok = inst._handle_exam_reconnect(ConnectionError('x'), 1)
+        self.assertTrue(ok)
+        self.assertEqual(loaded, ['222'])
+        self.assertEqual(strat, [('222', 'C:/tmp/ETS')])
+
+
+class TestAnswerChooseDecisions(unittest.TestCase):
+    def _make(self, groups, answers=None, strat_map=None, in_review_mode=False):
+        import ets_auto
+        from ets_common import ETSBase
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.debug_mode = False
+        inst.debug = lambda *a, **k: None
+        inst.interruptible_sleep = lambda s: None
+        inst.js_escape = ETSBase.js_escape
+        inst._IFRAME_FINDER = 'var iframe = null'
+        inst.stats = {'choose_answered': 0, 'choose_skip': 0, 'errors': 0}
+        inst.answered_questions = []
+        inst.total_questions = 10
+        inst.answers = answers or {}
+        inst._on_question_answered = None
+        inst._fire_question = lambda info: None
+        inst.parse_eval_json = ETSBase.parse_eval_json.__get__(inst)
+        inst.is_cdp_parse_error = ETSBase.is_cdp_parse_error.__get__(inst)
+        inst.get_page_state = lambda: {
+            'question_groups': groups,
+            'inReviewMode': in_review_mode,
+        }
+
+        class Strat:
+            def lookup(self, stype, stid, qid=None, **k):
+                return (strat_map or {}).get('%s_%s' % (stid, qid))
+
+        inst.strategy = Strat()
+        inst.answer_choose = ets_auto.ETSAutoAnswer.answer_choose.__get__(inst)
+        return inst
+
+    def test_review_mode_skips_and_marks_done(self):
+        inst = self._make([{'qid': '1_1', 'anySelected': False}], in_review_mode=True)
+        any_new, likely_done = inst.answer_choose()
+        self.assertFalse(any_new)
+        self.assertTrue(likely_done)
+
+    def test_already_selected_skips(self):
+        inst = self._make([{'qid': '10_1', 'anySelected': True}])
+        any_new, likely_done = inst.answer_choose()
+        self.assertFalse(any_new)
+        self.assertTrue(likely_done)
+        self.assertEqual(inst.stats['choose_skip'], 1)
+
+    def test_invalid_letter_does_not_click(self):
+        clicks = []
+        inst = self._make(
+            [{'qid': '10_1', 'anySelected': False}],
+            answers={'10_1': {'type': 'choose', 'answer': 'Z'}},
+        )
+        inst.eval_js = lambda js: clicks.append(js) or None
+        any_new, _ = inst.answer_choose()
+        self.assertFalse(any_new)
+        self.assertEqual(clicks, [])
+
+    def test_strategy_mismatch_uses_strategy_letter(self):
+        clicks = []
+        inst = self._make(
+            [{'qid': '10_1', 'anySelected': False}],
+            answers={'10_1': {'type': 'choose', 'answer': 'A'}},
+            strat_map={'10_1': {'type': 'choose', 'answer': 'B', 'source': 'local'}},
+        )
+
+        def _eval(js):
+            clicks.append(js)
+            if 'choose_selected' in js:
+                return True
+            if 'setPCChoose2' in js or 'getElementById' in js:
+                return json.dumps({'method': 'setPCChoose2'})
+            if 'kttb_getPcChoise' in js:
+                return 1
+            return None
+
+        inst.eval_js = _eval
+        any_new, _ = inst.answer_choose()
+        self.assertTrue(any_new)
+        self.assertTrue(any('10_1_2' in c for c in clicks))
+        self.assertEqual(inst.stats['choose_answered'], 1)
+
+    def test_cdp_parse_error_raises_connection_error(self):
+        inst = self._make([])
+        inst.get_page_state = lambda: {'error': 'eval_js_failed'}
+        with self.assertRaises(ConnectionError):
+            inst.answer_choose()
+
+
+class TestAnswerFillDecisions(unittest.TestCase):
+    def _make(self, inputs, answers=None):
+        import ets_auto
+        from ets_common import ETSBase
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.debug_mode = False
+        inst.debug = lambda *a, **k: None
+        inst.js_escape = ETSBase.js_escape
+        inst._IFRAME_FINDER = 'var iframe = null'
+        inst.stats = {'fill_answered': 0, 'fill_skip': 0, 'errors': 0}
+        inst.total_questions = 5
+        inst.answers = answers or {}
+        inst._on_question_answered = None
+        inst._fire_question = lambda info: None
+        inst.parse_eval_json = ETSBase.parse_eval_json.__get__(inst)
+        inst.is_cdp_parse_error = ETSBase.is_cdp_parse_error.__get__(inst)
+        inst.get_page_state = lambda: {'inputs': inputs}
+
+        class Strat:
+            def lookup(self, *a, **k):
+                return None
+
+        inst.strategy = Strat()
+        inst.answer_fill = ets_auto.ETSAutoAnswer.answer_fill.__get__(inst)
+        return inst
+
+    def test_already_filled_case_insensitive_skips(self):
+        inst = self._make(
+            [{'id': '10_1', 'value': 'Hello'}],
+            answers={'10_1': {'type': 'fill', 'answer': 'hello'}},
+        )
+        inst.eval_js = lambda js: (_ for _ in ()).throw(AssertionError('no eval'))
+        any_new, has_inputs = inst.answer_fill()
+        self.assertFalse(any_new)
+        self.assertTrue(has_inputs)
+        self.assertEqual(inst.stats['fill_skip'], 1)
+
+    def test_fill_false_counts_error_not_answered(self):
+        inst = self._make(
+            [{'id': '10_1', 'value': ''}],
+            answers={'10_1': {'type': 'fill', 'answer': 'cat'}},
+        )
+        inst.eval_js = lambda js: json.dumps({'filled': False, 'error': 'not found'})
+        any_new, _ = inst.answer_fill()
+        self.assertFalse(any_new)
+        self.assertEqual(inst.stats['fill_answered'], 0)
+        self.assertEqual(inst.stats.get('fill_errors'), 1)
+
+    def test_fill_success_counts_answered(self):
+        inst = self._make(
+            [{'id': '10_1', 'value': ''}],
+            answers={'10_1': {'type': 'fill', 'answer': 'cat'}},
+        )
+
+        def _eval(js):
+            if 'HTMLInputElement' in js or 'setter' in js or 'filled' in js:
+                return json.dumps({'filled': True, 'value': 'cat'})
+            return 1
+
+        inst.eval_js = _eval
+        any_new, _ = inst.answer_fill()
+        self.assertTrue(any_new)
+        self.assertEqual(inst.stats['fill_answered'], 1)
+
+    def test_cdp_parse_error_raises(self):
+        inst = self._make([])
+        inst.get_page_state = lambda: {'error': 'eval_js_failed'}
+        with self.assertRaises(ConnectionError):
+            inst.answer_fill()
+
 
 class TestPageAndPkStateErrors(unittest.TestCase):
     def test_get_page_state_none_is_error(self):
