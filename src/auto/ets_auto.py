@@ -210,13 +210,14 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
             return
         try:
             if cfg.get('appDataPath'):
-                # Normalize separators + trailing slash so ".../ETS/" still
-                # counts as the ETS root (endswith('/ETS') alone false-negatives).
-                path = cfg['appDataPath'].replace('\\', '/').rstrip('/')
-                if not path.upper().endswith('/ETS'):
-                    path = path + '/ETS'
-                self.ets_base = path
-                self.debug("Pinia: dataPath=" + self.ets_base)
+                from ets_common import constrain_ets_data_root
+                jailed = constrain_ets_data_root(cfg['appDataPath'])
+                if jailed:
+                    self.ets_base = jailed
+                    self.debug("Pinia: dataPath=" + self.ets_base)
+                else:
+                    self.debug("Pinia: rejected unsafe appDataPath=%r" % (
+                        str(cfg.get('appDataPath'))[:120],))
             self.homework_mode = cfg.get('doHomework')
             self.homework_id = str(cfg.get('homework_id') or '')
             hw_set = str(cfg.get('hw_set_id') or '')
@@ -235,40 +236,72 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
     # ── Bridge Injection ──────────────────────────────────────
 
     def inject_bridge(self):
-        """Wrap kttb_ReturnChoose / kttb_returnPcBlank (idempotent).
-        In homework mode: call native CEF function first, then record.
-        In practice mode: record only (no native function exists).
-        Guards against re-wrapping: checks __ets_hooked flag so repeated
-        calls on the same iframe don't nest wrappers."""
+        """Wrap kttb_ReturnChoose / kttb_returnPcBlank (idempotent + re-hook).
+
+        Homework: call native CEF first, then record. Practice: record only.
+        Skip only while *our* wrap is still installed. If CEF later installs
+        natives (replacing our wrap), re-wrap and capture them as orig
+        (M-BRIDGE: late native after early inject).
+        """
         js = '''(function(){
         %s;
         if (!iframe) return JSON.stringify({nativeChoose: false, nativeFill: false, error: "no iframe"});
         var win = iframe.contentWindow;
         window.top.__ets_recorded = window.top.__ets_recorded || [];
         window.top.__ets_recorded_fill = window.top.__ets_recorded_fill || [];
-        /* Idempotent guard: skip if already hooked on this iframe */
-        if (win.__ets_hooked) {
-            return JSON.stringify({nativeChoose: !!win.__ets_origChoose, nativeFill: !!win.__ets_origBlank, skipped: true});
+
+        var curChoose = win.kttb_ReturnChoose;
+        var curBlank = win.kttb_returnPcBlank;
+        var stillOurChoose = !!(win.__ets_wrappedChoose && curChoose === win.__ets_wrappedChoose);
+        var stillOurBlank = !!(win.__ets_wrappedBlank && curBlank === win.__ets_wrappedBlank);
+
+        /* Our wraps still installed: do not nest. */
+        if (win.__ets_hooked && stillOurChoose && stillOurBlank) {
+            if (win.__ets_origChoose || win.__ets_origBlank) {
+                return JSON.stringify({
+                    nativeChoose: !!win.__ets_origChoose,
+                    nativeFill: !!win.__ets_origBlank,
+                    skipped: true
+                });
+            }
+            /* Wrap in place but no native captured yet (practice or early inject) */
+            return JSON.stringify({
+                nativeChoose: false, nativeFill: false,
+                skipped: true, waitingNative: true
+            });
         }
-        var hadNativeChoose = typeof win.kttb_ReturnChoose === 'function';
-        var hadNativeFill = typeof win.kttb_returnPcBlank === 'function';
-        var _origChoose = win.kttb_ReturnChoose;
-        var _origBlank = win.kttb_returnPcBlank;
-        win.kttb_ReturnChoose = function(data) {
+        /* CEF replaced our wrap with native (or first inject): (re)install */
+
+        /* Capture orig: prefer live function that is NOT our previous wrap */
+        var _origChoose = null;
+        var _origBlank = null;
+        if (typeof curChoose === 'function' && curChoose !== win.__ets_wrappedChoose) {
+            _origChoose = curChoose;
+        } else if (win.__ets_origChoose) {
+            _origChoose = win.__ets_origChoose;
+        }
+        if (typeof curBlank === 'function' && curBlank !== win.__ets_wrappedBlank) {
+            _origBlank = curBlank;
+        } else if (win.__ets_origBlank) {
+            _origBlank = win.__ets_origBlank;
+        }
+        var hadNativeChoose = !!_origChoose;
+        var hadNativeFill = !!_origBlank;
+
+        var wrappedChoose = function(data) {
             if (_origChoose && typeof _origChoose === 'function') {
                 try { _origChoose(data); } catch(e) {}
             }
             window.top.__ets_recorded.push(data);
-            /* Drain: keep array bounded to prevent V8 heap OOM */
             if (window.top.__ets_recorded.length > 200) {
                 window.top.__ets_recorded = window.top.__ets_recorded.slice(-100);
             }
         };
-        Object.defineProperty(win.kttb_ReturnChoose, 'toString', {
+        Object.defineProperty(wrappedChoose, 'toString', {
             value: function() { return "function kttb_ReturnChoose() { [native code] }"; },
             enumerable: false, configurable: false
         });
-        win.kttb_returnPcBlank = function(data) {
+        var wrappedBlank = function(data) {
             if (_origBlank && typeof _origBlank === 'function') {
                 try { _origBlank(data); } catch(e) {}
             }
@@ -277,17 +310,21 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
                 window.top.__ets_recorded_fill = window.top.__ets_recorded_fill.slice(-100);
             }
         };
-        Object.defineProperty(win.kttb_returnPcBlank, 'toString', {
+        Object.defineProperty(wrappedBlank, 'toString', {
             value: function() { return "function kttb_returnPcBlank() { [native code] }"; },
             enumerable: false, configurable: false
         });
-        /* Mark as hooked and stash originals for idempotent guard */
+        win.kttb_ReturnChoose = wrappedChoose;
+        win.kttb_returnPcBlank = wrappedBlank;
+        win.__ets_wrappedChoose = wrappedChoose;
+        win.__ets_wrappedBlank = wrappedBlank;
         win.__ets_hooked = true;
-        win.__ets_origChoose = hadNativeChoose ? _origChoose : null;
-        win.__ets_origBlank = hadNativeFill ? _origBlank : null;
+        win.__ets_origChoose = _origChoose;
+        win.__ets_origBlank = _origBlank;
         return JSON.stringify({
             nativeChoose: hadNativeChoose,
-            nativeFill: hadNativeFill
+            nativeFill: hadNativeFill,
+            rehooked: !!(stillOurChoose === false || stillOurBlank === false)
         });
         })()''' % self._IFRAME_FINDER
         result = self.eval_js(js)
@@ -295,8 +332,14 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
         if info.get('error'):
             self.debug("Bridge result: " + str(result))
             return {}
-        mode = "HOMEWORK" if info.get('nativeChoose') else "PRACTICE"
-        self.debug("Bridge: " + mode)
+        if info.get('waitingNative'):
+            self.debug("Bridge: waiting for CEF natives")
+        elif info.get('skipped'):
+            self.debug("Bridge: skipped (stable wrap)")
+        else:
+            mode = "HOMEWORK" if info.get('nativeChoose') else "PRACTICE"
+            extra = " rehook" if info.get('rehooked') else ""
+            self.debug("Bridge: " + mode + extra)
         return info
 
     # ── RW iframe helper ────────────────────────────────────

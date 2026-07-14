@@ -12,7 +12,7 @@ import json, time, urllib.request, websocket, os, sys, threading
 from urllib.parse import urlparse
 
 # Single source of truth for app version (imported by exam/PK/GUI/remote)
-APP_VERSION = "0.6.7"
+APP_VERSION = "0.6.8"
 
 
 def is_loopback_ws_url(ws_url):
@@ -66,6 +66,43 @@ def user_data_path(filename, anchor_file=None):
         base = os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.abspath(anchor))))
     return os.path.join(base, name)
+
+
+def constrain_ets_data_root(path, appdata=None):
+    """Normalize Pinia/appDataPath into a path under %APPDATA%\\ETS (or None).
+
+    - Accepts paths that already end with ETS, or parent of ETS (appends ETS).
+    - realpath + commonpath jail: must stay under APPDATA\\ETS.
+    - Returns absolute real path, or None if empty/unsafe/escapes jail.
+    """
+    if path is None:
+        return None
+    raw = str(path).strip()
+    if not raw:
+        return None
+    raw = raw.replace('\\', '/').rstrip('/')
+    base_name = raw.rsplit('/', 1)[-1]
+    if base_name.upper() != 'ETS':
+        # appDataPath often points at Roaming (or similar) without ETS leaf
+        raw = raw + '/ETS'
+    # Windows path for realpath
+    candidate = raw.replace('/', os.sep)
+    app = appdata if appdata is not None else os.environ.get('APPDATA', '')
+    if not app:
+        return None
+    jail = os.path.realpath(os.path.join(app, 'ETS'))
+    try:
+        resolved = os.path.realpath(os.path.abspath(candidate))
+    except (OSError, ValueError):
+        return None
+    try:
+        common = os.path.commonpath([jail, resolved])
+    except ValueError:
+        return None
+    if common != jail:
+        return None
+    return resolved
+
 
 def force_utf8_stdio(line_buffering=False):
     """Force stdout/stderr to UTF-8 on Windows to avoid GBK encoding errors.

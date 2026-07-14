@@ -3127,6 +3127,93 @@ class TestInjectBridgeContract(unittest.TestCase):
         self.assertTrue(info.get('skipped'))
         self.assertIn('nativeChoose', info)
 
+    def test_js_tracks_wrapped_refs_for_rehook(self):
+        """Bridge must remember wrap identities so CEF-replaced natives re-hook."""
+        inst = self._make()
+        captured = []
+
+        def _eval(js):
+            captured.append(js)
+            return json.dumps({'nativeChoose': True, 'nativeFill': True})
+
+        inst.eval_js = _eval
+        inst.inject_bridge()
+        src = captured[0]
+        self.assertIn('__ets_wrappedChoose', src)
+        self.assertIn('__ets_wrappedBlank', src)
+        # re-hook when current fn is not our wrap
+        self.assertIn('!== win.__ets_wrappedChoose', src)
+        self.assertIn('waitingNative', src)
+
+
+class TestConstrainEtsDataRoot(unittest.TestCase):
+    def test_accepts_under_appdata_ets(self):
+        import ets_common
+        import tempfile
+        app = tempfile.mkdtemp(prefix='appdata_')
+        ets = _os.path.join(app, 'ETS')
+        _os.makedirs(ets)
+        try:
+            got = ets_common.constrain_ets_data_root(ets, appdata=app)
+            self.assertEqual(got, _os.path.realpath(ets))
+            # Roaming-style without ETS leaf
+            got2 = ets_common.constrain_ets_data_root(app, appdata=app)
+            self.assertEqual(got2, _os.path.realpath(ets))
+        finally:
+            shutil.rmtree(app, ignore_errors=True)
+
+    def test_rejects_escape(self):
+        import ets_common
+        import tempfile
+        app = tempfile.mkdtemp(prefix='appdata_')
+        outside = tempfile.mkdtemp(prefix='outside_')
+        try:
+            self.assertIsNone(
+                ets_common.constrain_ets_data_root(outside, appdata=app))
+            self.assertIsNone(
+                ets_common.constrain_ets_data_root('', appdata=app))
+            self.assertIsNone(
+                ets_common.constrain_ets_data_root(None, appdata=app))
+        finally:
+            shutil.rmtree(app, ignore_errors=True)
+            shutil.rmtree(outside, ignore_errors=True)
+
+
+class TestWordPKLearnMiss(unittest.TestCase):
+    def _make(self):
+        import ets_word_pk
+        pk = object.__new__(ets_word_pk.ETSWordPK)
+        pk.debug_mode = False
+        pk.debug = lambda *a, **k: None
+        pk.word_trans = {}
+        pk.trans_index = {}
+        pk.cn_seg_index = {}
+        pk.pk_extra = {}
+        pk.extra_path = _os.path.join(
+            tempfile.mkdtemp(prefix='pk_learn_'), 'pk_extra.json')
+        pk._is_chinese = lambda t: ets_word_pk.ETSWordPK._is_chinese(t)
+        pk._cn_split = lambda s: [s] if s else []
+        pk.learn_miss = ets_word_pk.ETSWordPK.learn_miss.__get__(pk)
+        pk.find_answer = ets_word_pk.ETSWordPK.find_answer.__get__(pk)
+        pk.get_stems = ets_word_pk.ETSWordPK.get_stems.__get__(pk)
+        pk.get_opt_trans = ets_word_pk.ETSWordPK.get_opt_trans.__get__(pk)
+        return pk
+
+    def test_learn_miss_cn_to_en_and_find(self):
+        pk = self._make()
+        pk.learn_miss('苹果', 'apple')
+        self.assertEqual(pk.pk_extra['苹果'], 'apple')
+        self.assertIn('apple', pk.trans_index.get('苹果', []))
+        self.assertTrue(_os.path.isfile(pk.extra_path))
+        idx = pk.find_answer('苹果', ['banana', 'apple'])
+        self.assertEqual(idx, 1)
+
+    def test_learn_miss_empty_noop(self):
+        pk = self._make()
+        pk.learn_miss('', 'x')
+        pk.learn_miss('q', '')
+        self.assertEqual(pk.pk_extra, {})
+
 
 class TestFormatUpdateMessageLevels(unittest.TestCase):
     """format_update_message must surface warn (unsigned) and block (signed)."""

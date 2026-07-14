@@ -1,8 +1,8 @@
 {
-  "version": "0.6.7",
+  "version": "0.6.8",
   "minVer": "0.4.0",
   "allowStart": true,
-  "announcement": "v0.6.7: CDP loopback guard, unsigned remote fail-open, click_next waiting fix, remote cache hardening — see CHANGELOG",
+  "announcement": "v0.6.8: homework bridge re-hook when CEF natives appear late; Pinia ets_base jailed under APPDATA\\\\ETS — see CHANGELOG",
   "pkExtraUrl": "https://raw.githubusercontent.com/yigenhuobah/ETS_Auto/main/pk_extra.json",
   "downloadUrl": "https://github.com/yigenhuobah/ETS_Auto/releases/latest"
 }
