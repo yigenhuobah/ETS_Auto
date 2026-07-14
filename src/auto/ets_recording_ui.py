@@ -6,7 +6,6 @@ Mixin expects ETSBase/ETSAutoAnswer attributes: eval_js, stop_event,
 _signal_stop, interruptible_sleep, recording_answers, debug, _fire_question,
 _recording_window_closed, _tk_root, _rec_done_event.
 """
-import json
 import time
 
 

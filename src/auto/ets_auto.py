@@ -10,7 +10,7 @@ Usage:
   python ets_auto.py --show-answers  # 仅查看答案
   python ets_auto.py --json       # JSON 输出
 """
-import json, os, time, sys, threading, re
+import json, os, time, sys, threading
 from urllib.parse import urlparse, parse_qs
 from urllib.error import URLError
 
@@ -25,7 +25,7 @@ __version__ = APP_VERSION
 __all__ = ['ETSAutoAnswer', 'TeeOutput', 'APP_VERSION']
 
 from ets_strategy import (
-    ETSStrategy, _safe_set_id, _resolve_exam_dir, _read_json, _html_to_text,
+    ETSStrategy, _safe_set_id, _resolve_exam_dir, _read_json,
 )
 
 

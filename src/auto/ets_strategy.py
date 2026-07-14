@@ -27,8 +27,6 @@ Usage:
   ans = strategy.lookup('collector.choose', stid, qid='1')
 """
 import sys, os, json, re, hashlib, copy
-from urllib.parse import urlparse, parse_qs
-
 # ── Path setup ───────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
     _BASE = sys._MEIPASS

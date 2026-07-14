@@ -277,7 +277,7 @@ def t_strategy_load_set():
     from ets_strategy import ETSStrategy
     s = ETSStrategy()
     ok = s.load_set(_STRATEGY_TEST_SET)
-    assert ok, f"load_set({set_id}) returned False"
+    assert ok, f"load_set({_STRATEGY_TEST_SET}) returned False"
     assert len(s.sections) > 0, "No sections loaded"
     assert len(s.answer_index) > 0, "answer_index is empty after load_set"
 test("strategy.load_set() loads sections + answer_index", t_strategy_load_set)
@@ -464,7 +464,7 @@ def t_strategy_index_role():
     entry = s.answer_index[expected_key]
     assert entry.get('type') == 'oral', f"Expected type=oral, got {entry.get('type')}"
     assert 'variants' in entry, f"Missing 'variants' in role entry: {entry}"
-    assert len(entry['variants']) > 0, f"Empty variants list in role entry"
+    assert len(entry['variants']) > 0, "Empty variants list in role entry"
 test("strategy._index_section indexes collector.role with q1 key", t_strategy_index_role)
 
 def t_load_answers_empty_answer():
@@ -807,7 +807,7 @@ def t_sig_base_connect():
     import inspect
     from ets_common import ETSBase
     sig = inspect.signature(ETSBase.connect)
-    assert sig.parameters, f"connect() should have parameters"
+    assert sig.parameters, "connect() should have parameters"
 test("ETSBase.connect() signature stable", t_sig_base_connect)
 
 # ── 13. Version / path / integrity hygiene (v0.6.5) ─────────

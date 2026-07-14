@@ -1009,7 +1009,6 @@ class ETSWordPK(ETSBase):
 
         answered = 0
         no_match = 0
-        last_progress = ''
         last_question_hash = ''
         same_count = 0
         no_q_count = 0
@@ -1089,9 +1088,7 @@ class ETSWordPK(ETSBase):
                 import hashlib as _hl
                 question_hash = _hl.md5((title + '|' + '|'.join(sorted(options))).encode()).hexdigest()[:12]
 
-                if progress:
-                    last_progress = progress
-                elif title == '' and not progress:
+                if not progress and title == '':
                     self.interruptible_sleep(0.3)
                     continue
 

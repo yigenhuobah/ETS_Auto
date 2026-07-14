@@ -4,7 +4,6 @@
 Extracted from ets_auto. Mixin expects exam instance attributes used by RW
 loops (answers, stats, reconnect_control, inject_bridge, etc.).
 """
-import json
 import re
 import time
 

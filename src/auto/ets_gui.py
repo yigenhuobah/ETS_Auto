@@ -15,7 +15,6 @@ import sys
 import os
 import threading
 import queue
-import time
 
 # ── Path setup: ensure auto modules are importable ───────────
 # Dev: this file lives in src/auto. Frozen onefile: modules unpack
