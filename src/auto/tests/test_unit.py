@@ -3117,6 +3117,51 @@ class TestInjectBridgeContract(unittest.TestCase):
         inst.eval_js = lambda js: None
         self.assertEqual(inst.inject_bridge(), {})
 
+    def test_skipped_idempotent_payload_shape(self):
+        """When JS reports skipped, Python still returns parsed dict (not {})."""
+        inst = self._make()
+        inst.eval_js = lambda js: json.dumps({
+            'nativeChoose': False, 'nativeFill': False, 'skipped': True,
+        })
+        info = inst.inject_bridge()
+        self.assertTrue(info.get('skipped'))
+        self.assertIn('nativeChoose', info)
+
+
+class TestFormatUpdateMessageLevels(unittest.TestCase):
+    """format_update_message must surface warn (unsigned) and block (signed)."""
+
+    def test_warn_and_block_and_update(self):
+        import ets_remote
+        with _cleared_remote_integrity_env():
+            warn_info = ets_remote.RemoteInfo(
+                allow_start=False, announcement='', download_url='')
+            msg = ets_remote.format_update_message(warn_info, '0.6.7')
+            self.assertIsNotNone(msg)
+            self.assertIn('仅提示', msg)
+
+            _os.environ['ETS_REMOTE_HMAC'] = 'unit-format-secret'
+            block_info = ets_remote.RemoteInfo(
+                allow_start=False, announcement='', download_url='https://example.com')
+            # allowlist strips non-allowlisted download_url in parse path;
+            # RemoteInfo can still carry a display URL set directly.
+            block_info.download_url = 'https://github.com/yigenhuobah/ETS_Auto/releases/latest'
+            msg_b = ets_remote.format_update_message(block_info, '0.6.7')
+            self.assertIsNotNone(msg_b)
+            self.assertIn('远程关闭', msg_b.replace(' ', '') or msg_b)
+            # Chinese reason or ban emoji path
+            self.assertTrue('关闭' in msg_b or '程序' in msg_b)
+
+        with _cleared_remote_integrity_env():
+            upd = ets_remote.RemoteInfo(
+                allow_start=True, force_update=False, update_available=True,
+                latest_version='0.9.0', announcement='hi',
+                download_url='https://github.com/yigenhuobah/ETS_Auto/releases/latest')
+            msg_u = ets_remote.format_update_message(upd, '0.6.7')
+            self.assertIsNotNone(msg_u)
+            self.assertIn('0.9.0', msg_u)
+            self.assertIn('hi', msg_u)
+
 
 class TestGoldenFixtures(unittest.TestCase):
     """Synthetic content.json under tests/fixtures/sets/ (Project offline golden).
