@@ -120,7 +120,7 @@ python src/auto/tests/test_unit.py
 
 ```text
 # ── 套卷答题 ──
-ETS Auto v0.6.7
+ETS Auto v0.6.8
 ========================================
 ETS connected
 Loaded 21 answers (set_id=721920)
@@ -258,11 +258,12 @@ ETS_Auto/
 * [x] **傻瓜式 GUI 界面** —— CustomTkinter 可视化窗口，点点鼠标即可完成。 ✅ v0.4.0
 * [x] **离线试卷浏览器** —— 扫描本地缓存，红字高亮正确答案，支持五种题型。 ✅ v0.4.0
 * [x] **热键支持** —— F9 暂停 / F10 跳过 / F12 停止（全局 RegisterHotKey）。 ✅ v0.5+
-* [x] **断连恢复** —— CDP `reconnect()` + 套卷/PK/RW 自动重连与 bridge 重注入。 ✅ v0.6.3–0.6.7
-* [x] **策略层双重验证** —— 复合 key 索引 + 模糊 + DOM 回退；`set_id` 数字校验。 ✅ v0.5–0.6.7
-* [x] **远程配置** —— 版本/公告/pk_extra；未签名 kill-switch 为 warn；可选 HMAC/Ed25519。 ✅ v0.6.0–0.6.7
+* [x] **断连恢复** —— CDP `reconnect()` + 套卷/PK/RW 自动重连与 bridge 重注入。 ✅ v0.6.3–0.6.8
+* [x] **策略层双重验证** —— 复合 key 索引 + 模糊 + DOM 回退；`set_id` 数字校验。 ✅ v0.5–0.6.8
+* [x] **远程配置** —— 版本/公告/pk_extra；未签名 kill-switch 为 warn；可选 HMAC/Ed25519。 ✅ v0.6.0–0.6.8
 * [x] **模块 mixin 拆分** —— recording / RW / tee。 ✅ v0.6.6
 * [x] **CDP loopback + next 等待态** —— 非本机 debugger 拒绝；`next_icon hidden` 不提前收卷。 ✅ v0.6.7
+* [x] **作业 bridge re-hook + ets_base jail** —— CEF 晚到 native 时 re-wrap；Pinia 路径限制在 APPDATA\\ETS。 ✅ v0.6.8
 * [ ] **作业模式全量真机验收** — 真实作业卷提交链路（桥接已做，缺稳定作业卷回归）
 
 > **注**：由于移动端系统级权限管控，本脚本目前及未来均**不计划**兼容 Android 或 iOS 平台。如果有移动端相关需求，请尝试开源社区的其他相关库吧（如 `Fuck_ets100`，适用于安卓设备的答案检索工具）。
