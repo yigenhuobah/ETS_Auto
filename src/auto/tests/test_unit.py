@@ -3190,6 +3190,18 @@ class TestInjectBridgeContract(unittest.TestCase):
         self.assertIn('!== win.__ets_wrappedChoose', src)
         self.assertIn('waitingNative', src)
 
+    def test_waiting_native_payload_passes_through(self):
+        """Python must surface waitingNative for early inject (no CEF natives yet)."""
+        inst = self._make()
+        inst.eval_js = lambda js: json.dumps({
+            'nativeChoose': False, 'nativeFill': False,
+            'skipped': True, 'waitingNative': True,
+        })
+        info = inst.inject_bridge()
+        self.assertTrue(info.get('waitingNative'))
+        self.assertTrue(info.get('skipped'))
+        self.assertFalse(info.get('nativeChoose'))
+
 
 class TestConstrainEtsDataRoot(unittest.TestCase):
     def test_accepts_under_appdata_ets(self):
@@ -3263,6 +3275,152 @@ class TestWordPKLearnMiss(unittest.TestCase):
         pk.learn_miss('', 'x')
         pk.learn_miss('q', '')
         self.assertEqual(pk.pk_extra, {})
+
+
+class TestWordPKCaptureAndRecordMiss(unittest.TestCase):
+    """capture_wrong_answer guards + record_miss JSONL append (no CDP)."""
+
+    def _make(self):
+        import ets_word_pk
+        from ets_common import ETSBase
+        pk = object.__new__(ets_word_pk.ETSWordPK)
+        pk.debug_mode = False
+        pk.debug = lambda *a, **k: None
+        pk.parse_eval_json = ETSBase.parse_eval_json.__get__(pk)
+        pk.capture_wrong_answer = (
+            ets_word_pk.ETSWordPK.capture_wrong_answer.__get__(pk))
+        pk.record_miss = ets_word_pk.ETSWordPK.record_miss.__get__(pk)
+        td = tempfile.mkdtemp(prefix='pk_miss_')
+        pk.misses_path = _os.path.join(td, 'pk_misses.jsonl')
+        return pk
+
+    def test_capture_wrong_count_mismatch_skips(self):
+        pk = self._make()
+        pk.eval_js = lambda js: json.dumps({
+            'isWrong': True,
+            'correctAnswer': 'right',
+            'allOpts': ['a', 'b'],  # 2
+        })
+        got = pk.capture_wrong_answer(0, current_options=['a', 'b', 'c'])
+        self.assertEqual(got, '')
+
+    def test_capture_wrong_content_mismatch_skips(self):
+        pk = self._make()
+        pk.eval_js = lambda js: json.dumps({
+            'isWrong': True,
+            'correctAnswer': 'right',
+            'allOpts': ['x', 'y', 'z', 'w'],
+        })
+        got = pk.capture_wrong_answer(
+            0, current_options=['a', 'b', 'c', 'd'])
+        self.assertEqual(got, '')
+
+    def test_capture_wrong_success_when_options_match(self):
+        pk = self._make()
+        opts = ['apple', 'banana', 'cherry']
+        pk.eval_js = lambda js: json.dumps({
+            'isWrong': True,
+            'correctAnswer': 'banana',
+            'allOpts': opts,
+        })
+        got = pk.capture_wrong_answer(0, current_options=opts)
+        self.assertEqual(got, 'banana')
+
+    def test_capture_not_wrong_returns_empty(self):
+        pk = self._make()
+        pk.eval_js = lambda js: json.dumps({
+            'isWrong': False,
+            'correctAnswer': 'banana',
+            'allOpts': ['a', 'b'],
+        })
+        self.assertEqual(pk.capture_wrong_answer(0), '')
+
+    def test_capture_parse_error_returns_empty(self):
+        pk = self._make()
+        pk.eval_js = lambda js: None
+        self.assertEqual(pk.capture_wrong_answer(0, current_options=['a']), '')
+
+    def test_record_miss_appends_jsonl(self):
+        pk = self._make()
+        pk.record_miss('hello', ['A', 'B'])
+        pk.record_miss('world', ['C'])
+        with open(pk.misses_path, encoding='utf-8') as f:
+            lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 2)
+        r0 = json.loads(lines[0])
+        self.assertEqual(r0['question'], 'hello')
+        self.assertEqual(r0['options'], ['A', 'B'])
+        self.assertIn('time', r0)
+        r1 = json.loads(lines[1])
+        self.assertEqual(r1['question'], 'world')
+
+    def test_record_miss_write_failure_is_swallowed(self):
+        pk = self._make()
+        # Directory path as file path → open fails
+        pk.misses_path = _os.path.join(
+            tempfile.mkdtemp(prefix='pk_bad_'), 'nope', 'x.jsonl')
+        # Should not raise
+        pk.record_miss('q', ['o'])
+
+
+class TestPiniaEtsBaseJailBehavior(unittest.TestCase):
+    """Rejected appDataPath must not install an escaped ets_base."""
+
+    def test_unsafe_pinia_path_leaves_ets_base_none(self):
+        import ets_auto
+        from ets_common import ETSBase
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.debug_mode = False
+        inst.debug = lambda *a, **k: None
+        inst.ets_base = None
+        inst.homework_mode = None
+        inst.homework_id = None
+        inst.set_id = None
+        inst.parse_eval_json = ETSBase.parse_eval_json.__get__(inst)
+        inst._read_pinia_config = (
+            ets_auto.ETSAutoAnswer._read_pinia_config.__get__(inst))
+        # Escapes APPDATA jail
+        inst.eval_js = lambda js: json.dumps({
+            'appDataPath': 'D:/not/under/appdata',
+            'doHomework': False,
+            'homework_id': '',
+            'hw_set_id': '',
+        })
+        # Force empty APPDATA for jail so any non-empty path fails? Better:
+        # use real APPDATA but path outside it — D:/ is outside.
+        inst._read_pinia_config()
+        self.assertIsNone(inst.ets_base)
+
+    def test_safe_pinia_roaming_sets_ets_base(self):
+        import ets_auto
+        from ets_common import ETSBase, constrain_ets_data_root
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.debug_mode = False
+        inst.debug = lambda *a, **k: None
+        inst.ets_base = None
+        inst.homework_mode = None
+        inst.homework_id = None
+        inst.set_id = None
+        inst.parse_eval_json = ETSBase.parse_eval_json.__get__(inst)
+        inst._read_pinia_config = (
+            ets_auto.ETSAutoAnswer._read_pinia_config.__get__(inst))
+        app = _os.environ.get('APPDATA', '')
+        if not app:
+            self.skipTest('APPDATA not set')
+        # Only assert if constrain accepts APPDATA (ETS leaf may not exist)
+        expected = constrain_ets_data_root(app)
+        if expected is None:
+            self.skipTest('constrain rejects default APPDATA on this machine')
+        inst.eval_js = lambda js: json.dumps({
+            'appDataPath': app,
+            'doHomework': True,
+            'homework_id': '1',
+            'hw_set_id': '12345',
+        })
+        inst._read_pinia_config()
+        self.assertEqual(inst.ets_base, expected)
+        self.assertTrue(inst.homework_mode)
+        self.assertEqual(inst.set_id, '12345')
 
 
 class TestFormatUpdateMessageLevels(unittest.TestCase):
