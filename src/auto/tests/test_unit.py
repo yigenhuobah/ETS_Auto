@@ -854,16 +854,46 @@ class TestRemoteClassifyInfo(unittest.TestCase):
         self.assertEqual(level, 'normal')
         self.assertEqual(reason, '')
 
-    def test_allow_start_false_is_block(self):
-        info = self._ri(allow_start=False)
-        level, reason = self._ci(info)
-        self.assertEqual(level, 'block')
-        self.assertEqual(reason, '程序已被远程关闭')
+    def test_allow_start_false_is_warn_when_unsigned(self):
+        """Without integrity keys, unauthenticated kill-switch is warn (fail-open)."""
+        import ets_remote
+        old = _os.environ.pop('ETS_REMOTE_HMAC', None)
+        old_pk = _os.environ.pop('ETS_REMOTE_PUBKEY', None)
+        try:
+            info = self._ri(allow_start=False)
+            level, reason = self._ci(info)
+            self.assertEqual(level, 'warn')
+            self.assertEqual(reason, '程序已被远程关闭')
+            _os.environ['ETS_REMOTE_HMAC'] = 'unit-test-secret'
+            level2, _ = ets_remote.classify_info(info)
+            self.assertEqual(level2, 'block')
+        finally:
+            if old is None:
+                _os.environ.pop('ETS_REMOTE_HMAC', None)
+            else:
+                _os.environ['ETS_REMOTE_HMAC'] = old
+            if old_pk is None:
+                _os.environ.pop('ETS_REMOTE_PUBKEY', None)
+            else:
+                _os.environ['ETS_REMOTE_PUBKEY'] = old_pk
 
-    def test_force_update_is_block(self):
-        info = self._ri(allow_start=True, force_update=True)
-        level, reason = self._ci(info)
-        self.assertEqual(level, 'block')
+    def test_force_update_is_warn_when_unsigned(self):
+        old = _os.environ.pop('ETS_REMOTE_HMAC', None)
+        old_pk = _os.environ.pop('ETS_REMOTE_PUBKEY', None)
+        try:
+            info = self._ri(allow_start=True, force_update=True)
+            level, reason = self._ci(info)
+            self.assertEqual(level, 'warn')
+            self.assertIn('版本过低', reason)
+        finally:
+            if old is None:
+                _os.environ.pop('ETS_REMOTE_HMAC', None)
+            else:
+                _os.environ['ETS_REMOTE_HMAC'] = old
+            if old_pk is None:
+                _os.environ.pop('ETS_REMOTE_PUBKEY', None)
+            else:
+                _os.environ['ETS_REMOTE_PUBKEY'] = old_pk
 
     def test_update_available_is_normal(self):
         info = self._ri(allow_start=True, force_update=False, update_available=True)
@@ -923,16 +953,52 @@ class TestRemoteETSSystem(unittest.TestCase):
 
     def test_should_block_start(self):
         import ets_remote
-        info = self._ri_class(allow_start=False)
-        blocked, reason = ets_remote.should_block_start(info)
-        self.assertTrue(blocked)
-        self.assertEqual(reason, '程序已被远程关闭')
+        old = _os.environ.pop('ETS_REMOTE_HMAC', None)
+        old_pk = _os.environ.pop('ETS_REMOTE_PUBKEY', None)
+        try:
+            info = self._ri_class(allow_start=False)
+            blocked, reason = ets_remote.should_block_start(info)
+            self.assertFalse(blocked)
+            self.assertEqual(reason, '')
+            _os.environ['ETS_REMOTE_HMAC'] = 'unit-test-secret'
+            blocked2, reason2 = ets_remote.should_block_start(info)
+            self.assertTrue(blocked2)
+            self.assertEqual(reason2, '程序已被远程关闭')
+        finally:
+            if old is None:
+                _os.environ.pop('ETS_REMOTE_HMAC', None)
+            else:
+                _os.environ['ETS_REMOTE_HMAC'] = old
+            if old_pk is None:
+                _os.environ.pop('ETS_REMOTE_PUBKEY', None)
+            else:
+                _os.environ['ETS_REMOTE_PUBKEY'] = old_pk
 
     def test_should_not_block_normal(self):
         import ets_remote
         info = self._ri_class(allow_start=True)
         blocked, _ = ets_remote.should_block_start(info)
         self.assertFalse(blocked)
+
+    def test_format_update_message_warn_when_unsigned_kill_switch(self):
+        import ets_remote
+        old = _os.environ.pop('ETS_REMOTE_HMAC', None)
+        old_pk = _os.environ.pop('ETS_REMOTE_PUBKEY', None)
+        try:
+            info = self._ri_class(allow_start=False, announcement='')
+            msg = ets_remote.format_update_message(info, current_version='0.6.7')
+            self.assertIsNotNone(msg)
+            self.assertIn('程序已被远程关闭', msg)
+            self.assertIn('仅提示', msg)
+        finally:
+            if old is None:
+                _os.environ.pop('ETS_REMOTE_HMAC', None)
+            else:
+                _os.environ['ETS_REMOTE_HMAC'] = old
+            if old_pk is None:
+                _os.environ.pop('ETS_REMOTE_PUBKEY', None)
+            else:
+                _os.environ['ETS_REMOTE_PUBKEY'] = old_pk
 
     def test_format_update_message_update_available(self):
         import ets_remote
@@ -2757,6 +2823,89 @@ class TestGuiClosedGuard(unittest.TestCase):
         s._run_finished()
         self.assertFalse(s._running)
         self.assertTrue(s._restored)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  v0.6.7 quality ports — loopback / next waiting / thresholds
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestLoopbackWsUrl(unittest.TestCase):
+    def test_accepts_loopback(self):
+        import ets_common
+        self.assertTrue(ets_common.is_loopback_ws_url(
+            'ws://127.0.0.1:10086/devtools/page/1'))
+        self.assertTrue(ets_common.is_loopback_ws_url('ws://localhost:10086/x'))
+        self.assertTrue(ets_common.is_loopback_ws_url('ws://[::1]:10086/x'))
+        self.assertTrue(ets_common.is_loopback_ws_url('ws://127.0.0.2:10086/x'))
+        self.assertTrue(ets_common.is_loopback_ws_url(
+            'ws://[0:0:0:0:0:0:0:1]:10086/x'))
+        self.assertTrue(ets_common.is_loopback_ws_url(
+            'ws://[::ffff:127.0.0.1]:10086/x'))
+
+    def test_rejects_remote_and_bad(self):
+        import ets_common
+        self.assertFalse(ets_common.is_loopback_ws_url('ws://192.168.1.2:10086/x'))
+        self.assertFalse(ets_common.is_loopback_ws_url('http://127.0.0.1:10086/x'))
+        self.assertFalse(ets_common.is_loopback_ws_url(''))
+        self.assertFalse(ets_common.is_loopback_ws_url(None))
+
+
+class TestLoopThresholds(unittest.TestCase):
+    def test_scales_with_total_and_caps(self):
+        import ets_auto
+        e1, u1 = ets_auto.ETSAutoAnswer.compute_loop_thresholds(1)
+        self.assertEqual((e1, u1), (5, 8))
+        e50, u50 = ets_auto.ETSAutoAnswer.compute_loop_thresholds(50)
+        self.assertEqual(e50, 15)
+        self.assertEqual(u50, 24)
+        e999, u999 = ets_auto.ETSAutoAnswer.compute_loop_thresholds(999)
+        self.assertEqual(e999, 15)
+        self.assertEqual(u999, 25)
+
+
+class TestClickNextWaiting(unittest.TestCase):
+    def _make(self):
+        import ets_auto
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.debug_mode = False
+        inst.debug = lambda *a, **k: None
+        inst._IFRAME_FINDER = 'var iframe = null'
+        inst.stats = {'next_click': 0}
+        inst.parse_eval_json = ets_auto.ETSAutoAnswer.parse_eval_json.__get__(inst) \
+            if hasattr(ets_auto.ETSAutoAnswer, 'parse_eval_json') else None
+        # Prefer instance method from ETSBase if present
+        if hasattr(inst, 'parse_eval_json') is False or inst.parse_eval_json is None:
+            if hasattr(ets_auto.ETSAutoAnswer, 'parse_eval_json'):
+                inst.parse_eval_json = (
+                    ets_auto.ETSAutoAnswer.parse_eval_json.__get__(inst))
+            else:
+                # ETSBase mixin
+                from ets_common import ETSBase
+                inst.parse_eval_json = ETSBase.parse_eval_json.__get__(inst)
+        inst.click_next = ets_auto.ETSAutoAnswer.click_next.__get__(inst)
+        inst._is_next_waiting = ets_auto.ETSAutoAnswer._is_next_waiting
+        return inst
+
+    def test_next_icon_hidden_does_not_fall_through(self):
+        inst = self._make()
+        calls = []
+        seq = [
+            False,  # iframe.next failed
+            json.dumps({'success': False, 'reason': 'next_icon hidden'}),
+            json.dumps({'success': False, 'reason': 'not found'}),
+        ]
+
+        def _eval(js):
+            calls.append(js)
+            return seq.pop(0) if seq else '{}'
+
+        inst.eval_js = _eval
+        r = inst.click_next()
+        self.assertFalse(r.get('success'))
+        self.assertEqual(r.get('reason'), 'next_icon hidden')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(inst.stats['next_click'], 0)
+        self.assertTrue(inst._is_next_waiting(r.get('reason')))
 
 
 #  MAIN

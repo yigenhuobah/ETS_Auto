@@ -9,9 +9,45 @@ Provides ETSBase class with:
   - JS string escaping utility
 """
 import json, time, urllib.request, websocket, os, sys, threading
+from urllib.parse import urlparse
 
 # Single source of truth for app version (imported by exam/PK/GUI/remote)
-APP_VERSION = "0.6.6"
+APP_VERSION = "0.6.7"
+
+
+def is_loopback_ws_url(ws_url):
+    """Return True if webSocketDebuggerUrl targets a local loopback host.
+
+    CDP attach is a high-privilege local control plane; reject non-loopback
+    hosts even if the /json listing somehow points elsewhere.
+
+    Accepts common loopback spellings: 127.0.0.1, localhost, ::1,
+    IPv4-mapped ::ffff:127.0.0.1, expanded IPv6 loopback, and 127.0.0.0/8.
+    """
+    if not ws_url or not isinstance(ws_url, str):
+        return False
+    try:
+        parsed = urlparse(ws_url.strip())
+    except Exception:
+        return False
+    if parsed.scheme not in ('ws', 'wss'):
+        return False
+    host = (parsed.hostname or '').lower()
+    if not host:
+        return False
+    if '%' in host:
+        host = host.split('%', 1)[0]
+    if host in ('127.0.0.1', 'localhost', '::1'):
+        return True
+    if host in ('::ffff:127.0.0.1', '0:0:0:0:0:ffff:127.0.0.1'):
+        return True
+    if host in ('0:0:0:0:0:0:0:1', '0000:0000:0000:0000:0000:0000:0000:0001'):
+        return True
+    if host.startswith('127.'):
+        parts = host.split('.')
+        if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            return True
+    return False
 
 
 def user_data_path(filename, anchor_file=None):
@@ -291,6 +327,10 @@ class ETSBase:
             raise Exception(
                 "Selected ETS tab has no webSocketDebuggerUrl on port %d "
                 "(url=%s)" % (self.port, (self.tab.get("url") or "")[:120]))
+        if not is_loopback_ws_url(ws_url):
+            raise Exception(
+                "Refusing non-loopback CDP webSocketDebuggerUrl: %s"
+                % (ws_url[:120],))
         self.ws = websocket.create_connection(ws_url, timeout=None)
         # Fresh socket: always start mid at 0 (matches reconnect; avoids stale ids
         # if connect() is called again after a prior session without a new instance).
@@ -331,6 +371,10 @@ class ETSBase:
                     raise Exception(
                         "Selected ETS tab has no webSocketDebuggerUrl "
                         "(url=%s)" % ((self.tab.get("url") or "")[:120]))
+                if not is_loopback_ws_url(ws_url):
+                    raise Exception(
+                        "Refusing non-loopback CDP webSocketDebuggerUrl: %s"
+                        % (ws_url[:120],))
                 self.ws = websocket.create_connection(ws_url, timeout=None)
                 # New socket: reset mid so eval_js ids don't collide with stale state
                 self.mid = 0

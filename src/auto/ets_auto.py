@@ -67,6 +67,14 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
             return False
         return reason == 'disabled' or reason.startswith('next_icon hidden')
 
+    @staticmethod
+    def compute_loop_thresholds(total_questions):
+        """Adaptive empty/unreachable caps for the exam main loop."""
+        tq = max(int(total_questions or 0), 1)
+        max_empty = min(5 + tq // 5, 15)
+        max_unreachable = min(8 + tq // 3, 25)
+        return max_empty, max_unreachable
+
     # ── Public API (CLI + GUI) ─────────────────────────────
 
     def get_all_answers(self):
@@ -584,7 +592,7 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
             if strat_ans and strat_ans.get('source') == 'local':
                 strat_letter = strat_ans['answer'].upper()
                 if strat_letter != ans['answer'].upper():
-                    print("  ⚠ MISMATCH Q:%s: answers=%s strategy=%s — using strategy" % (
+                    print("  [MISMATCH] Q:%s: answers=%s strategy=%s — using strategy" % (
                         qid, ans['answer'], strat_letter))
                     ans = strat_ans
 
@@ -691,7 +699,7 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
             strat_ans = self.strategy.lookup('collector.fill', stid_part, qid=qid_part)
             if strat_ans and strat_ans.get('source') == 'local':
                 if strat_ans['answer'].strip().lower() != ans['answer'].strip().lower():
-                    print("  ⚠ FILL MISMATCH %s: answers=%s strategy=%s — using strategy" % (
+                    print("  [FILL MISMATCH] %s: answers=%s strategy=%s — using strategy" % (
                         inp_id, ans['answer'], strat_ans['answer']))
                     ans = strat_ans
 
@@ -817,6 +825,10 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
         if result.get('success'):
             self.stats['next_click'] += 1
             self.debug("Next: iframe .next_icon")
+            return result
+        # Waiting states must not fall through to main-frame "not found",
+        # or callers lose _is_next_waiting() and may end the paper early.
+        if self._is_next_waiting(result.get('reason')):
             return result
 
         # 3. Try .icon-nextQuestion in main frame (legacy)
@@ -1029,8 +1041,7 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
         consecutive_choose_empty = 0   # Empty after choose section
         consecutive_unreachable = 0    # iframe not ready
         # Adaptive max: more questions → more tolerance
-        max_empty = min(5 + max(self.total_questions, 1) // 5, 15)
-        max_unreachable = min(8 + max(self.total_questions, 1) // 3, 25)
+        max_empty, max_unreachable = self.compute_loop_thresholds(self.total_questions)
         self.debug("Thresholds: max_empty=%d, max_unreachable=%d" % (max_empty, max_unreachable))
 
         while True:

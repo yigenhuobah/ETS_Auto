@@ -24,18 +24,17 @@ Remote info.json schema:
   }
 
 Usage:
-  from ets_remote import ETSRemote
+  from ets_remote import ETSRemote, should_block_start
   remote = ETSRemote(current_version="0.5.1")
   info = remote.check()
-  if info and not info.allow_start:
-      print("远程已关闭，程序无法启动")
-  if info and info.force_update:
-      print("版本过低，请更新到 %s" % info.latest_version)
+  # Prefer should_block_start / classify_info — unsigned kill-switch is warn-only
+  blocked, reason = should_block_start(info)
+  if blocked:
+      print(reason)
 """
 import json
 import os
 import shutil
-import sys
 import tempfile
 import time
 import urllib.error
@@ -356,8 +355,22 @@ def compare_versions(v1, v2):
     return 0
 
 
+def _remote_integrity_configured():
+    """True when HMAC or Ed25519 pubkey env is set (hard verify mode)."""
+    if os.environ.get('ETS_REMOTE_HMAC', '').strip():
+        return True
+    if os.environ.get('ETS_REMOTE_PUBKEY', '').strip():
+        return True
+    return False
+
+
 def classify_info(info):
     """Unified decision: classify RemoteInfo into block / warn / normal.
+
+    Unsigned mode (no ETS_REMOTE_HMAC / ETS_REMOTE_PUBKEY):
+      allowStart:false and force_update become **warn** (fail-open), not hard
+      block — unauthenticated remote JSON must not DoS local clients.
+    Signed mode (keys configured): keep hard **block** (fail-closed).
 
     Returns:
         (level: str, reason: str)
@@ -367,11 +380,15 @@ def classify_info(info):
     if info is None:
         return "normal", ""
 
+    hard = _remote_integrity_configured()
+
     if not info.allow_start:
-        return "block", "程序已被远程关闭"
+        msg = "程序已被远程关闭"
+        return ("block" if hard else "warn"), msg
 
     if info.force_update:
-        return "block", "版本过低，请更新到 %s" % info.latest_version
+        msg = "版本过低，请更新到 %s" % info.latest_version
+        return ("block" if hard else "warn"), msg
 
     return "normal", ""
 
@@ -399,12 +416,28 @@ class ETSRemote:
         self._last_info = None  # Cache last check result for download_pk_extra
 
     def _resolve_cache_path(self):
-        """Resolve cache file path: beside exe (PyInstaller) or beside script."""
-        if getattr(sys, 'frozen', False):
-            base = os.path.dirname(sys.executable)
-        else:
-            base = os.path.dirname(os.path.abspath(__file__))
-        return os.path.join(base, _CACHE_FILENAME)
+        """Resolve cache path via user_data_path (project root / exe side).
+
+        If a legacy cache still sits beside ets_remote.py (pre-user_data_path)
+        and the new path is missing, prefer the legacy file so offline 24h
+        cache is not silently orphaned after the path move.
+
+        Absolute _CACHE_FILENAME (used by unit tests) is honored as-is.
+        """
+        name = _CACHE_FILENAME
+        if isinstance(name, str) and os.path.isabs(name):
+            return name
+        from ets_common import user_data_path
+        primary = user_data_path(name, anchor_file=__file__)
+        if os.path.isfile(primary):
+            return primary
+        legacy = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              os.path.basename(str(name)))
+        if os.path.isfile(legacy) and os.path.normcase(
+                os.path.abspath(legacy)) != os.path.normcase(
+                os.path.abspath(primary)):
+            return legacy
+        return primary
 
     def _build_urls(self):
         """Build ordered list of mirror URLs to try."""
@@ -437,16 +470,29 @@ class ETSRemote:
             return None
 
     def _save_cache(self, data):
-        """Save fetched data to local cache file.
+        """Save fetched data to local cache file (atomic temp + replace).
 
         Uses a wrapper structure to keep internal metadata (_fetched_at, _source)
         separate from the raw remote JSON data.
         """
+        tmp_path = ''
         try:
-            with open(self._cache_path, 'w', encoding='utf-8') as f:
+            dir_name = os.path.dirname(self._cache_path) or '.'
+            os.makedirs(dir_name, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(suffix='.json', dir=dir_name)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-        except OSError:
-            pass  # Cache write failure is non-critical
+            os.replace(tmp_path, self._cache_path)
+            tmp_path = ''  # ownership transferred
+        except (OSError, TypeError, ValueError):
+            # Cache is best-effort: never abort remote check() for write/serialize
+            pass
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def _load_cache(self):
         """Load last known remote info from cache.
@@ -516,6 +562,7 @@ class ETSRemote:
             ok_int, why, payload = _verify_remote_dict(data)
             if not ok_int:
                 # Reject poisoned remote; fall through to cache if allowed
+                print("[Remote] integrity reject (live): %s" % why)
                 data = None
                 source = None
                 if not use_cache:
@@ -540,8 +587,9 @@ class ETSRemote:
             # Fail-closed for kill-switch: when HMAC/pubkey is configured,
             # re-verify the cache payload instead of trusting it blindly.
             # Without keys configured this is a no-op allowlist-only success.
-            ok_cache, _why_cache, cached_payload = _verify_remote_dict(cached_data)
+            ok_cache, why_cache, cached_payload = _verify_remote_dict(cached_data)
             if not ok_cache:
+                print("[Remote] integrity reject (cache): %s" % why_cache)
                 return None
             data = cached_payload
             source = cache_entry.get('_source', 'cache')
@@ -743,6 +791,17 @@ def format_update_message(info, current_version=""):
             lines.append("当前版本：%s → 最新版本：%s" % (current_version or "?", info.latest_version))
         else:
             lines.append("🚫 %s" % reason)
+        if info.download_url:
+            lines.append("下载地址：%s" % info.download_url)
+
+    elif level == "warn" and reason:
+        # Unsigned fail-open: surface kill-switch / minVer as advisory text
+        if info.force_update:
+            lines.append("⚠️ 版本过低，建议更新到 %s（未配置远程签名，仅提示）" % (
+                info.latest_version or "?"))
+            lines.append("当前版本：%s" % (current_version or "?"))
+        else:
+            lines.append("⚠️ %s（未配置远程签名，仅提示不拦截）" % reason)
         if info.download_url:
             lines.append("下载地址：%s" % info.download_url)
 

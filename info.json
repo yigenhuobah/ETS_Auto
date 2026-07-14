@@ -1,8 +1,8 @@
 {
-  "version": "0.6.6",
+  "version": "0.6.7",
   "minVer": "0.4.0",
   "allowStart": true,
-  "announcement": "v0.6.6: reconnect/silent-error/recording lifecycle hardening, ets_auto split (recording/RW/tee), see CHANGELOG",
+  "announcement": "v0.6.7: CDP loopback guard, unsigned remote fail-open, click_next waiting fix, remote cache hardening — see CHANGELOG",
   "pkExtraUrl": "https://raw.githubusercontent.com/yigenhuobah/ETS_Auto/main/pk_extra.json",
   "downloadUrl": "https://github.com/yigenhuobah/ETS_Auto/releases/latest"
 }

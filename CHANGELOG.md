@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.6.7] - 2026-07-14
+
+### Fixed / Hardened
+- **CDP loopback only** — `is_loopback_ws_url()` on connect/reconnect (`127/8`, `::1`, `::ffff:127.0.0.1`, expanded IPv6)
+- **`click_next` waiting** — `next_icon hidden` / `disabled` no longer falls through to main-frame `not found` (keeps `_is_next_waiting`)
+- **Unsigned remote kill-switch** — without `ETS_REMOTE_HMAC`/`ETS_REMOTE_PUBKEY`, `allowStart:false` / `force_update` are **warn** (fail-open); signed mode still hard-blocks
+- **`format_update_message`** — covers `warn` advisory text
+- **Remote cache** — path via `user_data_path` (legacy beside-module fallback); atomic temp+replace; integrity reject logged; serialize errors do not abort `check()`
+- **Console** — strategy MISMATCH prints use ASCII `[MISMATCH]` / `[FILL MISMATCH]` (GBK-safe)
+
+### Changed
+- **`compute_loop_thresholds()`** — pure helper for exam empty/unreachable caps
+- **Version** — `APP_VERSION` / `info.json` → **0.6.7**
+
+### Tests
+- Remote classify unsigned/signed; loopback URL; click_next waiting; loop thresholds
+
 ## [0.6.6] - 2026-07-13
 
 ### Fixed

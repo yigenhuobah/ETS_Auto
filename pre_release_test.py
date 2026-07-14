@@ -653,19 +653,45 @@ test("compare_versions() handles semver correctly", t_compare_versions)
 
 def t_classify_info_block():
     from ets_remote import RemoteInfo, classify_info
-    # allow_start=False → block
-    info = RemoteInfo(allow_start=False)
-    level, reason = classify_info(info)
-    assert level == 'block', f"Expected block, got {level}"
-    assert reason, f"Expected non-empty reason"
-test("classify_info() blocks when allow_start=False", t_classify_info_block)
+    old = os.environ.pop('ETS_REMOTE_HMAC', None)
+    old_pk = os.environ.pop('ETS_REMOTE_PUBKEY', None)
+    try:
+        info = RemoteInfo(allow_start=False)
+        level, reason = classify_info(info)
+        assert level == 'warn', f"Expected warn when unsigned, got {level}"
+        assert reason, "Expected non-empty reason"
+        os.environ['ETS_REMOTE_HMAC'] = 'pre-release-secret'
+        level2, _ = classify_info(info)
+        assert level2 == 'block', f"Expected block when HMAC set, got {level2}"
+    finally:
+        if old is None:
+            os.environ.pop('ETS_REMOTE_HMAC', None)
+        else:
+            os.environ['ETS_REMOTE_HMAC'] = old
+        if old_pk is None:
+            os.environ.pop('ETS_REMOTE_PUBKEY', None)
+        else:
+            os.environ['ETS_REMOTE_PUBKEY'] = old_pk
+test("classify_info() warns unsigned / blocks signed when allow_start=False", t_classify_info_block)
 
 def t_classify_info_force_update():
     from ets_remote import RemoteInfo, classify_info
-    info = RemoteInfo(allow_start=True, force_update=True, latest_version='0.7.0')
-    level, reason = classify_info(info)
-    assert level == 'block', f"Expected block, got {level}"
-test("classify_info() blocks when force_update=True", t_classify_info_force_update)
+    old = os.environ.pop('ETS_REMOTE_HMAC', None)
+    old_pk = os.environ.pop('ETS_REMOTE_PUBKEY', None)
+    try:
+        info = RemoteInfo(allow_start=True, force_update=True, latest_version='0.7.0')
+        level, reason = classify_info(info)
+        assert level == 'warn', f"Expected warn when unsigned, got {level}"
+    finally:
+        if old is None:
+            os.environ.pop('ETS_REMOTE_HMAC', None)
+        else:
+            os.environ['ETS_REMOTE_HMAC'] = old
+        if old_pk is None:
+            os.environ.pop('ETS_REMOTE_PUBKEY', None)
+        else:
+            os.environ['ETS_REMOTE_PUBKEY'] = old_pk
+test("classify_info() warns when force_update=True and unsigned", t_classify_info_force_update)
 
 def t_classify_info_normal():
     from ets_remote import RemoteInfo, classify_info
@@ -682,13 +708,29 @@ test("classify_info() returns normal for None", t_classify_info_none)
 
 def t_should_block_start():
     from ets_remote import RemoteInfo, should_block_start
-    blocked, reason = should_block_start(RemoteInfo(allow_start=False))
-    assert blocked is True
-    assert reason
-    blocked, reason = should_block_start(RemoteInfo(allow_start=True))
-    assert blocked is False
-    assert reason == ''
-test("should_block_start() matches classify_info", t_should_block_start)
+    old = os.environ.pop('ETS_REMOTE_HMAC', None)
+    old_pk = os.environ.pop('ETS_REMOTE_PUBKEY', None)
+    try:
+        blocked, reason = should_block_start(RemoteInfo(allow_start=False))
+        assert blocked is False, "unsigned kill-switch must not hard-block"
+        assert reason == ''
+        os.environ['ETS_REMOTE_HMAC'] = 'pre-release-secret'
+        blocked2, reason2 = should_block_start(RemoteInfo(allow_start=False))
+        assert blocked2 is True
+        assert reason2
+        blocked3, reason3 = should_block_start(RemoteInfo(allow_start=True))
+        assert blocked3 is False
+        assert reason3 == ''
+    finally:
+        if old is None:
+            os.environ.pop('ETS_REMOTE_HMAC', None)
+        else:
+            os.environ['ETS_REMOTE_HMAC'] = old
+        if old_pk is None:
+            os.environ.pop('ETS_REMOTE_PUBKEY', None)
+        else:
+            os.environ['ETS_REMOTE_PUBKEY'] = old_pk
+test("should_block_start() matches classify_info (unsigned warn / signed block)", t_should_block_start)
 
 def t_remote_info_to_dict():
     from ets_remote import RemoteInfo
