@@ -69,11 +69,12 @@ def user_data_path(filename, anchor_file=None):
 
 
 def constrain_ets_data_root(path, appdata=None):
-    """Normalize Pinia/appDataPath into a path under %APPDATA%\\ETS (or None).
+    """Normalize Pinia/appDataPath to the %APPDATA%\\ETS data root (or None).
 
-    - Accepts paths that already end with ETS, or parent of ETS (appends ETS).
+    - Accepts Roaming (or similar) without ETS leaf, or any path under ETS.
     - realpath + commonpath jail: must stay under APPDATA\\ETS.
-    - Returns absolute real path, or None if empty/unsafe/escapes jail.
+    - Always returns the canonical ETS root (not a subdirectory), or None
+      if empty/unsafe/escapes jail.
     """
     if path is None:
         return None
@@ -81,11 +82,10 @@ def constrain_ets_data_root(path, appdata=None):
     if not raw:
         return None
     raw = raw.replace('\\', '/').rstrip('/')
-    base_name = raw.rsplit('/', 1)[-1]
-    if base_name.upper() != 'ETS':
-        # appDataPath often points at Roaming (or similar) without ETS leaf
+    parts = [p for p in raw.split('/') if p]
+    if not any(p.upper() == 'ETS' for p in parts):
+        # appDataPath often points at Roaming without ETS leaf
         raw = raw + '/ETS'
-    # Windows path for realpath
     candidate = raw.replace('/', os.sep)
     app = appdata if appdata is not None else os.environ.get('APPDATA', '')
     if not app:
@@ -101,7 +101,8 @@ def constrain_ets_data_root(path, appdata=None):
         return None
     if common != jail:
         return None
-    return resolved
+    # Data root is always APPDATA\\ETS, never a random subfolder under it
+    return jail
 
 
 def force_utf8_stdio(line_buffering=False):

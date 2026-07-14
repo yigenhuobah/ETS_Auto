@@ -2660,6 +2660,30 @@ class TestAnswerChooseDecisions(unittest.TestCase):
         with self.assertRaises(ConnectionError):
             inst.answer_choose()
 
+    def test_cache_miss_filled_from_strategy(self):
+        """answers table miss must still use strategy.lookup (not skip)."""
+        clicks = []
+        inst = self._make(
+            [{'qid': '10_1', 'anySelected': False}],
+            answers={},  # miss
+            strat_map={'10_1': {'type': 'choose', 'answer': 'C', 'source': 'local'}},
+        )
+
+        def _eval(js):
+            clicks.append(js)
+            if 'choose_selected' in js:
+                return True
+            if 'setPCChoose2' in js or 'getElementById' in js:
+                return json.dumps({'method': 'setPCChoose2'})
+            return 1
+
+        inst.eval_js = _eval
+        any_new, _ = inst.answer_choose()
+        self.assertTrue(any_new)
+        self.assertTrue(any('10_1_3' in c for c in clicks))
+        self.assertEqual(inst.stats['choose_answered'], 1)
+        self.assertEqual(inst.answers.get('10_1', {}).get('answer'), 'C')
+
 
 class TestAnswerFillDecisions(unittest.TestCase):
     def _make(self, inputs, answers=None):
@@ -2730,6 +2754,27 @@ class TestAnswerFillDecisions(unittest.TestCase):
         inst.get_page_state = lambda: {'error': 'eval_js_failed'}
         with self.assertRaises(ConnectionError):
             inst.answer_fill()
+
+    def test_fill_miss_from_strategy(self):
+        inst = self._make(
+            [{'id': '10_1', 'value': ''}],
+            answers={},
+        )
+        class Strat:
+            def lookup(self, *a, **k):
+                return {'type': 'fill', 'answer': 'dog', 'source': 'local'}
+        inst.strategy = Strat()
+
+        def _eval(js):
+            if 'kttb_getPcBlank' in js or '__ets_recorded_fill' in js:
+                return 1
+            return json.dumps({'filled': True, 'value': 'dog'})
+
+        inst.eval_js = _eval
+        any_new, _ = inst.answer_fill()
+        self.assertTrue(any_new)
+        self.assertEqual(inst.stats['fill_answered'], 1)
+        self.assertEqual(inst.answers.get('10_1', {}).get('answer'), 'dog')
 
 
 class TestPageAndPkStateErrors(unittest.TestCase):
@@ -3159,6 +3204,11 @@ class TestConstrainEtsDataRoot(unittest.TestCase):
             # Roaming-style without ETS leaf
             got2 = ets_common.constrain_ets_data_root(app, appdata=app)
             self.assertEqual(got2, _os.path.realpath(ets))
+            # Subdir under ETS must snap to ETS root (not .../ETS/foo/ETS)
+            sub = _os.path.join(ets, '12345')
+            _os.makedirs(sub)
+            got3 = ets_common.constrain_ets_data_root(sub, appdata=app)
+            self.assertEqual(got3, _os.path.realpath(ets))
         finally:
             shutil.rmtree(app, ignore_errors=True)
 

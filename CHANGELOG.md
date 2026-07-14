@@ -3,11 +3,12 @@
 ## [0.6.8] - 2026-07-14
 
 ### Fixed
-- **M-BRIDGE** — `inject_bridge` tracks wrap identity (`__ets_wrappedChoose/Blank`); if CEF later replaces the wrap with real `kttb_*` natives, the next inject **re-hooks** and captures them as orig (no nested wrap while ours still installed)
-- **Pinia `ets_base`** — `constrain_ets_data_root()` realpath-jails under `%APPDATA%\\ETS`; rejects escape paths
+- **M-BRIDGE** — `inject_bridge` tracks wrap identity (`__ets_wrappedChoose/Blank`); if CEF later replaces the wrap with real `kttb_*` natives, the next inject **re-hooks** and captures them as orig (no nested wrap while ours still installed); `rehooked` only after prior hook
+- **Pinia `ets_base`** — `constrain_ets_data_root()` realpath-jails under `%APPDATA%\\ETS`; always returns the ETS **root** (not a random subdir); rejects escape
+- **Strategy miss fill** — `answer_choose` / `answer_fill` use `strategy.lookup` when `self.answers` misses a qid (was double-check only)
 
 ### Tests
-- `TestConstrainEtsDataRoot`, bridge re-hook markers, `TestWordPKLearnMiss`
+- `TestConstrainEtsDataRoot` (incl. subdir snaps to root), bridge re-hook markers, `TestWordPKLearnMiss`, strategy miss → answer
 
 ## [0.6.7] - 2026-07-14
 

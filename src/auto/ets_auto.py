@@ -14,7 +14,9 @@ import json, os, time, sys, threading
 from urllib.parse import urlparse, parse_qs
 from urllib.error import URLError
 
-from ets_common import APP_VERSION, ETSBase, force_utf8_stdio
+from ets_common import (
+    APP_VERSION, ETSBase, force_utf8_stdio, constrain_ets_data_root,
+)
 from ets_recording_ui import ETSRecordingMixin
 from ets_rw_mode import ETSReadWriteMixin
 from ets_tee import TeeOutput
@@ -210,7 +212,6 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
             return
         try:
             if cfg.get('appDataPath'):
-                from ets_common import constrain_ets_data_root
                 jailed = constrain_ets_data_root(cfg['appDataPath'])
                 if jailed:
                     self.ets_base = jailed
@@ -271,6 +272,7 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
             });
         }
         /* CEF replaced our wrap with native (or first inject): (re)install */
+        var wasHooked = !!win.__ets_hooked;
 
         /* Capture orig: prefer live function that is NOT our previous wrap */
         var _origChoose = null;
@@ -324,7 +326,7 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
         return JSON.stringify({
             nativeChoose: hadNativeChoose,
             nativeFill: hadNativeFill,
-            rehooked: !!(stillOurChoose === false || stillOurBlank === false)
+            rehooked: wasHooked && (!stillOurChoose || !stillOurBlank)
         });
         })()''' % self._IFRAME_FINDER
         result = self.eval_js(js)
@@ -625,14 +627,21 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
 
             all_already_done = False
             ans = self.answers.get(qid, {})
-            if ans.get('type') != 'choose':
-                self.debug("Q:%s no answer in cache" % qid)
-                continue
-
-            # ── Strategy layer double-check ──
+            # Strategy: fill miss OR double-check mismatch (composite index)
             stid_part, qid_part = (qid.rsplit('_', 1) + [''])[:2]
-            strat_ans = self.strategy.lookup('collector.choose', stid_part, qid=qid_part)
-            if strat_ans and strat_ans.get('source') == 'local':
+            strat_ans = self.strategy.lookup(
+                'collector.choose', stid_part, qid=qid_part) if self.strategy else None
+            if ans.get('type') != 'choose':
+                if strat_ans and strat_ans.get('source') in ('local', 'local_fuzzy'):
+                    ans = strat_ans
+                    self.answers[qid] = {
+                        'type': 'choose', 'answer': ans.get('answer', ''),
+                    }
+                    self.debug("Q:%s filled from strategy" % qid)
+                else:
+                    self.debug("Q:%s no answer in cache" % qid)
+                    continue
+            elif strat_ans and strat_ans.get('source') == 'local':
                 strat_letter = strat_ans['answer'].upper()
                 if strat_letter != ans['answer'].upper():
                     print("  [MISMATCH] Q:%s: answers=%s strategy=%s — using strategy" % (
@@ -733,14 +742,20 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
                 continue
 
             ans = self.answers.get(inp_id, {})
-            if ans.get('type') != 'fill':
-                self.debug("No fill answer for: " + inp_id)
-                continue
-
-            # ── Strategy layer double-check ──
             stid_part, qid_part = (inp_id.rsplit('_', 1) + [''])[:2]
-            strat_ans = self.strategy.lookup('collector.fill', stid_part, qid=qid_part)
-            if strat_ans and strat_ans.get('source') == 'local':
+            strat_ans = self.strategy.lookup(
+                'collector.fill', stid_part, qid=qid_part) if self.strategy else None
+            if ans.get('type') != 'fill':
+                if strat_ans and strat_ans.get('source') in ('local', 'local_fuzzy'):
+                    ans = strat_ans
+                    self.answers[inp_id] = {
+                        'type': 'fill', 'answer': ans.get('answer', ''),
+                    }
+                    self.debug("Fill %s from strategy" % inp_id)
+                else:
+                    self.debug("No fill answer for: " + inp_id)
+                    continue
+            elif strat_ans and strat_ans.get('source') == 'local':
                 if strat_ans['answer'].strip().lower() != ans['answer'].strip().lower():
                     print("  [FILL MISMATCH] %s: answers=%s strategy=%s — using strategy" % (
                         inp_id, ans['answer'], strat_ans['answer']))
