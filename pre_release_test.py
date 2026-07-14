@@ -651,11 +651,31 @@ def t_compare_versions():
     assert compare_versions('0.6.1', '0.6.10') == -1, "0.6.1 < 0.6.10"
 test("compare_versions() handles semver correctly", t_compare_versions)
 
+def _cleared_remote_integrity_env():
+    """Context manager: clear integrity env; restore previous values on exit."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _cm():
+        old_h = os.environ.pop('ETS_REMOTE_HMAC', None)
+        old_p = os.environ.pop('ETS_REMOTE_PUBKEY', None)
+        try:
+            yield
+        finally:
+            if old_h is None:
+                os.environ.pop('ETS_REMOTE_HMAC', None)
+            else:
+                os.environ['ETS_REMOTE_HMAC'] = old_h
+            if old_p is None:
+                os.environ.pop('ETS_REMOTE_PUBKEY', None)
+            else:
+                os.environ['ETS_REMOTE_PUBKEY'] = old_p
+    return _cm()
+
+
 def t_classify_info_block():
     from ets_remote import RemoteInfo, classify_info
-    old = os.environ.pop('ETS_REMOTE_HMAC', None)
-    old_pk = os.environ.pop('ETS_REMOTE_PUBKEY', None)
-    try:
+    with _cleared_remote_integrity_env():
         info = RemoteInfo(allow_start=False)
         level, reason = classify_info(info)
         assert level == 'warn', f"Expected warn when unsigned, got {level}"
@@ -663,34 +683,14 @@ def t_classify_info_block():
         os.environ['ETS_REMOTE_HMAC'] = 'pre-release-secret'
         level2, _ = classify_info(info)
         assert level2 == 'block', f"Expected block when HMAC set, got {level2}"
-    finally:
-        if old is None:
-            os.environ.pop('ETS_REMOTE_HMAC', None)
-        else:
-            os.environ['ETS_REMOTE_HMAC'] = old
-        if old_pk is None:
-            os.environ.pop('ETS_REMOTE_PUBKEY', None)
-        else:
-            os.environ['ETS_REMOTE_PUBKEY'] = old_pk
 test("classify_info() warns unsigned / blocks signed when allow_start=False", t_classify_info_block)
 
 def t_classify_info_force_update():
     from ets_remote import RemoteInfo, classify_info
-    old = os.environ.pop('ETS_REMOTE_HMAC', None)
-    old_pk = os.environ.pop('ETS_REMOTE_PUBKEY', None)
-    try:
+    with _cleared_remote_integrity_env():
         info = RemoteInfo(allow_start=True, force_update=True, latest_version='0.7.0')
         level, reason = classify_info(info)
         assert level == 'warn', f"Expected warn when unsigned, got {level}"
-    finally:
-        if old is None:
-            os.environ.pop('ETS_REMOTE_HMAC', None)
-        else:
-            os.environ['ETS_REMOTE_HMAC'] = old
-        if old_pk is None:
-            os.environ.pop('ETS_REMOTE_PUBKEY', None)
-        else:
-            os.environ['ETS_REMOTE_PUBKEY'] = old_pk
 test("classify_info() warns when force_update=True and unsigned", t_classify_info_force_update)
 
 def t_classify_info_normal():
@@ -708,9 +708,7 @@ test("classify_info() returns normal for None", t_classify_info_none)
 
 def t_should_block_start():
     from ets_remote import RemoteInfo, should_block_start
-    old = os.environ.pop('ETS_REMOTE_HMAC', None)
-    old_pk = os.environ.pop('ETS_REMOTE_PUBKEY', None)
-    try:
+    with _cleared_remote_integrity_env():
         blocked, reason = should_block_start(RemoteInfo(allow_start=False))
         assert blocked is False, "unsigned kill-switch must not hard-block"
         assert reason == ''
@@ -721,15 +719,6 @@ def t_should_block_start():
         blocked3, reason3 = should_block_start(RemoteInfo(allow_start=True))
         assert blocked3 is False
         assert reason3 == ''
-    finally:
-        if old is None:
-            os.environ.pop('ETS_REMOTE_HMAC', None)
-        else:
-            os.environ['ETS_REMOTE_HMAC'] = old
-        if old_pk is None:
-            os.environ.pop('ETS_REMOTE_PUBKEY', None)
-        else:
-            os.environ['ETS_REMOTE_PUBKEY'] = old_pk
 test("should_block_start() matches classify_info (unsigned warn / signed block)", t_should_block_start)
 
 def t_remote_info_to_dict():

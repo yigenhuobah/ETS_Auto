@@ -25,11 +25,30 @@ import unittest
 import tempfile
 import shutil
 import time
+from contextlib import contextmanager
 
 _SysPath = _os.path.dirname(_os.path.abspath(__file__))
 _SrcAuto  = _os.path.dirname(_SysPath)
 if _SrcAuto not in _sys.path:
     _sys.path.insert(0, _SrcAuto)
+
+
+@contextmanager
+def _cleared_remote_integrity_env():
+    """Temporarily clear ETS_REMOTE_HMAC / ETS_REMOTE_PUBKEY for unsigned-mode tests."""
+    old_h = _os.environ.pop('ETS_REMOTE_HMAC', None)
+    old_p = _os.environ.pop('ETS_REMOTE_PUBKEY', None)
+    try:
+        yield
+    finally:
+        if old_h is None:
+            _os.environ.pop('ETS_REMOTE_HMAC', None)
+        else:
+            _os.environ['ETS_REMOTE_HMAC'] = old_h
+        if old_p is None:
+            _os.environ.pop('ETS_REMOTE_PUBKEY', None)
+        else:
+            _os.environ['ETS_REMOTE_PUBKEY'] = old_p
 
 # ── Mock heavy dependencies before importing target modules ────────────────────
 # These modules require websocket, customtkinter, etc. which may not be installed.
@@ -857,9 +876,7 @@ class TestRemoteClassifyInfo(unittest.TestCase):
     def test_allow_start_false_is_warn_when_unsigned(self):
         """Without integrity keys, unauthenticated kill-switch is warn (fail-open)."""
         import ets_remote
-        old = _os.environ.pop('ETS_REMOTE_HMAC', None)
-        old_pk = _os.environ.pop('ETS_REMOTE_PUBKEY', None)
-        try:
+        with _cleared_remote_integrity_env():
             info = self._ri(allow_start=False)
             level, reason = self._ci(info)
             self.assertEqual(level, 'warn')
@@ -867,33 +884,13 @@ class TestRemoteClassifyInfo(unittest.TestCase):
             _os.environ['ETS_REMOTE_HMAC'] = 'unit-test-secret'
             level2, _ = ets_remote.classify_info(info)
             self.assertEqual(level2, 'block')
-        finally:
-            if old is None:
-                _os.environ.pop('ETS_REMOTE_HMAC', None)
-            else:
-                _os.environ['ETS_REMOTE_HMAC'] = old
-            if old_pk is None:
-                _os.environ.pop('ETS_REMOTE_PUBKEY', None)
-            else:
-                _os.environ['ETS_REMOTE_PUBKEY'] = old_pk
 
     def test_force_update_is_warn_when_unsigned(self):
-        old = _os.environ.pop('ETS_REMOTE_HMAC', None)
-        old_pk = _os.environ.pop('ETS_REMOTE_PUBKEY', None)
-        try:
+        with _cleared_remote_integrity_env():
             info = self._ri(allow_start=True, force_update=True)
             level, reason = self._ci(info)
             self.assertEqual(level, 'warn')
             self.assertIn('版本过低', reason)
-        finally:
-            if old is None:
-                _os.environ.pop('ETS_REMOTE_HMAC', None)
-            else:
-                _os.environ['ETS_REMOTE_HMAC'] = old
-            if old_pk is None:
-                _os.environ.pop('ETS_REMOTE_PUBKEY', None)
-            else:
-                _os.environ['ETS_REMOTE_PUBKEY'] = old_pk
 
     def test_update_available_is_normal(self):
         info = self._ri(allow_start=True, force_update=False, update_available=True)
@@ -953,9 +950,7 @@ class TestRemoteETSSystem(unittest.TestCase):
 
     def test_should_block_start(self):
         import ets_remote
-        old = _os.environ.pop('ETS_REMOTE_HMAC', None)
-        old_pk = _os.environ.pop('ETS_REMOTE_PUBKEY', None)
-        try:
+        with _cleared_remote_integrity_env():
             info = self._ri_class(allow_start=False)
             blocked, reason = ets_remote.should_block_start(info)
             self.assertFalse(blocked)
@@ -964,15 +959,6 @@ class TestRemoteETSSystem(unittest.TestCase):
             blocked2, reason2 = ets_remote.should_block_start(info)
             self.assertTrue(blocked2)
             self.assertEqual(reason2, '程序已被远程关闭')
-        finally:
-            if old is None:
-                _os.environ.pop('ETS_REMOTE_HMAC', None)
-            else:
-                _os.environ['ETS_REMOTE_HMAC'] = old
-            if old_pk is None:
-                _os.environ.pop('ETS_REMOTE_PUBKEY', None)
-            else:
-                _os.environ['ETS_REMOTE_PUBKEY'] = old_pk
 
     def test_should_not_block_normal(self):
         import ets_remote
@@ -982,23 +968,12 @@ class TestRemoteETSSystem(unittest.TestCase):
 
     def test_format_update_message_warn_when_unsigned_kill_switch(self):
         import ets_remote
-        old = _os.environ.pop('ETS_REMOTE_HMAC', None)
-        old_pk = _os.environ.pop('ETS_REMOTE_PUBKEY', None)
-        try:
+        with _cleared_remote_integrity_env():
             info = self._ri_class(allow_start=False, announcement='')
             msg = ets_remote.format_update_message(info, current_version='0.6.7')
             self.assertIsNotNone(msg)
             self.assertIn('程序已被远程关闭', msg)
             self.assertIn('仅提示', msg)
-        finally:
-            if old is None:
-                _os.environ.pop('ETS_REMOTE_HMAC', None)
-            else:
-                _os.environ['ETS_REMOTE_HMAC'] = old
-            if old_pk is None:
-                _os.environ.pop('ETS_REMOTE_PUBKEY', None)
-            else:
-                _os.environ['ETS_REMOTE_PUBKEY'] = old_pk
 
     def test_format_update_message_update_available(self):
         import ets_remote
@@ -2866,22 +2841,14 @@ class TestLoopThresholds(unittest.TestCase):
 class TestClickNextWaiting(unittest.TestCase):
     def _make(self):
         import ets_auto
+        from ets_common import ETSBase
         inst = object.__new__(ets_auto.ETSAutoAnswer)
         inst.debug_mode = False
         inst.debug = lambda *a, **k: None
         inst._IFRAME_FINDER = 'var iframe = null'
         inst.stats = {'next_click': 0}
-        inst.parse_eval_json = ets_auto.ETSAutoAnswer.parse_eval_json.__get__(inst) \
-            if hasattr(ets_auto.ETSAutoAnswer, 'parse_eval_json') else None
-        # Prefer instance method from ETSBase if present
-        if hasattr(inst, 'parse_eval_json') is False or inst.parse_eval_json is None:
-            if hasattr(ets_auto.ETSAutoAnswer, 'parse_eval_json'):
-                inst.parse_eval_json = (
-                    ets_auto.ETSAutoAnswer.parse_eval_json.__get__(inst))
-            else:
-                # ETSBase mixin
-                from ets_common import ETSBase
-                inst.parse_eval_json = ETSBase.parse_eval_json.__get__(inst)
+        # parse_eval_json lives on ETSBase; bind explicitly for object.__new__
+        inst.parse_eval_json = ETSBase.parse_eval_json.__get__(inst)
         inst.click_next = ets_auto.ETSAutoAnswer.click_next.__get__(inst)
         inst._is_next_waiting = ets_auto.ETSAutoAnswer._is_next_waiting
         return inst

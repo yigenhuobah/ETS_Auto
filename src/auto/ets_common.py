@@ -20,9 +20,6 @@ def is_loopback_ws_url(ws_url):
 
     CDP attach is a high-privilege local control plane; reject non-loopback
     hosts even if the /json listing somehow points elsewhere.
-
-    Accepts common loopback spellings: 127.0.0.1, localhost, ::1,
-    IPv4-mapped ::ffff:127.0.0.1, expanded IPv6 loopback, and 127.0.0.0/8.
     """
     if not ws_url or not isinstance(ws_url, str):
         return False
@@ -37,17 +34,18 @@ def is_loopback_ws_url(ws_url):
         return False
     if '%' in host:
         host = host.split('%', 1)[0]
-    if host in ('127.0.0.1', 'localhost', '::1'):
+    if host == 'localhost':
         return True
-    if host in ('::ffff:127.0.0.1', '0:0:0:0:0:ffff:127.0.0.1'):
-        return True
-    if host in ('0:0:0:0:0:0:0:1', '0000:0000:0000:0000:0000:0000:0000:0001'):
-        return True
-    if host.startswith('127.'):
-        parts = host.split('.')
-        if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+    try:
+        import ipaddress
+        addr = ipaddress.ip_address(host)
+        if addr.is_loopback:
             return True
-    return False
+        # IPv4-mapped IPv6 (::ffff:127.0.0.1) is not .is_loopback in stdlib
+        mapped = getattr(addr, 'ipv4_mapped', None)
+        return bool(mapped is not None and mapped.is_loopback)
+    except ValueError:
+        return False
 
 
 def user_data_path(filename, anchor_file=None):

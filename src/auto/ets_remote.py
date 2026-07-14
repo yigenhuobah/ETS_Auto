@@ -357,11 +357,10 @@ def compare_versions(v1, v2):
 
 def _remote_integrity_configured():
     """True when HMAC or Ed25519 pubkey env is set (hard verify mode)."""
-    if os.environ.get('ETS_REMOTE_HMAC', '').strip():
-        return True
-    if os.environ.get('ETS_REMOTE_PUBKEY', '').strip():
-        return True
-    return False
+    return bool(
+        os.environ.get('ETS_REMOTE_HMAC', '').strip()
+        or os.environ.get('ETS_REMOTE_PUBKEY', '').strip()
+    )
 
 
 def classify_info(info):
@@ -380,15 +379,13 @@ def classify_info(info):
     if info is None:
         return "normal", ""
 
-    hard = _remote_integrity_configured()
-
     if not info.allow_start:
         msg = "程序已被远程关闭"
-        return ("block" if hard else "warn"), msg
+        return ("block" if _remote_integrity_configured() else "warn"), msg
 
     if info.force_update:
         msg = "版本过低，请更新到 %s" % info.latest_version
-        return ("block" if hard else "warn"), msg
+        return ("block" if _remote_integrity_configured() else "warn"), msg
 
     return "normal", ""
 
@@ -425,17 +422,17 @@ class ETSRemote:
         Absolute _CACHE_FILENAME (used by unit tests) is honored as-is.
         """
         name = _CACHE_FILENAME
-        if isinstance(name, str) and os.path.isabs(name):
-            return name
+        if os.path.isabs(name):
+            return name  # unit tests may override with an absolute path
         from ets_common import user_data_path
         primary = user_data_path(name, anchor_file=__file__)
         if os.path.isfile(primary):
             return primary
         legacy = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              os.path.basename(str(name)))
-        if os.path.isfile(legacy) and os.path.normcase(
-                os.path.abspath(legacy)) != os.path.normcase(
-                os.path.abspath(primary)):
+                              os.path.basename(name))
+        if (os.path.isfile(legacy)
+                and os.path.normcase(os.path.abspath(legacy))
+                != os.path.normcase(os.path.abspath(primary))):
             return legacy
         return primary
 
@@ -475,24 +472,11 @@ class ETSRemote:
         Uses a wrapper structure to keep internal metadata (_fetched_at, _source)
         separate from the raw remote JSON data.
         """
-        tmp_path = ''
         try:
-            dir_name = os.path.dirname(self._cache_path) or '.'
-            os.makedirs(dir_name, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(suffix='.json', dir=dir_name)
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, self._cache_path)
-            tmp_path = ''  # ownership transferred
+            _atomic_write_json(self._cache_path, data)
         except (OSError, TypeError, ValueError):
             # Cache is best-effort: never abort remote check() for write/serialize
             pass
-        finally:
-            if tmp_path:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
 
     def _load_cache(self):
         """Load last known remote info from cache.
@@ -784,37 +768,33 @@ def format_update_message(info, current_version=""):
 
     level, reason = classify_info(info)
     lines = []
+    cur = current_version or "?"
+    latest = info.latest_version or "?"
 
-    if level == "block":
+    if level in ("block", "warn") and reason:
+        # Shared body for hard-block vs unsigned advisory (wording only differs)
         if info.force_update:
-            lines.append("⚠️ 版本过低，必须更新！")
-            lines.append("当前版本：%s → 最新版本：%s" % (current_version or "?", info.latest_version))
-        else:
+            if level == "block":
+                lines.append("⚠️ 版本过低，必须更新！")
+                lines.append("当前版本：%s → 最新版本：%s" % (cur, latest))
+            else:
+                lines.append("⚠️ 版本过低，建议更新到 %s（未配置远程签名，仅提示）" % latest)
+                lines.append("当前版本：%s" % cur)
+        elif level == "block":
             lines.append("🚫 %s" % reason)
-        if info.download_url:
-            lines.append("下载地址：%s" % info.download_url)
-
-    elif level == "warn" and reason:
-        # Unsigned fail-open: surface kill-switch / minVer as advisory text
-        if info.force_update:
-            lines.append("⚠️ 版本过低，建议更新到 %s（未配置远程签名，仅提示）" % (
-                info.latest_version or "?"))
-            lines.append("当前版本：%s" % (current_version or "?"))
         else:
             lines.append("⚠️ %s（未配置远程签名，仅提示不拦截）" % reason)
         if info.download_url:
             lines.append("下载地址：%s" % info.download_url)
 
     elif info.update_available:
-        lines.append("🔄 发现新版本：%s（当前 %s）" % (info.latest_version, current_version or "?"))
+        lines.append("🔄 发现新版本：%s（当前 %s）" % (latest, cur))
         if info.download_url:
             lines.append("下载地址：%s" % info.download_url)
 
     if info.announcement:
         lines.append("")
         lines.append("📢 %s" % info.announcement)
-
-    # Don't duplicate block reason in message — classify_info already handles it
 
     return '\n'.join(lines) if lines else None
 
