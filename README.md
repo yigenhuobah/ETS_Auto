@@ -26,7 +26,7 @@
 - ✅ **录音页等待** — 到达录音题提示手动完成，提交后自动继续
 - ✅ **全局热键** — F9 暂停 / F10 跳过 / F12 停止
 - ✅ **GUI 进度条** — 实时显示已完成/总数
-- ✅ **远程配置（可选网络）** — 版本检查/杀开关/公告；**答案仍纯本地**，不上传题目
+- ✅ **远程配置（可选网络）** — 版本检查/公告/pk_extra 热更；未配置签名时远程关停仅为**提示**（不硬拦）；**答案仍纯本地**
 
 ---
 
@@ -120,7 +120,7 @@ python src/auto/tests/test_unit.py
 
 ```text
 # ── 套卷答题 ──
-ETS Auto v0.6.6
+ETS Auto v0.6.7
 ========================================
 ETS connected
 Loaded 21 answers (set_id=721920)
@@ -240,6 +240,9 @@ ETS_Auto/
     ├── ets_gui.py                # ★ 图形界面 (CustomTkinter)
     ├── ets_parser.py             # ★ 离线试卷浏览器数据层
     ├── ets_browser_ui.py         # 离线浏览 UI
+    ├── ets_recording_ui.py       # 录音参考窗 mixin
+    ├── ets_rw_mode.py            # 读写同步 mixin
+    ├── ets_tee.py                # CLI Tee 输出
     └── run.py                    # 统一入口 (exam|pk|gui)
 
 ```
@@ -255,9 +258,11 @@ ETS_Auto/
 * [x] **傻瓜式 GUI 界面** —— CustomTkinter 可视化窗口，点点鼠标即可完成。 ✅ v0.4.0
 * [x] **离线试卷浏览器** —— 扫描本地缓存，红字高亮正确答案，支持五种题型。 ✅ v0.4.0
 * [x] **热键支持** —— F9 暂停 / F10 跳过 / F12 停止（全局 RegisterHotKey）。 ✅ v0.5+
-* [x] **断连恢复** —— CDP `reconnect()` + 套卷/PK/RW 自动重连与 bridge 重注入。 ✅ v0.6.3–0.6.5
-* [x] **策略层双重验证** —— 复合 key 索引 + 模糊 + DOM 回退；`set_id` 数字校验。 ✅ v0.5–0.6.5
-* [x] **远程配置** —— 版本/杀开关/公告/pk_extra 热更；可选 HMAC/Ed25519 完整性。 ✅ v0.6.0–0.6.5
+* [x] **断连恢复** —— CDP `reconnect()` + 套卷/PK/RW 自动重连与 bridge 重注入。 ✅ v0.6.3–0.6.7
+* [x] **策略层双重验证** —— 复合 key 索引 + 模糊 + DOM 回退；`set_id` 数字校验。 ✅ v0.5–0.6.7
+* [x] **远程配置** —— 版本/公告/pk_extra；未签名 kill-switch 为 warn；可选 HMAC/Ed25519。 ✅ v0.6.0–0.6.7
+* [x] **模块 mixin 拆分** —— recording / RW / tee。 ✅ v0.6.6
+* [x] **CDP loopback + next 等待态** —— 非本机 debugger 拒绝；`next_icon hidden` 不提前收卷。 ✅ v0.6.7
 * [ ] **作业模式全量真机验收** — 真实作业卷提交链路（桥接已做，缺稳定作业卷回归）
 
 > **注**：由于移动端系统级权限管控，本脚本目前及未来均**不计划**兼容 Android 或 iOS 平台。如果有移动端相关需求，请尝试开源社区的其他相关库吧（如 `Fuck_ets100`，适用于安卓设备的答案检索工具）。

@@ -2875,6 +2875,93 @@ class TestClickNextWaiting(unittest.TestCase):
         self.assertTrue(inst._is_next_waiting(r.get('reason')))
 
 
+class TestInjectBridgeContract(unittest.TestCase):
+    """Offline contract checks for inject_bridge JS assembly (no CDP)."""
+
+    def _make(self):
+        import ets_auto
+        from ets_common import ETSBase
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.debug_mode = False
+        inst.debug = lambda *a, **k: None
+        inst._IFRAME_FINDER = 'var iframe = null;'
+        inst.parse_eval_json = ETSBase.parse_eval_json.__get__(inst)
+        inst.inject_bridge = ets_auto.ETSAutoAnswer.inject_bridge.__get__(inst)
+        return inst
+
+    def test_js_contains_wrap_markers_and_drain_cap(self):
+        inst = self._make()
+        captured = []
+
+        def _eval(js):
+            captured.append(js)
+            return json.dumps({'nativeChoose': True, 'nativeFill': False})
+
+        inst.eval_js = _eval
+        info = inst.inject_bridge()
+        self.assertTrue(info.get('nativeChoose'))
+        src = captured[0]
+        self.assertIn('__ets_hooked', src)
+        self.assertIn('kttb_ReturnChoose', src)
+        self.assertIn('_origChoose', src)
+        self.assertIn('kttb_returnPcBlank', src)
+        self.assertIn('> 200', src)
+        self.assertIn('slice(-100)', src)
+        # wrap-before-record: original call appears before push into recorded
+        self.assertLess(src.find('_origChoose(data)'), src.find('__ets_recorded.push'))
+
+    def test_invalid_or_empty_eval_returns_empty_dict(self):
+        inst = self._make()
+        inst.eval_js = lambda js: 'not-json{'
+        self.assertEqual(inst.inject_bridge(), {})
+        inst.eval_js = lambda js: None
+        self.assertEqual(inst.inject_bridge(), {})
+
+
+class TestGoldenFixtures(unittest.TestCase):
+    """Synthetic content.json under tests/fixtures/sets/ (Project offline golden).
+
+    Skips when fixtures are absent (e.g. Auto tree without fixtures synced).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fix_root = _os.path.join(_SysPath, 'fixtures', 'sets')
+        cls.set_id = '900001'
+        cls.available = _os.path.isdir(_os.path.join(cls.fix_root, cls.set_id))
+
+    def setUp(self):
+        if not self.available:
+            self.skipTest('fixtures/sets/900001 not present')
+        import ets_strategy
+        ets_strategy.ETSStrategy._set_cache = {}
+        ets_strategy.ETSStrategy._set_cache_order = []
+
+    def tearDown(self):
+        if not self.available:
+            return
+        import ets_strategy
+        ets_strategy.ETSStrategy._set_cache = {}
+        ets_strategy.ETSStrategy._set_cache_order = []
+
+    def test_load_set_composite_keys(self):
+        import ets_strategy
+        s = ets_strategy.ETSStrategy()
+        ok = s.load_set(self.set_id, data_dir=self.fix_root)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(s.sections), 3)
+        ans = s.lookup('collector.choose', '100', qid='1')
+        self.assertIsNotNone(ans)
+        self.assertEqual(ans.get('answer', '').upper(), 'B')
+        fill = s.lookup('collector.fill', '200', qid='1')
+        self.assertIsNotNone(fill)
+        self.assertEqual(fill.get('answer', '').lower(), 'colour')
+        role = s.lookup('collector.role', '300', qid='q1')
+        self.assertIsNotNone(role)
+        self.assertEqual(role.get('type'), 'oral')
+        self.assertTrue(role.get('variants'))
+
+
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
