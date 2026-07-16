@@ -690,6 +690,18 @@ class ETSApp(ctk.CTk):
         No global monkey-patching of time.sleep."""
         self._worker_error = False
         try:
+            from ets_compat import (
+                collect_compatibility_report,
+                format_compatibility_report,
+            )
+            report = collect_compatibility_report(
+                port=port, mode=mode, timeout=5.0)
+            print(format_compatibility_report(report))
+            if not report.get('ok'):
+                print("\n[错误] ETS 兼容性检查未通过，已取消启动")
+                self._worker_error = True
+                return
+
             if mode == self.MODE_EXAM:
                 from ets_auto import ETSAutoAnswer
                 auto = ETSAutoAnswer(port=port, debug_mode=debug,

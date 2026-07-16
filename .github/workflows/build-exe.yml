@@ -34,6 +34,7 @@ jobs:
           pyinstaller --onefile --noconsole
           --hidden-import=websocket
           --hidden-import=ets_common
+          --hidden-import=ets_compat
           --hidden-import=ets_auto
           --hidden-import=ets_word_pk
           --hidden-import=ets_strategy
@@ -73,19 +74,19 @@ jobs:
           --name ets_pk src/auto/ets_word_pk.py
 
       - name: Upload GUI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ets_gui.exe
           path: dist/ets_gui.exe
 
       - name: Upload exam artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ets_auto.exe
           path: dist/ets_auto.exe
 
       - name: Upload PK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ets_pk.exe
           path: dist/ets_pk.exe

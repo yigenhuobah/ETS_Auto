@@ -35,6 +35,12 @@ def t_import_common():
     import ets_common
     assert hasattr(ets_common, 'ETSBase'), "ETSBase not found in ets_common"
 test("import ets_common + ETSBase exists", t_import_common)
+def t_import_compat():
+    import ets_compat
+    assert callable(ets_compat.collect_compatibility_report)
+    assert callable(ets_compat.format_compatibility_report)
+test("import ets_compat + compatibility API exists", t_import_compat)
+
 
 def t_import_auto():
     import ets_auto
@@ -165,20 +171,37 @@ test("requirements.txt exists with >=3 deps", test_requirements)
 # ── 5. GUI Widget Smoke Tests ─────────────────────────────
 print("\n=== GUI Widget Tests ===")
 
+def _destroy_ctk_root(root):
+    """Cancel CustomTkinter timers before destroying its Tcl interpreter."""
+    try:
+        callback_ids = root.tk.call('after', 'info')
+        if isinstance(callback_ids, str):
+            callback_ids = (callback_ids,) if callback_ids else ()
+        for callback_id in callback_ids:
+            try:
+                # Widget.destroy() still owns and deletes the registered Tcl command.
+                root.tk.call('after', 'cancel', callback_id)
+            except Exception:
+                pass
+    finally:
+        root.destroy()
+
 def t_gui_widgets():
     import customtkinter as ctk
     root = ctk.CTk()
-    # CTkEntry does NOT support command=; only bind() works
-    entry = ctk.CTkEntry(root, placeholder_text="test")
-    entry.bind('<Return>', lambda e: None)  # This should work
-    # Verify configure() only accepts valid CTkEntry kwargs
     try:
-        entry.configure(command=lambda: None)
-        root.destroy()
-        raise AssertionError("CTkEntry.configure(command=...) should raise ValueError")
-    except ValueError:
-        pass  # Expected - command is not a valid CTkEntry argument
-    root.destroy()
+        # CTkEntry does NOT support command=; only bind() works
+        entry = ctk.CTkEntry(root, placeholder_text="test")
+        entry.bind('<Return>', lambda e: None)  # This should work
+        # Verify configure() only accepts valid CTkEntry kwargs
+        try:
+            entry.configure(command=lambda: None)
+        except ValueError:
+            pass  # Expected - command is not a valid CTkEntry argument
+        else:
+            raise AssertionError("CTkEntry.configure(command=...) should raise ValueError")
+    finally:
+        _destroy_ctk_root(root)
 test("CTkEntry widget creation + bind (no command=)", t_gui_widgets)
 
 def t_gui_parser_tab():
@@ -186,15 +209,17 @@ def t_gui_parser_tab():
     import customtkinter as ctk
     from ets_parser import create_browser_tab
     root = ctk.CTk()
-    tab = ctk.CTkFrame(root)
-    tab.pack()
     try:
-        create_browser_tab(tab)
-    except Exception as e:
-        # If ETS data dir doesn't exist, that's fine - just no crash from widget code
-        if 'ETS' not in str(e) and 'AppData' not in str(e) and 'scan_sets' not in str(e):
-            raise
-    root.destroy()
+        tab = ctk.CTkFrame(root)
+        tab.pack()
+        try:
+            create_browser_tab(tab)
+        except Exception as e:
+            # If ETS data dir doesn't exist, that's fine - just no crash from widget code
+            if 'ETS' not in str(e) and 'AppData' not in str(e) and 'scan_sets' not in str(e):
+                raise
+    finally:
+        _destroy_ctk_root(root)
 test("create_browser_tab() widget creation", t_gui_parser_tab)
 
 # ── 6. Syntax check all .py files ──────────────────────────
@@ -202,19 +227,22 @@ print("\n=== Syntax Check ===")
 
 def t_syntax_all():
     import py_compile
+    import tempfile
     py_files = []
     for name in [
         'ets_common.py', 'ets_auto.py', 'ets_word_pk.py', 'ets_parser.py',
         'ets_browser_ui.py', 'ets_remote.py', 'ets_gui.py', 'run.py',
-        'ets_strategy.py', 'ets_hotkey.py',
+        'ets_strategy.py', 'ets_hotkey.py', 'ets_compat.py',
     ]:
         fpath = os.path.join(SRC, name)
         if os.path.exists(fpath):
             py_files.append((name, fpath))
         else:
             raise AssertionError("required module missing for py_compile: %s" % name)
-    for name, fpath in py_files:
-        py_compile.compile(fpath, doraise=True)
+    with tempfile.TemporaryDirectory(prefix='ets_compile_') as compile_dir:
+        for name, fpath in py_files:
+            cfile = os.path.join(compile_dir, name + 'c')
+            py_compile.compile(fpath, cfile=cfile, doraise=True)
 test("all .py files pass py_compile (incl. strategy/hotkey)", t_syntax_all)
 
 # ── 7. Strategy layer tests ────────────────────────────────
@@ -832,7 +860,15 @@ def t_app_version_single_source():
             info = json.load(f)
         assert info.get('version') == APP_VERSION, (
             f"info.json version={info.get('version')!r} != {APP_VERSION!r}")
-test("APP_VERSION single-source matches auto/pk/gui/info.json", t_app_version_single_source)
+    # Project-only metadata should not silently lag behind the release version.
+    project_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'pyproject.toml')
+    if os.path.isfile(project_path):
+        import tomllib
+        with open(project_path, 'rb') as f:
+            project_meta = tomllib.load(f)
+        assert project_meta.get('project', {}).get('version') == APP_VERSION, (
+            f"pyproject.toml version={project_meta.get('project', {}).get('version')!r} != {APP_VERSION!r}")
+test("APP_VERSION matches auto/pk/gui/info.json/pyproject", t_app_version_single_source)
 
 def t_user_data_path_basename():
     from ets_common import user_data_path

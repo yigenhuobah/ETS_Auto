@@ -86,6 +86,10 @@ git clone https://github.com/yigenhuobah/ETS_Auto.git
 cd ETS_Auto
 pip install -r requirements.txt
 
+# 可选：答题前做一次只读兼容性体检
+python src/auto/run.py check --mode exam
+python src/auto/run.py check --mode pk --json
+
 # 2. 运行图形界面 (推荐)
 python src/auto/ets_gui.py
 
@@ -120,7 +124,7 @@ python src/auto/tests/test_unit.py
 
 ```text
 # ── 套卷答题 ──
-ETS Auto v0.6.8
+ETS Auto v0.6.9
 ========================================
 ETS connected
 Loaded 21 answers (set_id=721920)

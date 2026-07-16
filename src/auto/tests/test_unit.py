@@ -12,7 +12,8 @@ Run:
 
 Architecture:
     Each test class targets one module.  All mocks are self-contained.
-    No fixtures, no pytest, no conftest — runs on stdlib unittest only.
+    Release-critical fixtures are created in temporary directories. Optional
+    golden fixtures may be skipped. No pytest or conftest is required.
 
 ─────────────────────────────────────────────────────────────────────────────
 """
@@ -288,6 +289,31 @@ class TestETSStrategy(unittest.TestCase):
         self.assertIn('collector.choose_s1_1', s.answer_index)
         self.assertIn('collector.fill_s2_1', s.answer_index)
         self.assertIn('collector.picture_s3', s.answer_index)
+
+    def test_invalid_content_does_not_hide_valid_sections(self):
+        from unittest.mock import patch
+
+        set_id = '900002'
+        _make_exam_cache(self.cache_root, set_id, [
+            ('content_1', _make_content_json('collector.choose', {
+                'stid': 'valid',
+                'xtlist': [{'xt_xh': '1', 'answer': 'B'}],
+            })),
+            ('content_2', '[]'),
+        ])
+        strategy = self.Strategy()
+        with patch('builtins.print') as mock_print:
+            self.assertTrue(strategy.load_set(set_id))
+
+        mock_print.assert_any_call(
+            '  strategy skip content_2: expected JSON object')
+        self.assertEqual(
+            [section['dir'] for section in strategy.sections],
+            ['content_1'],
+        )
+        answer = strategy.lookup('collector.choose', 'valid', qid='1')
+        self.assertIsNotNone(answer)
+        self.assertEqual(answer.get('answer'), 'B')
 
     # ── lookup() ─────────────────────────────────────────────────────────────
 
@@ -3458,6 +3484,282 @@ class TestFormatUpdateMessageLevels(unittest.TestCase):
             self.assertIn('hi', msg_u)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TestCompatibilityPreflight — read-only ETS/CDP contract report
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCompatibilityPreflight(unittest.TestCase):
+    class _Response:
+        def __init__(self, payload):
+            self.payload = payload
+            self.closed = False
+
+        def read(self):
+            return self.payload
+
+        def close(self):
+            self.closed = True
+
+    class _Ws:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    def _tabs(self, ws_url='ws://127.0.0.1:10086/devtools/page/exam'):
+        return [{
+            'url': 'https://statics.ets100.com/app/mockExam?set_id=private',
+            'title': 'Exam',
+            'type': 'page',
+            'webSocketDebuggerUrl': ws_url,
+        }]
+
+    def _snapshot(self):
+        return {
+            'href': 'https://statics.ets100.com/app/mockExam?set_id=private',
+            'readyState': 'complete',
+            'userAgent': 'UnitTest/1.0',
+            'app': True,
+            'vue3': True,
+            'pinia': True,
+            'appDataPath': '',
+            'doHomework': False,
+            'iframe': {
+                'present': True,
+                'accessible': True,
+                'readyState': 'complete',
+                'error': '',
+            },
+            'exam': {'choiceCount': 4, 'fillCount': 1, 'nextIcon': True},
+            'bridge': {
+                'returnChoose': True,
+                'returnBlank': True,
+                'setPCChoose2': True,
+                'iframeNext': True,
+                'alreadyHooked': False,
+            },
+            'pk': {'title': False, 'optionCount': 0},
+        }
+
+    @staticmethod
+    def _check(report, check_id):
+        return next(check for check in report['checks'] if check['id'] == check_id)
+
+    def _collect(self, snapshot, *, mode='exam', appdata=None, ws_url=None):
+        import ets_compat
+        from unittest.mock import patch
+
+        tabs = self._tabs(ws_url) if ws_url is not None else self._tabs()
+        response = self._Response(json.dumps(tabs).encode('utf-8'))
+        ws = self._Ws()
+        eval_value = snapshot if isinstance(snapshot, str) else json.dumps(snapshot)
+        with patch.object(ets_compat.ETSBase, 'eval_js', return_value=eval_value):
+            report = ets_compat.collect_compatibility_report(
+                mode=mode,
+                opener=lambda *args, **kwargs: response,
+                ws_factory=lambda *args, **kwargs: ws,
+                appdata=appdata,
+            )
+        return report, response, ws
+
+    def test_endpoint_failure_is_blocking_and_does_not_open_ws(self):
+        import ets_compat
+
+        ws_calls = []
+
+        def unavailable(*args, **kwargs):
+            raise OSError('connection refused')
+
+        report = ets_compat.collect_compatibility_report(
+            opener=unavailable,
+            ws_factory=lambda *args, **kwargs: ws_calls.append(args),
+        )
+        self.assertFalse(report['ok'])
+        self.assertEqual(self._check(report, 'cdp.endpoint')['status'], 'fail')
+        self.assertTrue(self._check(report, 'cdp.endpoint')['blocking'])
+        self.assertEqual(ws_calls, [])
+
+    def test_missing_ets_target_is_blocking(self):
+        import ets_compat
+
+        response = self._Response(json.dumps([
+            {'url': 'https://example.com', 'title': 'Other'},
+        ]).encode('utf-8'))
+        report = ets_compat.collect_compatibility_report(
+            opener=lambda *args, **kwargs: response,
+            ws_factory=lambda *args, **kwargs: self.fail('WS must not open'),
+        )
+        self.assertFalse(report['ok'])
+        self.assertEqual(self._check(report, 'cdp.target')['status'], 'fail')
+        self.assertTrue(response.closed)
+
+    def test_non_loopback_ws_is_rejected_before_connect(self):
+        import ets_compat
+
+        response = self._Response(json.dumps(self._tabs(
+            'ws://192.168.1.20:10086/devtools/page/x')).encode('utf-8'))
+        ws_calls = []
+        report = ets_compat.collect_compatibility_report(
+            opener=lambda *args, **kwargs: response,
+            ws_factory=lambda *args, **kwargs: ws_calls.append(args),
+        )
+        self.assertFalse(report['ok'])
+        self.assertEqual(self._check(report, 'cdp.ws_loopback')['status'], 'fail')
+        self.assertEqual(ws_calls, [])
+
+    def test_healthy_exam_report_is_serializable_and_closes_resources(self):
+        import ets_compat
+
+        with tempfile.TemporaryDirectory(prefix='ets_appdata_') as appdata:
+            _os.makedirs(_os.path.join(appdata, 'ETS'))
+            snapshot = self._snapshot()
+            snapshot['appDataPath'] = appdata
+            report, response, ws = self._collect(snapshot, appdata=appdata)
+
+        self.assertTrue(report['ok'])
+        self.assertEqual(self._check(report, 'page.surface')['status'], 'pass')
+        self.assertEqual(self._check(report, 'bridge.native')['status'], 'pass')
+        self.assertEqual(self._check(report, 'data.root')['status'], 'pass')
+        self.assertNotIn('set_id', report['observations']['page_route'])
+        self.assertNotIn('/devtools/', report['observations']['ws_endpoint'])
+        self.assertIsInstance(json.loads(json.dumps(report)), dict)
+        self.assertTrue(response.closed)
+        self.assertTrue(ws.closed)
+        self.assertIn('preflight: PASS', ets_compat.format_compatibility_report(report))
+
+    def test_dom_and_bridge_not_ready_are_warnings(self):
+        with tempfile.TemporaryDirectory(prefix='ets_appdata_') as appdata:
+            _os.makedirs(_os.path.join(appdata, 'ETS'))
+            snapshot = self._snapshot()
+            snapshot.update({
+                'app': False,
+                'vue3': False,
+                'pinia': False,
+                'appDataPath': 'C:/outside-ets-jail',
+                'iframe': {'present': False, 'accessible': False, 'error': ''},
+                'exam': {'choiceCount': 0, 'fillCount': 0, 'nextIcon': False},
+                'bridge': {},
+            })
+            report, _, _ = self._collect(snapshot, appdata=appdata)
+
+        self.assertTrue(report['ok'])
+        self.assertEqual(self._check(report, 'page.vue')['status'], 'warn')
+        self.assertEqual(self._check(report, 'page.surface')['status'], 'warn')
+        self.assertEqual(self._check(report, 'bridge.native')['status'], 'warn')
+        self.assertEqual(report['observations']['data_root_source'], 'default')
+
+    def test_pk_surface_passes_without_exam_bridge(self):
+        snapshot = self._snapshot()
+        snapshot['pk'] = {'title': True, 'optionCount': 4}
+        report, _, ws = self._collect(snapshot, mode='pk')
+        self.assertTrue(report['ok'])
+        self.assertEqual(self._check(report, 'page.surface')['status'], 'pass')
+        self.assertEqual(self._check(report, 'bridge.native')['status'], 'skip')
+        self.assertTrue(ws.closed)
+
+    def test_attach_error_redacts_debugger_target(self):
+        import ets_compat
+
+        ws_url = (
+            'ws://127.0.0.1:10086/devtools/page/private-target'
+            '?token=private-query')
+        response = self._Response(json.dumps(self._tabs(ws_url)).encode('utf-8'))
+
+        def fail_attach(url, **kwargs):
+            raise RuntimeError('failed to attach ' + url)
+
+        report = ets_compat.collect_compatibility_report(
+            opener=lambda *args, **kwargs: response,
+            ws_factory=fail_attach,
+        )
+        serialized = json.dumps(report)
+        self.assertFalse(report['ok'])
+        self.assertEqual(self._check(report, 'cdp.attach')['status'], 'fail')
+        self.assertNotIn('/devtools/page/private-target', serialized)
+        self.assertNotIn('private-query', serialized)
+
+    def test_malformed_target_fields_return_structured_failure(self):
+        import ets_compat
+
+        response = self._Response(json.dumps([{
+            'url': 'https://statics.ets100.com/app/mockExam',
+            'title': 123,
+            'type': ['page'],
+            'webSocketDebuggerUrl': 456,
+        }]).encode('utf-8'))
+        report = ets_compat.collect_compatibility_report(
+            opener=lambda *args, **kwargs: response,
+            ws_factory=lambda *args, **kwargs: self.fail('WS must not open'),
+        )
+        self.assertFalse(report['ok'])
+        self.assertEqual(self._check(report, 'cdp.target')['status'], 'pass')
+        self.assertEqual(self._check(report, 'cdp.ws_loopback')['status'], 'fail')
+
+    def test_accessible_iframe_without_exam_markers_warns(self):
+        snapshot = self._snapshot()
+        snapshot['exam'] = {
+            'choiceCount': 0,
+            'fillCount': 0,
+            'nextIcon': False,
+        }
+        report, _, _ = self._collect(snapshot)
+        self.assertTrue(report['ok'])
+        self.assertEqual(self._check(report, 'page.surface')['status'], 'warn')
+    def test_invalid_runtime_snapshot_is_blocking_and_closes_ws(self):
+        report, _, ws = self._collect('not-json')
+        self.assertFalse(report['ok'])
+        self.assertEqual(self._check(report, 'page.runtime')['status'], 'fail')
+        self.assertTrue(ws.closed)
+
+
+class TestRunCompatibilityCommand(unittest.TestCase):
+    def test_json_success_and_human_failure_exit_codes(self):
+        import io
+        import run
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+
+        success = {
+            'schema_version': 1,
+            'app_version': 'test',
+            'mode': 'exam',
+            'port': 10086,
+            'ok': True,
+            'can_start': True,
+            'summary': 'ready',
+            'checks': [],
+            'observations': {},
+        }
+        stdout = io.StringIO()
+        with patch('ets_compat.collect_compatibility_report', return_value=success), \
+             redirect_stdout(stdout):
+            code = run.main(['check', '--json'])
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(stdout.getvalue())['ok'])
+
+        blocked = dict(success)
+        blocked.update({
+            'ok': False,
+            'can_start': False,
+            'summary': 'blocked',
+            'checks': [{
+                'id': 'cdp.endpoint',
+                'status': 'fail',
+                'blocking': True,
+                'summary': 'CDP unavailable',
+                'detail': '',
+                'remediation': '',
+            }],
+        })
+        stdout = io.StringIO()
+        with patch('ets_compat.collect_compatibility_report', return_value=blocked), \
+             redirect_stdout(stdout):
+            code = run.main(['check'])
+        self.assertEqual(code, 2)
+        self.assertIn('preflight: BLOCKED', stdout.getvalue())
+
+
 class TestGoldenFixtures(unittest.TestCase):
     """Synthetic content.json under tests/fixtures/sets/ (Project offline golden).
 
@@ -3501,20 +3803,6 @@ class TestGoldenFixtures(unittest.TestCase):
         self.assertEqual(role.get('type'), 'oral')
         self.assertTrue(role.get('variants'))
 
-    def test_invalid_content_fixture_does_not_hide_valid_sections(self):
-        import ets_strategy
-        from unittest.mock import patch
-        s = ets_strategy.ETSStrategy()
-        with patch('builtins.print') as mock_print:
-            self.assertTrue(s.load_set(self.set_id, data_dir=self.fix_root))
-        mock_print.assert_any_call(
-            '  strategy skip content_4: expected JSON object')
-        self.assertEqual(
-            {section['dir'] for section in s.sections},
-            {'content_1', 'content_2', 'content_3'},
-        )
-        self.assertIsNotNone(s.lookup('collector.choose', '100', qid='1'))
-
 
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3528,7 +3816,7 @@ if __name__ == '__main__':
     # Build suite so we can exit non-zero on failure (CI gate)
     loader = unittest.TestLoader()
     if argv:
-        suite = loader.loadTestsFromNames(argv)
+        suite = loader.loadTestsFromNames(argv, _sys.modules[__name__])
     else:
         suite = loader.loadTestsFromModule(_sys.modules[__name__])
     result = unittest.TextTestRunner(verbosity=verbosity).run(suite)

@@ -6,6 +6,7 @@ Usage:
   python run.py gui                 # 启动GUI界面 (default)
   python run.py exam [options]     # 套卷自动答题
   python run.py pk [options]       # 单词PK自动答题
+  python run.py check [options]    # ETS/CDP兼容性体检
   python run.py --help             # Show help
 """
 import argparse
@@ -47,12 +48,14 @@ def main(args_list=None):
         print("  gui     启动GUI界面 (launch graphical interface)")
         print("  exam    套卷自动答题 (auto-answer exam questions)")
         print("  pk      单词PK自动答题 (auto-answer word PK)")
+        print("  check   ETS/CDP兼容性体检 (read-only compatibility preflight)")
         print()
         print("Examples:")
         print("  python run.py")
         print("  python run.py gui")
         print("  python run.py exam --debug")
         print("  python run.py pk --max 50")
+        print("  python run.py check --mode exam")
         print("  python run.py exam --show-answers")
         sys.exit(0)
 
@@ -69,6 +72,7 @@ def main(args_list=None):
         parser = argparse.ArgumentParser(description="ETS Exam Auto — e听说PC端套卷自动答题")
         parser.add_argument("--max", type=int, default=999, help="Safety limit (default: 999)")
         parser.add_argument("--debug", action="store_true", help="Verbose output for troubleshooting")
+        parser.add_argument("--port", type=int, default=10086, help="CDP port")
         parser.add_argument("--json", action="store_true", help="Output results as JSON")
         parser.add_argument("--show-answers", action="store_true", help="Show all answers without auto-answering")
         parser.add_argument("--log", type=str, default=None, metavar="FILE", help="Save all output to a log file")
@@ -77,7 +81,7 @@ def main(args_list=None):
         tee, tee_err = _install_log_tee(args.log)
         try:
             # stop_event defaulted inside ETSAutoAnswer.ensure_stop_event()
-            auto = ETSAutoAnswer(debug_mode=args.debug)
+            auto = ETSAutoAnswer(port=args.port, debug_mode=args.debug)
             if args.show_answers:
                 auto.connect()
                 auto.load_answers()
@@ -108,6 +112,26 @@ def main(args_list=None):
         finally:
             _restore_log_tee(tee, tee_err, args.log)
 
+    elif command == 'check':
+        from ets_compat import collect_compatibility_report, format_compatibility_report
+
+        parser = argparse.ArgumentParser(
+            description="Read-only ETS/CDP compatibility preflight")
+        parser.add_argument("--mode", choices=('exam', 'pk'), default='exam')
+        parser.add_argument("--port", type=int, default=10086, help="CDP port")
+        parser.add_argument("--timeout", type=float, default=5.0,
+                            help="Timeout per network/CDP step in seconds")
+        parser.add_argument("--json", action="store_true",
+                            help="Output the structured report as JSON")
+        args = parser.parse_args(sub_args)
+        report = collect_compatibility_report(
+            port=args.port, mode=args.mode, timeout=args.timeout)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print(format_compatibility_report(report))
+        return 0 if report.get('ok') else 2
+
     else:
         print("Unknown command: %s" % command)
         print("Use 'python run.py --help' for available commands")
@@ -115,4 +139,4 @@ def main(args_list=None):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

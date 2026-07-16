@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Compatibility preflight** - `run.py check` reports CDP endpoint/target, loopback WebSocket, Vue/Pinia, exam or PK DOM surface, native bridge, and ETS data-root readiness without modifying the page.
+- **GUI startup guard** - exam and PK workers run the same preflight in the background and stop only on blocking CDP/control-plane failures.
+
+### Changed
+- **Release CI regression** - incompatible-cache coverage now builds its own temporary cache, so it runs in `ETS_Auto` without the optional Project golden fixture.
+- **Release workflow** - artifact uploads use `actions/upload-artifact@v7`.
+
+### Fixed
+- **Test selection** - `test_unit.py TestClass[.test_method]` resolves names against the current test module.
+- **GUI smoke teardown** - pending CustomTkinter timers are canceled without leaving stale Tcl callbacks or shutdown warnings.
+
 ## [0.6.9] - 2026-07-16
 
 ### Fixed
