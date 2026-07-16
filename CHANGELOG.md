@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Packaged EXE smoke gate** - every release build now runs `--version`, `--help`, and offline `--self-test` commands against all three frozen executables before uploading artifacts or creating a Release.
+
 ## [0.7.0] - 2026-07-16
 
 ### Added

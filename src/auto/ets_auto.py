@@ -29,6 +29,7 @@ __all__ = ['ETSAutoAnswer', 'TeeOutput', 'APP_VERSION']
 from ets_strategy import (
     ETSStrategy, _safe_set_id, _resolve_exam_dir, _read_json,
 )
+from ets_selftest import add_runtime_check_arguments, run_self_test
 
 
 class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
@@ -1602,7 +1603,11 @@ if __name__ == "__main__":
                         help="Auto-delete log files older than N days in the log directory (default: 7, 0=disable)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Load answers and simulate without actually answering (safety check)")
+    add_runtime_check_arguments(parser)
     args = parser.parse_args()
+
+    if args.self_test:
+        sys.exit(run_self_test('exam', ETSAutoAnswer))
 
     # #8: Auto-clean old log files
     if args.log and args.log_keep > 0:

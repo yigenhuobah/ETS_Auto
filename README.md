@@ -113,6 +113,12 @@ python src/auto/ets_parser.py
 python src/auto/ets_auto.py --debug        # 套卷答题
 python src/auto/ets_word_pk.py --debug     # 单词PK
 
+# 已发布 EXE 的离线启动检查（不连接 ETS）
+ets_gui.exe --self-test
+ets_auto.exe --version
+ets_auto.exe --self-test
+ets_pk.exe --self-test
+
 # 6. 发版前 / 开发自检（无需 ETS 客户端）
 python pre_release_test.py
 python src/auto/tests/test_unit.py

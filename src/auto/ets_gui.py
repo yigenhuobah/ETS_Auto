@@ -11,6 +11,7 @@ Usage:
   python ets_gui.py
   python ets_gui.py --debug
 """
+import argparse
 import sys
 import os
 import threading
@@ -32,6 +33,9 @@ if _AUTO_DIR and _AUTO_DIR not in sys.path:
 
 # ── Force UTF-8 on Windows ──────────────────────────────────
 from ets_common import APP_VERSION, force_utf8_stdio
+from ets_selftest import (
+    add_runtime_check_arguments, ensure_cli_streams, run_self_test,
+)
 force_utf8_stdio()
 
 import customtkinter as ctk
@@ -788,10 +792,21 @@ class ETSApp(ctk.CTk):
 
 
 # ── Entry point ──────────────────────────────────────────────
-def main():
+def main(argv=None):
+    ensure_cli_streams()
+    parser = argparse.ArgumentParser(description="ETS Auto graphical launcher")
+    add_runtime_check_arguments(parser)
+    parser.add_argument(
+        '--verify-version', metavar='VERSION', help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    if args.verify_version is not None:
+        return 0 if args.verify_version == APP_VERSION else 3
+    if args.self_test:
+        return run_self_test('gui')
     app = ETSApp()
     app.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

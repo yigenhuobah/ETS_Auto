@@ -1802,6 +1802,156 @@ class TestAppVersionSingleSource(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  TestPackagedSelfTest — deterministic offline checks for frozen entry points
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPackagedSelfTest(unittest.TestCase):
+    def test_runtime_arguments_include_version_and_self_test(self):
+        import argparse
+        from contextlib import redirect_stdout
+        from io import StringIO
+        import ets_common
+        import ets_selftest
+
+        parser = argparse.ArgumentParser()
+        ets_selftest.add_runtime_check_arguments(parser)
+        self.assertTrue(parser.parse_args(['--self-test']).self_test)
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as caught:
+            parser.parse_args(['--version'])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn(ets_common.APP_VERSION, output.getvalue())
+
+    def test_pk_dictionary_accepts_nonempty_string_map(self):
+        import ets_selftest
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _os.path.join(tmp, 'ecdict_pk.json')
+            with open(path, 'w', encoding='utf-8') as handle:
+                json.dump({'hello': '你好'}, handle, ensure_ascii=False)
+            ets_selftest._validate_pk_dictionary(path)
+
+    def test_pk_dictionary_rejects_missing_file(self):
+        import ets_selftest
+        with self.assertRaises(FileNotFoundError):
+            ets_selftest._validate_pk_dictionary('missing-ecdict.json')
+
+    def test_pk_dictionary_rejects_invalid_json(self):
+        import ets_selftest
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _os.path.join(tmp, 'ecdict_pk.json')
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write('{invalid')
+            with self.assertRaises(json.JSONDecodeError):
+                ets_selftest._validate_pk_dictionary(path)
+
+    def test_pk_dictionary_rejects_empty_object(self):
+        import ets_selftest
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _os.path.join(tmp, 'ecdict_pk.json')
+            with open(path, 'w', encoding='utf-8') as handle:
+                json.dump({}, handle)
+            with self.assertRaisesRegex(ValueError, 'empty'):
+                ets_selftest._validate_pk_dictionary(path)
+
+    def test_exam_self_test_does_not_connect(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from unittest.mock import patch
+        import ets_selftest
+
+        class FakeExam:
+            def __init__(self):
+                self.stop_event = object()
+                self.strategy = object()
+
+            def connect(self):
+                raise AssertionError('offline self-test must not connect')
+
+        with patch.object(ets_selftest, '_import_target_modules'), \
+                redirect_stdout(StringIO()):
+            self.assertEqual(ets_selftest.run_self_test('exam', FakeExam), 0)
+
+    def test_gui_self_test_uses_bounded_runtime_check(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from unittest.mock import patch
+        import ets_selftest
+
+        with patch.object(ets_selftest, '_import_target_modules'), \
+                patch.object(ets_selftest, '_validate_gui_runtime') as validate, \
+                redirect_stdout(StringIO()):
+            self.assertEqual(ets_selftest.run_self_test('gui'), 0)
+        validate.assert_called_once_with()
+
+    def test_gui_machine_version_check_exits_before_app_creation(self):
+        from unittest.mock import patch
+        import ets_gui
+
+        with patch.object(ets_gui, 'ETSApp') as app:
+            self.assertEqual(
+                ets_gui.main(['--verify-version', ets_gui.APP_VERSION]), 0)
+            self.assertEqual(
+                ets_gui.main(['--verify-version', '0.0.0-invalid']), 3)
+        app.assert_not_called()
+
+    def test_packaged_runner_checks_output_and_mismatch(self):
+        root = _os.path.dirname(_os.path.dirname(_SrcAuto))
+        if root not in _sys.path:
+            _sys.path.insert(0, root)
+        import packaged_smoke_test
+
+        packaged_smoke_test._run_case(
+            _sys.executable, '--version', 'Python', 5)
+        with self.assertRaisesRegex(RuntimeError, 'did not emit'):
+            packaged_smoke_test._run_case(
+                _sys.executable, '--version', 'not-a-real-version', 5)
+
+    def test_packaged_runner_timeout_is_bounded(self):
+        root = _os.path.dirname(_os.path.dirname(_SrcAuto))
+        if root not in _sys.path:
+            _sys.path.insert(0, root)
+        import packaged_smoke_test
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = _os.path.join(tmp, 'sleep_forever.py')
+            with open(script, 'w', encoding='utf-8') as handle:
+                handle.write('import time\ntime.sleep(30)\n')
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, 'timed out'):
+                packaged_smoke_test._run_case(
+                    _sys.executable, script, None, 0.1)
+            self.assertLess(time.monotonic() - started, 5)
+
+    def test_packaged_runner_cleanup_fallbacks_are_bounded(self):
+        import subprocess
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+        root = _os.path.dirname(_os.path.dirname(_SrcAuto))
+        if root not in _sys.path:
+            _sys.path.insert(0, root)
+        import packaged_smoke_test
+
+        process = MagicMock()
+        process.pid = 123
+        process.poll.return_value = None
+        with (
+            patch.object(packaged_smoke_test.os, 'name', 'nt'),
+            patch.object(
+                packaged_smoke_test.subprocess, 'run',
+                return_value=SimpleNamespace(returncode=1)),
+        ):
+            packaged_smoke_test._terminate_process_tree(process)
+        process.kill.assert_called_once_with()
+
+        stubborn = MagicMock()
+        stubborn.poll.return_value = None
+        stubborn.wait.side_effect = subprocess.TimeoutExpired('test', 10)
+        with self.assertRaisesRegex(RuntimeError, 'did not terminate'):
+            packaged_smoke_test._wait_after_termination(stubborn)
+        stubborn.kill.assert_called_once_with()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  TestUserDataPath — project root / basename safety
 # ═══════════════════════════════════════════════════════════════════════════════
 

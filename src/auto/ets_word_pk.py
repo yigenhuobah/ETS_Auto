@@ -7,6 +7,7 @@ import json, os, time, re, sys
 from urllib.error import URLError
 from ets_common import APP_VERSION, ETSBase, force_utf8_stdio, user_data_path
 from ets_hotkey import ETSHotkey
+from ets_selftest import add_runtime_check_arguments, run_self_test
 
 # Re-export for packaging / external importers (single source: ets_common)
 __version__ = APP_VERSION
@@ -1198,5 +1199,8 @@ if __name__ == "__main__":
     p.add_argument("--max", type=int, default=999, help="Max questions")
     p.add_argument("--debug", action="store_true", help="Show debug info")
     p.add_argument("--port", type=int, default=10086, help="CDP port")
+    add_runtime_check_arguments(p)
     a = p.parse_args()
+    if a.self_test:
+        sys.exit(run_self_test('pk', ETSWordPK))
     ETSWordPK(port=a.port, debug_mode=a.debug).run(max_q=a.max)

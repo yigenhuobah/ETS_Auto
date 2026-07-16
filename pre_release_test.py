@@ -41,6 +41,49 @@ def t_import_compat():
     assert callable(ets_compat.format_compatibility_report)
 test("import ets_compat + compatibility API exists", t_import_compat)
 
+def t_import_selftest():
+    import ets_selftest
+    assert callable(ets_selftest.add_runtime_check_arguments)
+    assert callable(ets_selftest.run_self_test)
+    assert set(ets_selftest.TARGET_IMPORTS) == {'exam', 'pk', 'gui'}
+test("import ets_selftest + packaged runtime API exists", t_import_selftest)
+
+def t_runtime_self_tests_are_offline():
+    import builtins
+    import socket
+    import urllib.request
+    from unittest.mock import patch
+    import websocket
+    import ets_selftest
+
+    real_open = builtins.open
+
+    def guarded_open(file, mode='r', *args, **kwargs):
+        if any(flag in str(mode) for flag in ('w', 'a', 'x', '+')):
+            raise AssertionError("offline self-test attempted a file write")
+        return real_open(file, mode, *args, **kwargs)
+
+    def forbidden_side_effect(*args, **kwargs):
+        raise AssertionError("offline self-test attempted network access")
+
+    old_dont_write = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        with (
+            patch('builtins.open', guarded_open),
+            patch.object(socket, 'create_connection', side_effect=forbidden_side_effect),
+            patch.object(urllib.request, 'urlopen', side_effect=forbidden_side_effect),
+            patch.object(websocket, 'create_connection', side_effect=forbidden_side_effect),
+        ):
+            from ets_auto import ETSAutoAnswer
+            from ets_word_pk import ETSWordPK
+            assert ets_selftest.run_self_test('exam', ETSAutoAnswer) == 0
+            assert ets_selftest.run_self_test('pk', ETSWordPK) == 0
+            assert ets_selftest.run_self_test('gui') == 0
+    finally:
+        sys.dont_write_bytecode = old_dont_write
+test("real packaged self-tests stay offline and read-only", t_runtime_self_tests_are_offline)
+
 
 def t_import_auto():
     import ets_auto
@@ -167,6 +210,25 @@ def test_requirements():
         lines = [l.strip() for l in f if l.strip() and not l.startswith('#')]
     assert len(lines) >= 3, f"requirements.txt should have >=3 deps, got {len(lines)}"
 test("requirements.txt exists with >=3 deps", test_requirements)
+
+def test_packaged_smoke_contract():
+    import packaged_smoke_test
+    required = {
+        (exe, arg)
+        for exe in ('ets_gui.exe', 'ets_auto.exe', 'ets_pk.exe')
+        for arg in ('--version', '--help', '--self-test')
+    }
+    actual = {(exe, arg) for exe, arg, _ in packaged_smoke_test.SMOKE_CASES}
+    assert required.issubset(actual), f"packaged smoke cases missing: {required - actual}"
+    assert ('ets_gui.exe', '--verify-version={version}') in actual
+    assert len(actual) == len(required) + 1
+    workflow_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        '.github', 'workflows', 'build-exe.yml')
+    workflow = open(workflow_path, encoding='utf-8').read()
+    assert workflow.count('--hidden-import=ets_selftest') == 3
+    assert 'python packaged_smoke_test.py --dist dist --timeout 60' in workflow
+test("packaged EXE smoke matrix + workflow wiring", test_packaged_smoke_contract)
 
 # ── 5. GUI Widget Smoke Tests ─────────────────────────────
 print("\n=== GUI Widget Tests ===")
