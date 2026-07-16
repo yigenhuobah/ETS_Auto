@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.9] - 2026-07-16
+
+### Fixed
+- **Cache compatibility** - `ETSStrategy.load_set()` skips `content.json` files whose top-level JSON value is not an object, while preserving valid sibling sections.
+
+### Tests
+- Added an offline incompatible-cache fixture and regression coverage for the skip diagnostic, valid-section indexing, and lookup continuity.
+
 ## [0.6.8] - 2026-07-14
 
 ### Fixed
