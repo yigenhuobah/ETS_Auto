@@ -3501,6 +3501,20 @@ class TestGoldenFixtures(unittest.TestCase):
         self.assertEqual(role.get('type'), 'oral')
         self.assertTrue(role.get('variants'))
 
+    def test_invalid_content_fixture_does_not_hide_valid_sections(self):
+        import ets_strategy
+        from unittest.mock import patch
+        s = ets_strategy.ETSStrategy()
+        with patch('builtins.print') as mock_print:
+            self.assertTrue(s.load_set(self.set_id, data_dir=self.fix_root))
+        mock_print.assert_any_call(
+            '  strategy skip content_4: expected JSON object')
+        self.assertEqual(
+            {section['dir'] for section in s.sections},
+            {'content_1', 'content_2', 'content_3'},
+        )
+        self.assertIsNotNone(s.lookup('collector.choose', '100', qid='1'))
+
 
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════════

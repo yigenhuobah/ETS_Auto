@@ -247,6 +247,13 @@ class ETSStrategy:
                 print("  ⚠ strategy skip %s: %s" % (d, e))
                 continue
 
+            # Valid JSON may still violate the content.json object contract.
+            # Skip that section without masking the rest of the cached set.
+            if not isinstance(data, dict):
+                skipped += 1
+                print("  strategy skip %s: expected JSON object" % d)
+                continue
+
             stype = data.get('structure_type', '')
             info = data.get('info', {})
             stid = str(info.get('stid', ''))
