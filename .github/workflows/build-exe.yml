@@ -1,6 +1,7 @@
 name: Build EXE
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'v*'
@@ -92,7 +93,7 @@ jobs:
           path: dist/ets_pk.exe
 
       - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
           files: |

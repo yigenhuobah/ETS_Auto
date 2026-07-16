@@ -12,7 +12,7 @@ import json, time, urllib.request, websocket, os, sys, threading
 from urllib.parse import urlparse
 
 # Single source of truth for app version (imported by exam/PK/GUI/remote)
-APP_VERSION = "0.6.9"
+APP_VERSION = "0.7.0"
 
 
 def is_loopback_ws_url(ws_url):

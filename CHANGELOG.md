@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.0] - 2026-07-16
 
 ### Added
 - **Compatibility preflight** - `run.py check` reports CDP endpoint/target, loopback WebSocket, Vue/Pinia, exam or PK DOM surface, native bridge, and ETS data-root readiness without modifying the page.
@@ -8,7 +8,7 @@
 
 ### Changed
 - **Release CI regression** - incompatible-cache coverage now builds its own temporary cache, so it runs in `ETS_Auto` without the optional Project golden fixture.
-- **Release workflow** - artifact uploads use `actions/upload-artifact@v7`.
+- **Release workflow** - supports manual `workflow_dispatch` builds and uses `actions/upload-artifact@v7`.
 
 ### Fixed
 - **Test selection** - `test_unit.py TestClass[.test_method]` resolves names against the current test module.
