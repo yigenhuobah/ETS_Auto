@@ -53,9 +53,21 @@ ecdict-stardict/
 ecdict-stardict-28.zip
 ecdict_compact.json
 ecdict_lite.json
-ecdict_pk.json
 pk_extra.json
+pk_extra.json.bak
+pk_extra.json.lock
 pk_misses.json
+pk_misses.jsonl
+ets_stats.json
+remote_info_cache.json
+test_log*.txt
+
+# Dev-only probe/test scripts
+_probe_*.py
+_test_*.py
+
+# Bug audit reports
+ets_auto_bug_audit_*.md
 
 # Internal docs (dev-only)
 HANDOVER.md

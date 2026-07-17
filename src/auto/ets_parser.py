@@ -22,6 +22,7 @@ import os
 import json
 import re
 import html
+from ets_common import normalize_ets_content
 
 try:
     import customtkinter as ctk
@@ -87,6 +88,12 @@ def _html_to_text(html_str):
     Uses a conservative tag-matching pattern that requires tags to start
     with a letter — avoids false matches on math text like "x < y".
     """
+    if html_str is None:
+        return ''
+    if not isinstance(html_str, str):
+        if not isinstance(html_str, (bool, int, float)):
+            return ''
+        html_str = str(html_str)
     if not html_str:
         return ''
     text = html_str
@@ -137,8 +144,10 @@ def scan_sets():
                 continue
 
             try:
-                data = _read_json(content_path)
+                data = normalize_ets_content(_read_json(content_path))
             except Exception:
+                continue
+            if data is None:
                 continue
 
             stype = data.get('structure_type', 'unknown')
@@ -207,7 +216,10 @@ def render_section(section_data):
     Returns a list of (text, tag) tuples where tag is '' for normal
     or 'answer'/'header'/'muted'/'q_num'/'option'/'section_title' for styled text.
     """
-    data = section_data.get('data', {})
+    raw_data = section_data.get('data', {}) if isinstance(section_data, dict) else {}
+    data = normalize_ets_content(raw_data)
+    if data is None:
+        data = {'structure_type': 'unknown', 'info': {}}
     stype = data.get('structure_type', '')
     info = data.get('info', {})
     parts = []
@@ -399,13 +411,17 @@ def _render_full_markdown(set_data):
     lines.append("")
 
     for sec in set_data['sections']:
-        stype = sec['type']
+        if not isinstance(sec, dict):
+            continue
+        data = normalize_ets_content(sec.get('data', {}))
+        if data is None:
+            continue
+        stype = data.get('structure_type', 'unknown')
         icon = TYPE_ICONS.get(stype, '📋')
         label = TYPE_LABELS.get(stype, stype)
         lines.append("## %s %s" % (icon, label))
         lines.append("")
 
-        data = sec.get('data', {})
         info = data.get('info', {})
 
         if stype == 'collector.choose':
@@ -552,12 +568,16 @@ def _render_full_html(set_data):
 
 
     for sec in set_data['sections']:
-        stype = sec['type']
+        if not isinstance(sec, dict):
+            continue
+        data = normalize_ets_content(sec.get('data', {}))
+        if data is None:
+            continue
+        stype = data.get('structure_type', 'unknown')
         icon = TYPE_ICONS.get(stype, '📋')
         label = TYPE_LABELS.get(stype, stype)
         html_lines.append('<h2>%s %s</h2>' % (icon, _esc_html(str(label))))
 
-        data = sec.get('data', {})
         info = data.get('info', {})
 
         if stype == 'collector.choose':

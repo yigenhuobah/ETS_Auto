@@ -1,0 +1,38 @@
+{
+  "structure_type": "collector.choose",
+  "info": {
+    "stid": "100",
+    "xtlist": [
+      {
+        "xt_xh": "1",
+        "xt_nr": "What is color of sky?",
+        "answer": "B",
+        "xxlist": [
+          {
+            "xx_mc": "A",
+            "xx_nr": "Green"
+          },
+          {
+            "xx_mc": "B",
+            "xx_nr": "Blue"
+          }
+        ]
+      },
+      {
+        "xt_xh": "2",
+        "xt_nr": "2+2?",
+        "answer": "A",
+        "xxlist": [
+          {
+            "xx_mc": "A",
+            "xx_nr": "4"
+          },
+          {
+            "xx_mc": "B",
+            "xx_nr": "5"
+          }
+        ]
+      }
+    ]
+  }
+}

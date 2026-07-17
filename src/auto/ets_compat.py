@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Read-only compatibility preflight for the ETS desktop client."""
 import json
+import math
 import os
-import urllib.request
 from urllib.parse import urlsplit
 
-import websocket
-
 from ets_common import (
+    _connect_local_cdp_websocket,
+    _open_local_cdp_url,
     APP_VERSION,
     ETSBase,
     constrain_ets_data_root,
+    is_ets_page_url,
     is_loopback_ws_url,
 )
 
@@ -191,11 +192,7 @@ def _normalize_ets_tab(tab):
     url = tab.get('url')
     if not isinstance(url, str):
         return None
-    try:
-        host = (urlsplit(url).hostname or '').lower()
-    except ValueError:
-        return None
-    if host != 'ets100.com' and not host.endswith('.ets100.com'):
+    if not is_ets_page_url(url):
         return None
 
     normalized = dict(tab)
@@ -209,7 +206,17 @@ def _normalize_ets_tab(tab):
 def _read_response(opener, url, timeout):
     response = opener(url, timeout=timeout)
     try:
-        return response.read()
+        limit = ETSBase._CDP_JSON_MAX_BYTES
+        try:
+            raw = response.read(limit + 1)
+        except TypeError:
+            raw = response.read()
+        if not isinstance(raw, (bytes, bytearray)):
+            raise TypeError('CDP /json response must be bytes')
+        if len(raw) > limit:
+            raise ValueError(
+                'CDP /json response exceeds %d bytes' % limit)
+        return bytes(raw)
     finally:
         close = getattr(response, 'close', None)
         if close:
@@ -351,7 +358,8 @@ def collect_compatibility_report(port=10086, mode='exam', timeout=5,
     be on its portal or loading an exercise.
     """
     report = _new_report(port, mode)
-    if mode not in SUPPORTED_MODES or not isinstance(port, int) or not 1 <= port <= 65535:
+    if (mode not in SUPPORTED_MODES or isinstance(port, bool)
+            or not isinstance(port, int) or not 1 <= port <= 65535):
         _add_check(
             report, 'input.parameters', 'fail', 'Invalid check parameters',
             blocking=True, detail='mode=%r, port=%r' % (mode, port),
@@ -359,9 +367,9 @@ def collect_compatibility_report(port=10086, mode='exam', timeout=5,
         return _finish(report)
     try:
         timeout = float(timeout)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         timeout = 0
-    if timeout <= 0:
+    if not math.isfinite(timeout) or timeout <= 0:
         _add_check(
             report, 'input.parameters', 'fail', 'Invalid check timeout',
             blocking=True, detail=repr(timeout),
@@ -369,8 +377,7 @@ def collect_compatibility_report(port=10086, mode='exam', timeout=5,
         return _finish(report)
     _add_check(report, 'input.parameters', 'pass', 'Parameters accepted')
 
-    opener = opener or urllib.request.urlopen
-    ws_factory = ws_factory or websocket.create_connection
+    opener = opener or _open_local_cdp_url
     endpoint = 'http://127.0.0.1:%d/json' % port
     try:
         tabs = json.loads(_read_response(opener, endpoint, timeout))
@@ -430,7 +437,11 @@ def collect_compatibility_report(port=10086, mode='exam', timeout=5,
         detail=report['observations']['ws_endpoint'])
 
     try:
-        base.ws = ws_factory(ws_url, timeout=timeout)
+        if ws_factory is None:
+            base.ws = _connect_local_cdp_websocket(
+                ws_url, timeout=timeout)
+        else:
+            base.ws = ws_factory(ws_url, timeout=timeout)
         base.tab = tab
         base._EVAL_JS_TIMEOUT = timeout
         if base.ws is None:

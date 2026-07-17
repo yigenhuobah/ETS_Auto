@@ -1,0 +1,16 @@
+{
+  "structure_type": "collector.fill",
+  "info": {
+    "stid": "200",
+    "std": [
+      {
+        "xth": "1",
+        "value": "colour/color"
+      },
+      {
+        "xth": "2",
+        "value": "apple"
+      }
+    ]
+  }
+}

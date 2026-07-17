@@ -5,8 +5,13 @@ ETS Word PK Auto Answer v5 — e听说单词PK自动答题
 """
 import json, os, time, re, sys
 from urllib.error import URLError
-from ets_common import APP_VERSION, ETSBase, force_utf8_stdio, user_data_path
+from ets_common import (
+    APP_VERSION, ETSBase, ensure_parent_dir, force_utf8_stdio,
+    migrate_legacy_user_data_family, migrate_legacy_user_data_file,
+    user_data_path,
+)
 from ets_hotkey import ETSHotkey
+from ets_pk_store import load_pk_extra, merge_write_pk_extra
 from ets_selftest import add_runtime_check_arguments, run_self_test
 
 # Re-export for packaging / external importers (single source: ets_common)
@@ -55,8 +60,8 @@ def _resource_path(filename):
     """Resolve bundled resource path — works both in dev and PyInstaller --onefile.
 
     Read-only data files (ecdict_pk.json) are bundled inside the exe via
-    sys._MEIPASS.  User-writable files (pk_extra.json, pk_misses.jsonl)
-    must live NEXT TO the exe, so they are NOT resolved through _MEIPASS.
+    sys._MEIPASS. User-writable files use the app-owned data directory and
+    are never resolved through _MEIPASS.
     """
     if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, filename)
@@ -66,7 +71,7 @@ def _resource_path(filename):
 
 
 def _exe_dir_path(filename):
-    """Resolve user-writable path (alias of ets_common.user_data_path)."""
+    """Resolve an app-owned writable path (legacy public helper name)."""
     return user_data_path(filename, anchor_file=__file__)
 
 
@@ -122,14 +127,52 @@ class ETSWordPK(ETSBase):
             self.dict_path = self.dict_path_new
         # Read-only: bundled inside exe via --add-data (PyInstaller _MEIPASS)
         self.ecdict_path = _resource_path('ecdict_pk.json')
-        # User-writable: must live next to the exe, not inside the bundle
-        self.extra_path = _exe_dir_path('pk_extra.json')
-        self.misses_path = _exe_dir_path('pk_misses.jsonl')
+        # User-writable: source project root or frozen per-user data directory.
+        self._default_extra_path = _exe_dir_path('pk_extra.json')
+        self._default_misses_path = _exe_dir_path('pk_misses.jsonl')
+        self.extra_path = self._default_extra_path
+        self.misses_path = self._default_misses_path
         self.word_trans = {}      # word.lower() -> full_trans
         self.trans_index = {}     # chinese_segment -> [word1, word2, ...]
         self.cn_seg_index = {}    # chinese_sub_phrase -> [word1, word2, ...] (finer-grained)
         self.pk_extra = {}        # question_text -> correct_option (self-learned)
         self.stats = {'answered': 0, 'no_match': 0, 'errors': 0, 'learned': 0}
+
+    @staticmethod
+    def _same_user_data_path(left, right):
+        """Compare two local paths without requiring either path to exist."""
+        try:
+            left = os.path.normcase(os.path.realpath(os.path.abspath(
+                os.fspath(left))))
+            right = os.path.normcase(os.path.realpath(os.path.abspath(
+                os.fspath(right))))
+        except (OSError, TypeError, ValueError):
+            return False
+        return left == right
+
+    def _migrate_default_sidecar(
+            self, path_attr, default_attr, filename, include_backup=False):
+        """Migrate one untouched default path while preserving custom paths."""
+        default_path = getattr(self, default_attr, None)
+        if default_path is None:
+            # Compatibility for callers/tests that allocate with object.__new__
+            # or instances created before the default-path markers existed.
+            default_path = _exe_dir_path(filename)
+            setattr(self, default_attr, default_path)
+        current_path = getattr(self, path_attr, default_path)
+        if self._same_user_data_path(current_path, default_path):
+            migrate = (migrate_legacy_user_data_family
+                       if include_backup else migrate_legacy_user_data_file)
+            current_path = migrate(filename, anchor_file=__file__)
+        setattr(self, path_attr, current_path)
+
+    def _migrate_user_state(self):
+        """Migrate untouched defaults without replacing caller-owned paths."""
+        self._migrate_default_sidecar(
+            'extra_path', '_default_extra_path', 'pk_extra.json',
+            include_backup=True)
+        self._migrate_default_sidecar(
+            'misses_path', '_default_misses_path', 'pk_misses.jsonl')
 
     # ── Dictionary Loading ──────────────────────────────────
 
@@ -189,6 +232,7 @@ class ETSWordPK(ETSBase):
         return len(arr)
 
     def load_dictionary(self):
+        self._migrate_user_state()
         if not os.path.exists(self.dict_path):
             print("ERROR: Dictionary not found: " + self.dict_path)
             return False
@@ -299,10 +343,17 @@ class ETSWordPK(ETSBase):
                         compound_count += 1
 
         # ── Load self-learned extra mappings ──
-        extra_count = 0
-        if os.path.exists(self.extra_path):
-            with open(self.extra_path, 'r', encoding='utf-8') as f:
-                self.pk_extra = json.load(f)
+        self.pk_extra, extra_status = load_pk_extra(self.extra_path)
+        if extra_status == 'restored':
+            print("  WARNING: restored invalid pk_extra.json from .bak")
+        elif extra_status == 'backup':
+            print("  WARNING: pk_extra.json is invalid; using healthy .bak in memory")
+        elif extra_status == 'invalid':
+            print("  WARNING: invalid pk_extra.json has no healthy backup; ignoring it")
+            self.pk_extra = {}
+
+        extra_count = len(self.pk_extra)
+        if self.pk_extra:
             for q_text, answer in self.pk_extra.items():
                 # Inject into trans_index so find_answer can use it
                 q_clean = re.sub(r'^([a-z]+\.\s*(,\s*[a-z]+\.\s*)*)', '', q_text).strip()
@@ -312,7 +363,6 @@ class ETSWordPK(ETSBase):
                     self.trans_index.setdefault(q_text, []).insert(0, answer)
                 # Also add to word_trans so total count is correct
                 self.word_trans.setdefault(q_text, answer)
-                extra_count += 1
             print("  Self-learned extra: +%d mappings" % extra_count)
 
         print("Dictionary: %d base + %d ecdict + %d deriv + %d compound + %d extra = %d total (%.1fs)" % (
@@ -903,7 +953,16 @@ class ETSWordPK(ETSBase):
         if not q or not correct_answer:
             return
         if q not in self.pk_extra or self.pk_extra[q] != correct_answer:
-            self.pk_extra[q] = correct_answer
+            try:
+                persisted = merge_write_pk_extra(
+                    self.extra_path, {q: correct_answer}, backup_existing=True)
+            except Exception as e:
+                # Do not update memory before persistence succeeds. Otherwise a
+                # transient write failure makes every future retry a no-op.
+                print("  [LEARN] save failed for '%s': %s" % (q, e))
+                self.debug("learn_miss persistence error: %s" % e)
+                return False
+            self.pk_extra = persisted
             # trans_index direction: chinese_key -> [english_words]
             # Determine which is Chinese and insert in the correct direction
             if self._is_chinese(q):
@@ -947,22 +1006,9 @@ class ETSWordPK(ETSBase):
                 for seg in self._cn_split(cn_clean):
                     if seg not in self.cn_seg_index or q not in self.cn_seg_index[seg]:
                         self.cn_seg_index.setdefault(seg, []).insert(0, q)
-            # Atomic write: temp file + os.replace() — never leaves a 0-byte file on crash
-            import tempfile
-            dir_name = os.path.dirname(self.extra_path) or '.'
-            tmp_path = ''
-            try:
-                fd, tmp_path = tempfile.mkstemp(suffix='.json', dir=dir_name)
-                with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                    json.dump(self.pk_extra, f, ensure_ascii=False, indent=2)
-                os.replace(tmp_path, self.extra_path)
-                tmp_path = ''  # success — nothing to clean up
-            except Exception:
-                if tmp_path:
-                    try: os.unlink(tmp_path)
-                    except Exception: pass
-                raise
             print("  [LEARN] '%s' -> %s" % (q, correct_answer))
+            return True
+        return True
 
     def record_miss(self, question, options):
         """Record a miss for later manual review (JSONL append — O(1) disk I/O)"""
@@ -972,6 +1018,7 @@ class ETSWordPK(ETSBase):
             'time': time.strftime('%Y-%m-%d %H:%M:%S')
         }
         try:
+            ensure_parent_dir(self.misses_path)
             with open(self.misses_path, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(record, ensure_ascii=False) + '\n')
         except Exception as e:
@@ -985,26 +1032,49 @@ class ETSWordPK(ETSBase):
         try:
             self.connect()
         except URLError as e:
+            self._drop_connection()
             print("\n❌ 连接失败: %s" % e)
             print("诊断：")
             print("  1. e听说PC端是否已启动？")
             print("  2. 调试端口 %d 是否正确？" % self.port)
             return
         except ConnectionRefusedError:
+            self._drop_connection()
             print("\n❌ 连接被拒绝 (端口 %d)" % self.port)
             print("诊断：e听说PC端可能未启动，或端口不匹配")
             return
         except Exception as e:
+            self._drop_connection()
             print("\n❌ 连接失败: %s" % e)
             print("诊断：请确认 e听说PC端已启动且调试端口 %d 正确" % self.port)
             return
+        try:
+            return self._run_connected(max_q)
+        finally:
+            self._drop_connection()
+
+    def _run_connected(self, max_q):
+        """Run after CDP attachment; ``run`` owns final connection cleanup."""
         if not self.load_dictionary():
             return
 
         # Register global hotkeys (F9=Pause, F10=Skip, F12=Emergency Stop)
         # F12 must set stop_event immediately so interruptible_sleep / GUI see it
-        self._hotkey = ETSHotkey(on_stop=self.signal_stop)
-        self._hotkey.register()
+        self._hotkey = None
+        hotkey = None
+        try:
+            hotkey = ETSHotkey(on_stop=self.signal_stop)
+            if hotkey.register():
+                self._hotkey = hotkey
+            else:
+                print("Hotkeys: WARNING — unavailable, continuing without hotkeys")
+        except Exception as e:
+            print("Hotkeys: WARNING — unavailable, continuing without hotkeys (%s)" % e)
+        if self._hotkey is None and hotkey is not None:
+            try:
+                hotkey.unregister()
+            except Exception:
+                pass
 
         print("-" * 45)
 
@@ -1058,7 +1128,6 @@ class ETSWordPK(ETSBase):
 
                 try:
                     state = self.get_pk_state()
-                    consecutive_conn_errors = 0
                 except (ConnectionError, TimeoutError) as e:
                     if _handle_pk_reconnect(e) == 'break':
                         break
@@ -1070,6 +1139,7 @@ class ETSWordPK(ETSBase):
                     if _handle_pk_reconnect(ConnectionError(state.get('error'))) == 'break':
                         break
                     continue
+                consecutive_conn_errors = 0
 
                 if not state.get('hasQuestion'):
                     no_q_count += 1
@@ -1173,7 +1243,6 @@ class ETSWordPK(ETSBase):
                 except Exception:
                     pass
                 self._hotkey = None
-            self._drop_connection()
 
         total = answered + no_match
         rate = (answered * 100 / total) if total > 0 else 0

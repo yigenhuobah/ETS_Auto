@@ -1,8 +1,8 @@
 {
-  "version": "0.7.0",
+  "version": "0.7.1",
   "minVer": "0.4.0",
   "allowStart": true,
-  "announcement": "v0.7.0: read-only compatibility preflight and release tooling improvements - see CHANGELOG",
-  "pkExtraUrl": "https://raw.githubusercontent.com/yigenhuobah/ETS_Auto/main/pk_extra.json",
+  "announcement": "v0.7.1: durable user data, bounded local transport, and long-term regression coverage - see CHANGELOG",
+  "pkExtraUrl": "",
   "downloadUrl": "https://github.com/yigenhuobah/ETS_Auto/releases/latest"
 }

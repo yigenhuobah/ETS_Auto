@@ -6,7 +6,7 @@
 [![Windows](https://img.shields.io/badge/Platform-Windows-0078D6.svg)]()
 [![ETS v5.7.8](https://img.shields.io/badge/ETS-v5.7.8-success.svg)](https://www.ets100.com/home/index.html)
 
-> 🚀 **e听说自动答题 / 单词PK自动答题 / 离线试卷浏览器** · 听后选择零秒作答 · 听后记录自动填词 · 单词PK 85%+ 命中率 · 离线浏览所有缓存试卷 · 无需管理员权限 · 不篡改客户端 · 纯本地零网络
+> 🚀 **e听说自动答题 / 单词PK自动答题 / 离线试卷浏览器** · 听后选择零秒作答 · 听后记录自动填词 · 单词PK 85%+ 命中率 · 离线浏览所有缓存试卷 · 无需管理员权限 · 不篡改客户端 · 核心答题纯本地
 
 **每天被 e 听说作业折磨？** 这个工具能自动完成 PC 端的听说选择题和填空题，还能自动答单词 PK，更内置离线试卷浏览器让你提前预览所有答案。遇到语音题自动停住等你开口读。不修改客户端、不篡改分数、不依赖网络，是目前 ETS 环境下最**合规安全**的自动答题方案。
 
@@ -24,9 +24,10 @@
 - ✅ **跨题型自动导航** — 选择→填空 Section 过渡自动等待重试
 - ✅ **断连自动重连** — CDP WebSocket 断开后自动 reconnect（套卷/PK/RW）
 - ✅ **录音页等待** — 到达录音题提示手动完成，提交后自动继续
-- ✅ **全局热键** — F9 暂停 / F10 跳过 / F12 停止
-- ✅ **GUI 进度条** — 实时显示已完成/总数
-- ✅ **远程配置（可选网络）** — 版本检查/公告/pk_extra 热更；未配置签名时远程关停仅为**提示**（不硬拦）；**答案仍纯本地**
+- ✅ **全局热键** — F9 暂停 / F10 跳过 / F12 停止；按键冲突时自动降级并明确提示
+- ✅ **GUI 生命周期** — 实时进度；停止和关闭不阻塞界面，并清理热键/CDP
+- ✅ **持久用户数据** — 打包版把自学习和运行状态保存在 `%LOCALAPPDATA%\ETS_Auto`，自动迁移旧 exe 旁文件
+- ✅ **远程配置（可选网络）** — 仅用于版本/公告；精确 host、重定向和大小/超时边界；未签名关停只提示，答案仍纯本地。`pk_extra` 自动热更新当前暂停
 
 ---
 
@@ -60,13 +61,17 @@ A: 在终端里按 `Ctrl + C` 强制终止，然后加上 `--debug` 参数重新
 * **Q: 语音录音题怎么处理？**
 A: 脚本启动时会自动弹出参考答案窗口（听后转述/回答问题/短文朗读），你可以边看答案边录音。选择题和填空题做完后，关闭答案窗口即可停止脚本。
 * **Q: 单词 PK 怎么用？**
-A: 运行 `python run.py pk` 或 `ets_pk.exe`，然后进入 ETS 的单词 PK 匹配页面即可。脚本会自动抓取题目并从本地字典匹配答案，答错的会自动学习，命中率越来越高。
+A: 运行 `python src/auto/run.py pk` 或 `ets_pk.exe`，然后进入 ETS 的单词 PK 匹配页面即可。脚本会从本地字典匹配答案，答错后自动学习；多进程写入会合并，避免互相覆盖。
+* **Q: 自学习数据放在哪里？升级 exe 会丢吗？**
+A: 打包版保存在 `%LOCALAPPDATA%\ETS_Auto`。新版本首次访问时会复制旧 exe 旁同名文件及 `.bak`，不覆盖已有新数据，也不会删除旧文件。
+
+若旧版仍把 sidecar 存在 exe 旁，程序只检查**当前正在运行的新版 exe 所在目录**，不会扫描旧下载目录。升级时请原地替换 exe，或在首次启动前把旧 sidecar 及其 `.bak` 复制到新版 exe 同目录。
 * **Q: 离线试卷浏览器看不到任何试卷？**
 A: 浏览器读取 `%APPDATA%\ETS` 目录下的缓存。需要先在 ETS 客户端中打开过至少一次作业，系统才会缓存试卷数据。
 * **Q: 热键怎么用？**
 A: 运行中全局有效：**F9** 暂停/继续，**F10** 跳过当前题，**F12** 紧急停止（断开 CDP）。命令行与 GUI 均可。
 * **Q: 不是说「零网络」吗，为什么还会联网？**
-A: **答题答案始终读本地缓存**，不抓包、不上传题目。可选联网仅用于检查 `info.json`（版本/杀开关/公告）和热更 `pk_extra.json`；可断网使用。
+A: **答题答案始终读本地缓存**，不抓包、不上传题目。可选联网仅检查 `info.json` 的版本、开关和公告，并有精确 host、重定向复核、大小和超时限制；可断网使用。`pkExtraUrl` 当前为空，PK 词典自动热更新已暂停，等待受控公共词典发布流程。
 
 ---
 
@@ -119,9 +124,16 @@ ets_auto.exe --version
 ets_auto.exe --self-test
 ets_pk.exe --self-test
 
-# 6. 发版前 / 开发自检（无需 ETS 客户端）
+# 6. 发布仓 ETS_Auto 可直接运行的发版自检（无需 ETS 客户端）
+python release_guard.py
+python -m unittest discover -s src/auto/tests -p "test_*.py"
 python pre_release_test.py
-python src/auto/tests/test_unit.py
+
+# 仅开发仓 ETS_Project：改动尚未同步 Auto 时先跑本地门禁
+python scripts/dev_check.py --skip-parity
+python scripts/test_maintenance_tools.py
+# 同步 Auto 后再运行不带 --skip-parity 的完整门禁
+python scripts/dev_check.py
 ```
 
 ---
@@ -130,7 +142,7 @@ python src/auto/tests/test_unit.py
 
 ```text
 # ── 套卷答题 ──
-ETS Auto v0.7.0
+ETS Auto v0.7.1
 ========================================
 ETS connected
 Loaded 21 answers (set_id=721920)
@@ -187,7 +199,7 @@ Done: 13 hit / 15 total = 87% | 2 miss | 0 err | 3 learned
 
 ## ⚙️ 工作原理剖析
 
-本项目基于 Chrome DevTools Protocol (CDP) 的底层协议注入：
+本项目基于 Chrome DevTools Protocol (CDP) 的底层协议注入。运行时只接受 host 精确属于 ETS 的 tab 和 loopback WebSocket；发现响应、连接与 JS 求值均有大小/时间上限，超时连接会关闭后重连：
 
 ```text
 ┌──────────────────────────────────┐
@@ -234,16 +246,25 @@ ETS 的交互选项为原生 DOM 节点 (`.choose2`) 而非 Canvas 渲染，可�
 
 ```text
 ETS_Auto/
+├── .gitattributes                # 大字典不生成文本 diff
+├── .gitignore                    # 忽略运行时用户状态文件
 ├── .github/workflows/build-exe.yml  # CI: 自动打包三 exe
+├── release_guard.py              # 版本/字典/tag 发版门禁
+├── pre_release_test.py           # 发版前离线检查
+├── packaged_smoke_test.py        # 已打包 exe 冒烟
 ├── LICENSE
 ├── README.md
 ├── requirements.txt
 ├── CHANGELOG.md
 ├── ecdict_pk.json                # ECDICT 字典补充 (PK用)
+├── info.json                     # 远程版本与公告配置
 └── src/auto/
     ├── ets_common.py             # ★ 共享基类 (CDP/重连/版本/路径)
+    ├── ets_compat.py             # 只读兼容性体检
     ├── ets_auto.py               # ★ 套卷自动答题
     ├── ets_word_pk.py            # ★ 单词PK自动答题
+    ├── ets_pk_store.py           # 跨进程 PK 自学习持久化
+    ├── ets_selftest.py           # 打包离线自检
     ├── ets_strategy.py           # 答案策略层
     ├── ets_hotkey.py             # 全局热键
     ├── ets_remote.py             # 远程配置
@@ -253,7 +274,8 @@ ETS_Auto/
     ├── ets_recording_ui.py       # 录音参考窗 mixin
     ├── ets_rw_mode.py            # 读写同步 mixin
     ├── ets_tee.py                # CLI Tee 输出
-    └── run.py                    # 统一入口 (exam|pk|gui)
+    ├── run.py                    # 统一入口 (exam|pk|gui)
+    └── tests/                    # 发布关键离线回归与 fixtures
 
 ```
 
@@ -270,7 +292,7 @@ ETS_Auto/
 * [x] **热键支持** —— F9 暂停 / F10 跳过 / F12 停止（全局 RegisterHotKey）。 ✅ v0.5+
 * [x] **断连恢复** —— CDP `reconnect()` + 套卷/PK/RW 自动重连与 bridge 重注入。 ✅ v0.6.3–0.6.8
 * [x] **策略层双重验证** —— 复合 key 索引 + 模糊 + DOM 回退；`set_id` 数字校验。 ✅ v0.5–0.6.8
-* [x] **远程配置** —— 版本/公告/pk_extra；未签名 kill-switch 为 warn；可选 HMAC/Ed25519。 ✅ v0.6.0–0.6.8
+* [x] **远程配置** —— 版本/公告；未签名 kill-switch 为 warn；exact host + bounded transport；可选 HMAC/Ed25519。PK 自动热更新暂停，等待受控公共词典。
 * [x] **模块 mixin 拆分** —— recording / RW / tee。 ✅ v0.6.6
 * [x] **CDP loopback + next 等待态** —— 非本机 debugger 拒绝；`next_icon hidden` 不提前收卷。 ✅ v0.6.7
 * [x] **作业 bridge re-hook + ets_base jail** —— CEF 晚到 native 时 re-wrap；Pinia 路径限制在 APPDATA\\ETS。 ✅ v0.6.8
@@ -306,9 +328,13 @@ ETS_Auto/
 
 提交前建议本地跑通：
 ```bash
+python release_guard.py
+python -m unittest discover -s src/auto/tests -p "test_*.py"
 python pre_release_test.py
-python src/auto/tests/test_unit.py
 ```
+
+若在完整 `ETS_Project` 开发仓维护，尚未同步 Auto 时执行 `python scripts/dev_check.py --skip-parity`；同步后执行不带该参数的完整门禁。发布仓 `ETS_Auto` 不包含 `scripts/`。
+
 
 
 ## ⚠️ 注意事项与免责声明

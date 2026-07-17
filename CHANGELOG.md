@@ -1,9 +1,22 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.1] - 2026-07-17
 
 ### Added
 - **Packaged EXE smoke gate** - every release build now runs `--version`, `--help`, and offline `--self-test` commands against all three frozen executables before uploading artifacts or creating a Release.
+- **Durable frozen user data** - packaged apps now store writable state under `%LOCALAPPDATA%\ETS_Auto`; legacy sidecars and `.bak` files migrate under one cross-process family lock and become visible only after a complete, flushed copy.
+- **Process-safe PK persistence** - `ets_pk_store.py` serializes `pk_extra.json` updates across threads and processes, re-reads under the lock, merges updates, recovers healthy backups, and flushes temporary files before atomic replacement.
+- **Long-term offline regression suite** - CI discovers every offline `test_*.py` on Python 3.12 and 3.13; Project now tracks `ecdict_pk.json` and deterministic golden fixtures.
+- **Release guard** - release metadata, the non-empty PK dictionary, and an exact `v$APP_VERSION` tag are validated before packaging.
+
+### Changed
+- **Bounded transport** - CDP discovery and WebSocket attach use explicit proxy-free loopback connections, refuse redirects, require a 101 handshake, and bound response size, timeouts, malformed frames, and poisoned sockets.
+- **Lifecycle cleanup** - exam, PK, GUI, and hotkey shutdown paths are bounded; GUI close no longer waits for a worker on the Tk thread, failed registration is not advertised, and a stopping listener cannot be re-registered as healthy.
+- **Cache input isolation** - parser and strategy normalize cached section shapes, deep JSON recursion follows invalid/backup/fallback contracts, and one malformed section no longer hides healthy answers.
+- **Runtime clock and log safety** - iframe/recording deadlines and RW cache TTL use a monotonic clock; log retention only removes old `ets_auto_*.log` siblings and never arbitrary `.log` files in a user-selected directory.
+- **Maintenance truthfulness** - `pre_release_test.py` reports PASS/SKIP/FAIL separately; `dev_check.py --skip-parity` supports pre-sync checks while the default retains final parity; sync apply validates the target repository and jailed whitelist paths.
+- **Remote metadata parsing** - version checks now honor SemVer prerelease precedence and build metadata, while malformed or oversized version, URL, source, and announcement fields are bounded before reaching the UI.
+- **Remote branch/policy** - mirrors use the real `master` branch. `pkExtraUrl` is empty and automatic PK hot-update remains paused until a controlled public dictionary is published.
 
 ## [0.7.0] - 2026-07-16
 

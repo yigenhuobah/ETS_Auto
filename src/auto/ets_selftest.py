@@ -23,11 +23,13 @@ TARGET_IMPORTS = {
     'pk': (
         'websocket',
         'ets_common',
+        'ets_pk_store',
         'ets_hotkey',
     ),
     'gui': (
         'websocket',
         'ets_common',
+        'ets_pk_store',
         'ets_compat',
         'ets_auto',
         'ets_word_pk',
@@ -95,9 +97,11 @@ def _validate_pk_dictionary(path):
         raise ValueError('ecdict_pk.json must contain a JSON object')
     if not data:
         raise ValueError('ecdict_pk.json is empty')
-    word, translation = next(iter(data.items()))
-    if not isinstance(word, str) or not word or not isinstance(translation, str):
-        raise ValueError('ecdict_pk.json has an invalid first entry')
+    for index, (word, translation) in enumerate(data.items()):
+        if (not isinstance(word, str) or not word.strip()
+                or not isinstance(translation, str) or not translation.strip()):
+            raise ValueError(
+                'ecdict_pk.json has an invalid entry at index %d' % index)
 
 
 def _destroy_ctk_root(root):

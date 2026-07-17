@@ -55,11 +55,11 @@ class ETSRecordingMixin:
         self._fire_question({'type': 'recording', 'type_label': '\u5f55\u97f3\u9898-\u7b49\u5f85\u624b\u52a8\u5b8c\u6210',
                              'step': 'recording_wait'})
 
-        start = time.time()
+        start = time.monotonic()
         notified_5min = False
         notified_1min = False
 
-        while time.time() - start < max_wait:
+        while time.monotonic() - start < max_wait:
             # Check stop signal
             if self.stop_event and self.stop_event.is_set():
                 return False
@@ -70,7 +70,7 @@ class ETSRecordingMixin:
             try:
                 r = self.parse_eval_json(self.eval_js(self._JS_NEXT_READY))
                 if r.get('next_ready'):
-                    elapsed = int(time.time() - start)
+                    elapsed = int(time.monotonic() - start)
                     print("\u2705 \u5f55\u97f3\u5b8c\u6210\uff08\u8017\u65f6 %d \u79d2\uff09\uff0c\u7ee7\u7eed\u7b54\u9898" % elapsed)
                     return True
             except (ConnectionError, TimeoutError, InterruptedError):
@@ -79,7 +79,7 @@ class ETSRecordingMixin:
                 pass
 
             # Progress notifications
-            elapsed = time.time() - start
+            elapsed = time.monotonic() - start
             if not notified_5min and elapsed > 300:
                 print("\u23f0 \u5df2\u7b49\u5f85 5 \u5206\u949f\uff0c\u8bf7\u5c3d\u5feb\u5b8c\u6210\u5f55\u97f3")
                 notified_5min = True

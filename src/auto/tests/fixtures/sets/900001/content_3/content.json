@@ -1,0 +1,20 @@
+{
+  "structure_type": "collector.role",
+  "info": {
+    "stid": "300",
+    "question": [
+      {
+        "ask": "How are you?",
+        "keywords": "fine",
+        "std": [
+          {
+            "value": "I am fine."
+          },
+          {
+            "value": "I'm fine."
+          }
+        ]
+      }
+    ]
+  }
+}

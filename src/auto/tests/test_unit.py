@@ -56,16 +56,24 @@ def _cleared_remote_integrity_env():
 # We inject lightweight stubs so pure-logic tests can run without them.
 import types as _types
 
-# Mock 'websocket' module (required by ets_common)
-if 'websocket' not in _sys.modules:
+# Prefer the real runtime dependency; use a stub only on minimal dev installs.
+try:
+    import websocket as _real_websocket  # noqa: F401
+except ImportError:
     _ws = _types.ModuleType('websocket')
-    _ws.WebSocketConnectionClosedException = type('WebSocketConnectionClosedException', (Exception,), {})
-    _ws.WebSocketTimeoutException = type('WebSocketTimeoutException', (Exception,), {})
+    _ws.WebSocketException = type('WebSocketException', (Exception,), {})
+    _ws.WebSocketConnectionClosedException = type(
+        'WebSocketConnectionClosedException', (_ws.WebSocketException,), {})
+    _ws.WebSocketTimeoutException = type(
+        'WebSocketTimeoutException', (_ws.WebSocketException,), {})
+    _ws.WebSocketProtocolException = type(
+        'WebSocketProtocolException', (_ws.WebSocketException,), {})
     _ws.create_connection = lambda *a, **k: None
     _sys.modules['websocket'] = _ws
 
-# Mock 'customtkinter' module (required by ets_parser / ets_gui)
-if 'customtkinter' not in _sys.modules:
+try:
+    import customtkinter as _real_customtkinter  # noqa: F401
+except ImportError:
     _ctk = _types.ModuleType('customtkinter')
     _ctk.CTk = type('CTk', (), {})
     _ctk.CTkFrame = type('CTkFrame', (), {})
@@ -82,8 +90,9 @@ if 'customtkinter' not in _sys.modules:
     _ctk.set_default_color_theme = lambda *a: None
     _sys.modules['customtkinter'] = _ctk
 
-# Mock PIL (required by ets_gui)
-if 'PIL' not in _sys.modules:
+try:
+    import PIL  # noqa: F401
+except ImportError:
     _pil = _types.ModuleType('PIL')
     _pil.Image = _types.ModuleType('PIL.Image')
     _pil.Image.open = lambda *a, **k: None
@@ -300,6 +309,18 @@ class TestETSStrategy(unittest.TestCase):
                 'xtlist': [{'xt_xh': '1', 'answer': 'B'}],
             })),
             ('content_2', '[]'),
+            ('content_3', _make_content_json('collector.choose', [])),
+            ('content_4', _make_content_json('collector.choose', {
+                'stid': 'nested',
+                'xtlist': [
+                    None,
+                    {
+                        'xt_xh': '2',
+                        'answer': 'C',
+                        'xxlist': [None, {'xx_mc': 'C', 'xx_nr': 'safe'}],
+                    },
+                ],
+            })),
         ])
         strategy = self.Strategy()
         with patch('builtins.print') as mock_print:
@@ -307,13 +328,19 @@ class TestETSStrategy(unittest.TestCase):
 
         mock_print.assert_any_call(
             '  strategy skip content_2: expected JSON object')
+        mock_print.assert_any_call(
+            '  strategy skip content_3: expected info JSON object')
         self.assertEqual(
             [section['dir'] for section in strategy.sections],
-            ['content_1'],
+            ['content_1', 'content_4'],
         )
         answer = strategy.lookup('collector.choose', 'valid', qid='1')
         self.assertIsNotNone(answer)
         self.assertEqual(answer.get('answer'), 'B')
+        nested = strategy.lookup('collector.choose', 'nested', qid='2')
+        self.assertIsNotNone(nested)
+        self.assertEqual(nested.get('answer'), 'C')
+        self.assertEqual(nested.get('options'), ['safe'])
 
     # ── lookup() ─────────────────────────────────────────────────────────────
 
@@ -811,6 +838,48 @@ class TestETSScanSets(unittest.TestCase):
         self.assertEqual(sets[0]['exam_type_names'],
                           ['听后选择1', '听后记录'])
 
+    def test_bad_content_shapes_are_isolated_and_nested_lists_are_filtered(self):
+        import ets_parser
+        set_dir = _os.path.join(self.tmp, '10004')
+        payloads = {
+            'content_bad_top': [],
+            'content_bad_info': {
+                'structure_type': 'collector.choose', 'info': []},
+            'content_good': {
+                'structure_type': 'collector.choose',
+                'info': {'stid': 'good', 'xtlist': [{'xt_xh': '1'}]},
+            },
+            'content_nested': {
+                'structure_type': 'collector.choose',
+                'info': {
+                    'stid': 'nested',
+                    'xtlist': [
+                        None,
+                        {'xt_xh': '2', 'xxlist': [None, {'xx_mc': 'A'}]},
+                    ],
+                },
+            },
+        }
+        for name, payload in payloads.items():
+            directory = _os.path.join(set_dir, name)
+            _os.makedirs(directory)
+            with open(_os.path.join(directory, 'content.json'),
+                      'w', encoding='utf-8') as stream:
+                json.dump(payload, stream)
+
+        sets, err = ets_parser.scan_sets()
+
+        self.assertIsNone(err)
+        self.assertEqual(len(sets), 1)
+        self.assertEqual(
+            [section['dir'] for section in sets[0]['sections']],
+            ['content_good', 'content_nested'],
+        )
+        self.assertEqual(sets[0]['total_questions'], 2)
+        nested = sets[0]['sections'][1]['data']['info']['xtlist']
+        self.assertEqual(len(nested), 1)
+        self.assertEqual(nested[0]['xxlist'], [{'xx_mc': 'A'}])
+
     def test_sort_by_score_descending(self):
         import ets_parser
         for sid, score in [('3', 30), ('1', 100), ('2', 60)]:
@@ -871,8 +940,8 @@ class TestRemoteVersion(unittest.TestCase):
         self.assertEqual(self.cv('0.5.1-beta', '0.5.1'), -1)
         self.assertEqual(self.cv('0.5.1', '0.5.1-beta'), 1)
         self.assertEqual(self.cv('0.5.1-alpha', '0.5.1'), -1)
-        # Pre-releases with same numeric base compare equal (suffix not ordered)
-        self.assertEqual(self.cv('0.5.1-beta', '0.5.1-alpha'), 0)
+        # SemVer orders prerelease identifiers lexically when both are text.
+        self.assertEqual(self.cv('0.5.1-beta', '0.5.1-alpha'), 1)
 
     def test_mixed_letters_digits(self):
         # Leading non-digit (e.g. "v0.5.1") does not match numeric start → 0
@@ -1162,6 +1231,40 @@ class TestRenderSection(unittest.TestCase):
         combined = ''.join(t for t, _ in parts)
         self.assertIn('A', combined)
         self.assertIn('What caused', combined)
+
+    def test_malformed_nested_lists_do_not_break_render_or_exports(self):
+        import ets_parser
+        section = {
+            'type': 'collector.choose',
+            'dir': 'content_1',
+            'data': {
+                'structure_type': 'collector.choose',
+                'info': {
+                    'stid': 7,
+                    'xtlist': [
+                        None,
+                        {
+                            'xt_xh': '1', 'xt_nr': 123, 'answer': 'A',
+                            'xxlist': [None, {'xx_mc': 'A', 'xx_nr': {}}],
+                        },
+                    ],
+                },
+            },
+        }
+        set_data = {
+            'id': '1', 'path': '', 'score': 0,
+            'total_questions': 1,
+            'types': {'collector.choose'}, 'exam_type_names': [],
+            'sections': [section, None],
+        }
+
+        rendered = ''.join(text for text, _tag in ets_parser.render_section(section))
+        markdown = ets_parser._render_full_markdown(set_data)
+        html_text = ets_parser._render_full_html(set_data)
+
+        self.assertIn('123', rendered)
+        self.assertIn('123', markdown)
+        self.assertIn('123', html_text)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1536,6 +1639,20 @@ class TestJsEscapeOpenM3(unittest.TestCase):
 
 
 class TestRemoteIntegrity(unittest.TestCase):
+    def setUp(self):
+        self._integrity_env = {
+            name: _os.environ.get(name)
+            for name in ('ETS_REMOTE_HMAC', 'ETS_REMOTE_PUBKEY')
+        }
+        self.addCleanup(self._restore_integrity_env)
+
+    def _restore_integrity_env(self):
+        for name, value in self._integrity_env.items():
+            if value is None:
+                _os.environ.pop(name, None)
+            else:
+                _os.environ[name] = value
+
     def test_no_key_allows_payload(self):
         import ets_remote
         import os
@@ -1663,7 +1780,7 @@ class TestRemoteIntegrity(unittest.TestCase):
             mock_resp.read.return_value = body
             mock_resp.__enter__ = lambda s: s
             mock_resp.__exit__ = MagicMock(return_value=False)
-            with patch('urllib.request.urlopen', return_value=mock_resp):
+            with patch.object(ets_remote, '_open_remote_url', return_value=mock_resp):
                 r = ets_remote.ETSRemote(current_version='0.6.1')
                 ok, msg = r.download_pk_extra(
                     url='https://raw.githubusercontent.com/o/r/main/pk_extra.json',
@@ -1696,7 +1813,7 @@ class TestRemoteIntegrity(unittest.TestCase):
             mock_resp.read.return_value = raw
             mock_resp.__enter__ = lambda s: s
             mock_resp.__exit__ = MagicMock(return_value=False)
-            with patch('urllib.request.urlopen', return_value=mock_resp):
+            with patch.object(ets_remote, '_open_remote_url', return_value=mock_resp):
                 r = ets_remote.ETSRemote(current_version='0.6.1')
                 ok, msg = r.download_pk_extra(
                     url='https://raw.githubusercontent.com/o/r/main/pk_extra.json',
@@ -1829,6 +1946,15 @@ class TestPackagedSelfTest(unittest.TestCase):
             with open(path, 'w', encoding='utf-8') as handle:
                 json.dump({'hello': '你好'}, handle, ensure_ascii=False)
             ets_selftest._validate_pk_dictionary(path)
+
+    def test_pk_dictionary_rejects_invalid_later_entry(self):
+        import ets_selftest
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _os.path.join(tmp, 'ecdict_pk.json')
+            with open(path, 'w', encoding='utf-8') as handle:
+                json.dump({'valid': 'ok', 'broken': None}, handle)
+            with self.assertRaisesRegex(ValueError, 'index 1'):
+                ets_selftest._validate_pk_dictionary(path)
 
     def test_pk_dictionary_rejects_missing_file(self):
         import ets_selftest
@@ -2289,8 +2415,9 @@ class TestReconnectControlFlow(unittest.TestCase):
                 return False
 
         fake_ws = MagicMock()
-        with patch('urllib.request.urlopen', return_value=FakeResp()), \
-             patch('websocket.create_connection', return_value=fake_ws), \
+        with patch('ets_common._open_local_cdp_url', return_value=FakeResp()), \
+             patch('ets_common._connect_local_cdp_websocket',
+                   return_value=fake_ws), \
              patch.object(base, 'interruptible_sleep', return_value=None):
             ok = base.reconnect()
         self.assertTrue(ok)
@@ -2304,7 +2431,7 @@ class TestReconnectControlFlow(unittest.TestCase):
         base = ets_common.ETSBase(port=10086, debug_mode=False)
         base._RECONNECT_MAX_RETRIES = 2
         base._RECONNECT_DELAY = 0
-        with patch('urllib.request.urlopen', side_effect=OSError('down')), \
+        with patch('ets_common._open_local_cdp_url', side_effect=OSError('down')), \
              patch.object(base, 'interruptible_sleep', return_value=None):
             with self.assertRaises(ConnectionError):
                 base.reconnect()
@@ -2323,7 +2450,7 @@ class TestReconnectControlFlow(unittest.TestCase):
         def _sleep(_s):
             raise InterruptedError('stop')
 
-        with patch('urllib.request.urlopen', side_effect=OSError('down')), \
+        with patch('ets_common._open_local_cdp_url', side_effect=OSError('down')), \
              patch.object(base, 'interruptible_sleep', side_effect=_sleep):
             with self.assertRaises(InterruptedError):
                 base.reconnect()
@@ -2346,7 +2473,7 @@ class TestReconnectControlFlow(unittest.TestCase):
             def __exit__(self, *a):
                 return False
 
-        with patch('urllib.request.urlopen', return_value=FakeResp()), \
+        with patch('ets_common._open_local_cdp_url', return_value=FakeResp()), \
              patch.object(base, 'interruptible_sleep', return_value=None):
             with self.assertRaises(ConnectionError):
                 base.reconnect()
@@ -3427,8 +3554,9 @@ class TestWordPKLearnMiss(unittest.TestCase):
         pk.trans_index = {}
         pk.cn_seg_index = {}
         pk.pk_extra = {}
-        pk.extra_path = _os.path.join(
-            tempfile.mkdtemp(prefix='pk_learn_'), 'pk_extra.json')
+        learn_dir = tempfile.mkdtemp(prefix='pk_learn_')
+        self.addCleanup(shutil.rmtree, learn_dir, True)
+        pk.extra_path = _os.path.join(learn_dir, 'pk_extra.json')
         pk._is_chinese = lambda t: ets_word_pk.ETSWordPK._is_chinese(t)
         pk._cn_split = lambda s: [s] if s else []
         pk.learn_miss = ets_word_pk.ETSWordPK.learn_miss.__get__(pk)
@@ -3467,6 +3595,7 @@ class TestWordPKCaptureAndRecordMiss(unittest.TestCase):
             ets_word_pk.ETSWordPK.capture_wrong_answer.__get__(pk))
         pk.record_miss = ets_word_pk.ETSWordPK.record_miss.__get__(pk)
         td = tempfile.mkdtemp(prefix='pk_miss_')
+        self.addCleanup(shutil.rmtree, td, True)
         pk.misses_path = _os.path.join(td, 'pk_misses.jsonl')
         return pk
 
@@ -3533,8 +3662,9 @@ class TestWordPKCaptureAndRecordMiss(unittest.TestCase):
     def test_record_miss_write_failure_is_swallowed(self):
         pk = self._make()
         # Directory path as file path → open fails
-        pk.misses_path = _os.path.join(
-            tempfile.mkdtemp(prefix='pk_bad_'), 'nope', 'x.jsonl')
+        td = tempfile.mkdtemp(prefix='pk_bad_')
+        self.addCleanup(shutil.rmtree, td, True)
+        pk.misses_path = td
         # Should not raise
         pk.record_miss('q', ['o'])
 
@@ -3956,6 +4086,96 @@ class TestGoldenFixtures(unittest.TestCase):
 
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
+
+class TestOwnedLogCleanup(unittest.TestCase):
+    def test_retention_never_deletes_unrelated_logs(self):
+        import ets_auto
+        with tempfile.TemporaryDirectory() as tmp:
+            now = 2_000_000_000.0
+            unrelated = _os.path.join(tmp, 'unrelated.log')
+            owned_old = _os.path.join(tmp, 'ets_auto_old.log')
+            owned_fresh = _os.path.join(tmp, 'ets_auto_fresh.log')
+            for path in (unrelated, owned_old, owned_fresh):
+                with open(path, 'w', encoding='utf-8') as stream:
+                    stream.write('log')
+            _os.utime(unrelated, (now - 30 * 86400,) * 2)
+            _os.utime(owned_old, (now - 30 * 86400,) * 2)
+            _os.utime(owned_fresh, (now,) * 2)
+
+            removed = ets_auto._cleanup_owned_logs(
+                _os.path.join(tmp, 'run.log'), 7, now=now)
+            self.assertEqual(removed, [])
+            self.assertTrue(_os.path.exists(unrelated))
+            self.assertTrue(_os.path.exists(owned_old))
+
+            removed = ets_auto._cleanup_owned_logs(
+                _os.path.join(tmp, 'ets_auto_current.log'), 7, now=now)
+            self.assertEqual(removed, ['ets_auto_old.log'])
+            self.assertTrue(_os.path.exists(unrelated))
+            self.assertFalse(_os.path.exists(owned_old))
+            self.assertTrue(_os.path.exists(owned_fresh))
+
+
+class TestMonotonicRuntimeTimers(unittest.TestCase):
+    def test_iframe_wait_uses_monotonic_deadline(self):
+        from unittest.mock import patch
+        import ets_auto
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.total_questions = 1
+        inst.get_page_state = lambda: {}
+        inst.is_cdp_parse_error = lambda _state: False
+        inst.interruptible_sleep = lambda _seconds: None
+
+        with patch.object(
+                ets_auto.time, 'time', side_effect=AssertionError('wall clock used')), \
+                patch.object(
+                    ets_auto.time, 'monotonic', side_effect=[0.0, 0.0, 16.0]):
+            self.assertEqual(inst.wait_iframe_ready(timeout=15), (False, False))
+
+    def test_recording_wait_uses_monotonic_deadline(self):
+        from unittest.mock import patch
+        import ets_auto
+        import ets_recording_ui
+        import threading
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.stop_event = threading.Event()
+        inst._recording_window_closed = False
+        inst._fire_question = lambda _info: None
+        inst.eval_js = lambda _js: json.dumps({'next_ready': False})
+        inst.parse_eval_json = json.loads
+        inst.interruptible_sleep = lambda _seconds: None
+
+        with patch.object(
+                ets_recording_ui.time, 'time',
+                side_effect=AssertionError('wall clock used')), patch.object(
+                    ets_recording_ui.time, 'monotonic',
+                    side_effect=[0.0, 0.0, 1.0, 6.0]):
+            self.assertFalse(inst.wait_for_recording_done(max_wait=5))
+
+    def test_rw_cache_ttl_uses_monotonic_clock(self):
+        from unittest.mock import patch
+        import ets_auto
+        import ets_rw_mode
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.rw_show_data = {'cached': True}
+        inst._rw_cache_time = 5.0
+
+        with patch.object(
+                ets_rw_mode.time, 'time',
+                side_effect=AssertionError('wall clock used')), patch.object(
+                    ets_rw_mode.time, 'monotonic', return_value=10.0):
+            self.assertEqual(inst.get_rw_show_data(), {'cached': True})
+
+        inst.rw_show_data = None
+        inst.eval_js = lambda _js: json.dumps({'question': []})
+        inst.parse_eval_json = json.loads
+        with patch.object(
+                ets_rw_mode.time, 'time',
+                side_effect=AssertionError('wall clock used')), patch.object(
+                    ets_rw_mode.time, 'monotonic', return_value=42.0):
+            self.assertEqual(inst.get_rw_show_data(), {'question': []})
+        self.assertEqual(inst._rw_cache_time, 42.0)
+
 
 if __name__ == '__main__':
     # Check for -v / --verbose flag

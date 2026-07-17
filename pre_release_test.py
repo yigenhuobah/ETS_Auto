@@ -15,14 +15,27 @@ sys.path.insert(0, SRC)
 
 passed = 0
 failed = 0
+skipped = 0
 errors = []
 
+
+class SkippedCheckError(RuntimeError):
+    """A check could not run because optional machine data is absent."""
+
+
+def skip(reason):
+    raise SkippedCheckError(reason)
+
+
 def test(name, fn):
-    global passed, failed
+    global passed, failed, skipped
     try:
         fn()
         passed += 1
         print(f"  [PASS] {name}")
+    except SkippedCheckError as e:
+        skipped += 1
+        print(f"  [SKIP] {name}: {e}")
     except Exception as e:
         failed += 1
         errors.append((name, str(e)))
@@ -201,7 +214,12 @@ def test_data_file():
         data = json.load(f)
     assert isinstance(data, dict), f"ecdict_pk.json should be dict, got {type(data)}"
     assert len(data) > 0, "ecdict_pk.json is empty"
-test("ecdict_pk.json exists and is valid JSON dict", test_data_file)
+    for index, (word, translation) in enumerate(data.items()):
+        assert isinstance(word, str) and word.strip(), (
+            f"ecdict_pk.json key at index {index} is invalid")
+        assert isinstance(translation, str) and translation.strip(), (
+            f"ecdict_pk.json value at index {index} is invalid")
+test("ecdict_pk.json exists and all entries are valid strings", test_data_file)
 
 def test_requirements():
     req_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'requirements.txt')
@@ -295,6 +313,7 @@ def t_syntax_all():
         'ets_common.py', 'ets_auto.py', 'ets_word_pk.py', 'ets_parser.py',
         'ets_browser_ui.py', 'ets_remote.py', 'ets_gui.py', 'run.py',
         'ets_strategy.py', 'ets_hotkey.py', 'ets_compat.py',
+        'ets_pk_store.py',
     ]:
         fpath = os.path.join(SRC, name)
         if os.path.exists(fpath):
@@ -312,10 +331,8 @@ print("\n=== Strategy Layer Tests ===")
 
 def t_strategy_import():
     from ets_strategy import ETSStrategy, ETS_DATA_DIR
-    # CI runners don't have ETS data — skip if directory absent
-    if not os.path.isdir(ETS_DATA_DIR):
-        print(f"  [SKIP] ETS_DATA_DIR not found: {ETS_DATA_DIR}")
-        return
+    assert ETSStrategy is not None
+    assert isinstance(ETS_DATA_DIR, str) and ETS_DATA_DIR
 test("import ETSStrategy + ETS_DATA_DIR exists", t_strategy_import)
 
 # Find a real set_id with choose data for tests below
@@ -361,9 +378,7 @@ def _find_test_set():
 
 def t_strategy_load_set():
     if not _find_test_set():
-        # No ETS data on this machine — skip gracefully
-        print("  [SKIP] No ETS cache data available")
-        return
+        skip("no ETS cache data available")
     from ets_strategy import ETSStrategy
     s = ETSStrategy()
     ok = s.load_set(_STRATEGY_TEST_SET)
@@ -374,7 +389,7 @@ test("strategy.load_set() loads sections + answer_index", t_strategy_load_set)
 
 def t_strategy_lookup_choose():
     if not _find_test_set():
-        return  # skip if no data
+        skip("no collector.choose cache data available")
     from ets_strategy import ETSStrategy
     s = ETSStrategy()
     s.load_set(_STRATEGY_TEST_SET)
@@ -413,7 +428,7 @@ test("strategy._text_similarity() returns expected scores", t_strategy_text_simi
 
 def t_strategy_list_sections():
     if not _find_test_set():
-        return
+        skip("no ETS cache data available")
     from ets_strategy import ETSStrategy
     s = ETSStrategy()
     s.load_set(_STRATEGY_TEST_SET)
@@ -427,7 +442,7 @@ test("strategy.list_sections() returns list", t_strategy_list_sections)
 def t_strategy_get_recording_answers():
     """get_recording_answers should return list (may be empty if no recording data)."""
     if not _find_test_set():
-        return
+        skip("no ETS cache data available")
     from ets_strategy import ETSStrategy
     s = ETSStrategy()
     s.load_set(_STRATEGY_TEST_SET)
@@ -517,7 +532,7 @@ def t_strategy_index_role():
     They are indexed by strategy._index_section with key format: collector.role_{stid}_q{qi+1}.
     """
     if not _find_test_set():
-        return
+        skip("no ETS cache data available")
     from ets_strategy import ETSStrategy, ETS_DATA_DIR
     # Find a set that contains role data
     role_set = None
@@ -544,7 +559,7 @@ def t_strategy_index_role():
         if role_set:
             break
     if not role_set:
-        return  # no role data, skip
+        skip("no collector.role cache data available")
     s = ETSStrategy()
     s.load_set(role_set)
     # Verify role key exists in answer_index with q1 format
@@ -602,7 +617,7 @@ def t_ets_data_structure_types():
     """Scan all local content.json files — verify structure_type is known."""
     from ets_strategy import ETS_DATA_DIR
     if not os.path.isdir(ETS_DATA_DIR):
-        return  # skip if no ETS data
+        skip(f"ETS data directory not found: {ETS_DATA_DIR}")
     unknown_types = set()
     count = 0
     for set_id in os.listdir(ETS_DATA_DIR):
@@ -634,7 +649,7 @@ def t_ets_data_choose_format():
     """Verify all collector.choose content.json have valid xtlist with answers."""
     from ets_strategy import ETS_DATA_DIR
     if not os.path.isdir(ETS_DATA_DIR):
-        return
+        skip(f"ETS data directory not found: {ETS_DATA_DIR}")
     issues = []
     count = 0
     for set_id in os.listdir(ETS_DATA_DIR):
@@ -683,7 +698,7 @@ def t_ets_data_fill_format():
     """Verify all collector.fill content.json have valid std with values."""
     from ets_strategy import ETS_DATA_DIR
     if not os.path.isdir(ETS_DATA_DIR):
-        return
+        skip(f"ETS data directory not found: {ETS_DATA_DIR}")
     import re as _re
     issues = []
     count = 0
@@ -719,7 +734,7 @@ def t_ets_data_fill_format():
             except Exception as e:
                 issues.append(f"{set_id}/{d}: parse error: {e}")
     if count == 0:
-        return  # no fill data, skip
+        skip("no collector.fill cache data available")
     if issues:
         msg = '; '.join(issues[:5])
         if len(issues) > 5:
@@ -989,7 +1004,7 @@ test("js_escape() escapes U+2028/U+2029 (OPEN-M3)", t_js_escape_line_separators)
 
 # ── Summary ────────────────────────────────────────────────
 print(f"\n{'='*40}")
-print(f"Results: {passed} passed, {failed} failed")
+print(f"Results: {passed} passed, {failed} failed, {skipped} skipped")
 if failed:
     print("\nFailed tests:")
     for name, err in errors:

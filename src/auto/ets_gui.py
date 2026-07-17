@@ -101,6 +101,8 @@ class ETSApp(ctk.CTk):
         self._closed = False  # set in _on_close; _run_finished no-ops after destroy
         self._original_stdout = sys.stdout
         self._original_stderr = sys.stderr
+        self._queue_writer_out = None
+        self._queue_writer_err = None
 
         # Theme
         ctk.set_appearance_mode("dark")
@@ -120,6 +122,31 @@ class ETSApp(ctk.CTk):
 
         # Background remote check (non-blocking)
         self._check_remote_async()
+
+    def _safe_after(self, delay_ms, callback, *args):
+        """Schedule a Tk callback without leaking close/destroy races."""
+        if getattr(self, '_closed', False):
+            return False
+        try:
+            self.after(delay_ms, callback, *args)
+            return True
+        except Exception:
+            return False
+
+    def _worker_cleanup_without_ui(self):
+        """Worker-side fallback when Tk can no longer accept callbacks."""
+        try:
+            self._restore_streams()
+        except Exception:
+            pass
+        self._running = False
+
+    def _schedule_run_finished(self):
+        """Publish worker completion or finish locally after GUI teardown."""
+        if self._safe_after(0, self._run_finished):
+            return True
+        self._worker_cleanup_without_ui()
+        return False
 
     # ── UI Construction ──────────────────────────────────────
     def _build_ui(self):
@@ -289,7 +316,7 @@ class ETSApp(ctk.CTk):
         Thread-safe: schedules UI update on main thread via after().
         """
         # Schedule on main thread — callback may fire from worker thread
-        self.after(0, lambda: self._do_update_answer_preview(info))
+        self._safe_after(0, self._do_update_answer_preview, info)
 
     def _do_update_answer_preview(self, info):
         """Actual UI update — always runs on main thread.
@@ -453,7 +480,7 @@ class ETSApp(ctk.CTk):
         self._start_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
         self._status_var.set("运行中...")
-        self._hotkey_var.set("⌨ F9暂停/恢复  F10跳过  F12停止")
+        self._hotkey_var.set("⌨ 热键状态见运行日志")
         # Reset progress bar (H22: progress driven by question callbacks)
         self._progress_var.set(0.0)
         self._progress_label_var.set("")
@@ -496,11 +523,11 @@ class ETSApp(ctk.CTk):
                 remote = ETSRemote(current_version=APP_VERSION)
                 info = remote.check()
                 # Always hop to main thread for assignment + UI
-                self.after(0, self._on_remote_checked, info)
+                self._safe_after(0, self._on_remote_checked, info)
             except Exception as e:
                 # Log to terminal but don't crash GUI — remote check is non-critical
                 print("[Remote] Check failed: %s" % e)
-                self.after(0, self._on_remote_checked, None)
+                self._safe_after(0, self._on_remote_checked, None)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -548,12 +575,11 @@ class ETSApp(ctk.CTk):
                 remote = ETSRemote(current_version=APP_VERSION)
                 success, message = remote.download_pk_extra(url=pk_url)
                 # Bind message as default arg to avoid late-binding in after()
+                prefix = "[远程] %s\n" if success else "[远程] ⚠️ %s\n"
                 if success:
-                    self.after(0, lambda m=message: self._append_log(
-                        "[远程] %s\n" % m))
-                else:
-                    self.after(0, lambda m=message: self._append_log(
-                        "[远程] ⚠️ %s\n" % m))
+                    prefix = "[远程] %s\n"
+                self._safe_after(
+                    0, self._append_log, prefix % message)
             except Exception as e:
                 # Non-critical, but do not hide failures completely
                 print("[Remote] pk_extra update error: %s" % e)
@@ -568,69 +594,44 @@ class ETSApp(ctk.CTk):
         self._append_log("\n[用户] 请求停止...\n")
 
     def _on_close(self):
-        """Handle window close: stop worker, wait briefly, then destroy."""
+        """Signal stop and destroy immediately; never join on the Tk thread."""
         self._closed = True
+        self._stop_event.set()
         if self._running:
-            self._stop_event.set()
             try:
                 self._status_var.set("正在停止...")
             except Exception:
                 pass
-            # Wait for worker to exit (max 3s)
-            if self._worker and self._worker.is_alive():
-                self._worker.join(timeout=3)
-            self._restore_streams()
-        self.destroy()
+        self._restore_streams()
+        self._running = False
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
     def _restore_streams(self):
-        """Restore stdout/stderr to original, drain remaining log queue.
-        Bug fix: join worker thread first to close the race window where
-        QueueWriter still writes after streams are restored.
-
-        Join budget raised to 8s so stop during eval_js/reconnect is less
-        likely to flip streams under a still-live worker.
-        """
-        if self._worker and self._worker.is_alive() and self._worker is not threading.current_thread():
-            self._worker.join(timeout=8)
-
-        # Drain remaining log messages (already written to original by QueueWriter)
-        while not self._log_queue.empty():
-            try:
-                self._log_queue.get_nowait()
-            except queue.Empty:
-                break
-
-        # If worker still alive, leave QueueWriter in place to avoid lost/racy writes
-        if self._worker and self._worker.is_alive() and self._worker is not threading.current_thread():
-            return
-
-        sys.stdout = self._original_stdout
-        sys.stderr = self._original_stderr
+        """Restore only streams currently owned by this app instance."""
+        writer_out = getattr(self, '_queue_writer_out', None)
+        writer_err = getattr(self, '_queue_writer_err', None)
+        if writer_out is not None and sys.stdout is writer_out:
+            sys.stdout = writer_out.original
+        if writer_err is not None and sys.stderr is writer_err:
+            sys.stderr = writer_err.original
+        self._queue_writer_out = None
+        self._queue_writer_err = None
 
     def _run_finished(self):
         """Called on main thread when worker finishes."""
         # Window may already be destroyed (_on_close); never touch dead widgets.
         if getattr(self, '_closed', False):
-            try:
-                self._restore_streams()
-            except Exception:
-                pass
-            self._running = False
+            self._worker_cleanup_without_ui()
             return
         try:
             if not self.winfo_exists():
-                try:
-                    self._restore_streams()
-                except Exception:
-                    pass
-                self._running = False
+                self._worker_cleanup_without_ui()
                 return
         except Exception:
-            try:
-                self._restore_streams()
-            except Exception:
-                pass
-            self._running = False
+            self._worker_cleanup_without_ui()
             return
 
         self._restore_streams()
@@ -744,20 +745,21 @@ class ETSApp(ctk.CTk):
             print("[错误] 导入失败: %s" % e)
             print("请确保 ets_auto.py / ets_word_pk.py / ets_common.py 在正确路径")
             self._worker_error = True
-            self.after(0, lambda err=str(e): self._show_error(
+            self._safe_after(0, self._show_error,
                 "导入失败",
-                "找不到必要模块：%s\n\n请确保 ets_auto.py / ets_word_pk.py / ets_common.py 在正确路径" % err))
+                "找不到必要模块：%s\n\n请确保 ets_auto.py / ets_word_pk.py / ets_common.py 在正确路径" % str(e))
         except Exception as e:
             print("[错误] %s" % e)
             self._worker_error = True
-            self.after(0, lambda err=str(e): self._show_error("运行错误", err))
+            self._safe_after(0, self._show_error, "运行错误", str(e))
         finally:
-            # Schedule UI update on main thread
-            self.after(0, self._run_finished)
+            self._schedule_run_finished()
 
     # ── Log polling ──────────────────────────────────────────
     def _poll_log(self):
         """Drain the log queue and update the textbox (runs on main thread)."""
+        if getattr(self, '_closed', False):
+            return
         while True:
             try:
                 msg = self._log_queue.get_nowait()
@@ -765,7 +767,7 @@ class ETSApp(ctk.CTk):
                 break
             self._append_log(msg)
         # Re-schedule every 100ms
-        self.after(100, self._poll_log)
+        self._safe_after(100, self._poll_log)
 
     def _append_log(self, text):
         """Append text to the log widget."""

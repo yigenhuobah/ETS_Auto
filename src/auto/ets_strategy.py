@@ -27,6 +27,7 @@ Usage:
   ans = strategy.lookup('collector.choose', stid, qid='1')
 """
 import sys, os, json, re, hashlib, copy
+from ets_common import normalize_ets_content
 # ── Path setup ───────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
     _BASE = sys._MEIPASS
@@ -63,6 +64,12 @@ def _html_to_text(html_str):
     with a letter (e.g. <br>, <p>, </div>) — this avoids false matches on
     math text like "x < y" or "a < 3" which are not HTML tags.
     """
+    if html_str is None:
+        return ''
+    if not isinstance(html_str, str):
+        if not isinstance(html_str, (bool, int, float)):
+            return ''
+        html_str = str(html_str)
     if not html_str:
         return ''
     import html
@@ -253,6 +260,11 @@ class ETSStrategy:
                 skipped += 1
                 print("  strategy skip %s: expected JSON object" % d)
                 continue
+            data = normalize_ets_content(data)
+            if data is None:
+                skipped += 1
+                print("  strategy skip %s: expected info JSON object" % d)
+                continue
 
             stype = data.get('structure_type', '')
             info = data.get('info', {})
@@ -360,15 +372,17 @@ class ETSStrategy:
 
     def _index_section(self, section):
         """Build composite-key index for one section."""
-        data = section['data']
-        stype = section['type']
-        stid = section['stid']
+        data = normalize_ets_content(section.get('data'))
+        if data is None:
+            return
+        stype = data.get('structure_type', 'unknown')
         info = data.get('info', {})
+        stid = str(info.get('stid') or '')
 
         if stype == 'collector.choose':
             for xt in info.get('xtlist', []):
                 qid = str(xt.get('xt_xh', ''))
-                answer = xt.get('answer', '')
+                answer = str(xt.get('answer') or '')
                 title = _html_to_text(xt.get('xt_nr', ''))
                 key = "collector.choose_%s_%s" % (stid, qid)
                 self.answer_index[key] = {
@@ -381,7 +395,7 @@ class ETSStrategy:
         elif stype == 'collector.fill':
             for std in info.get('std', []):
                 qid = str(std.get('xth', std.get('th', '')))
-                answer = std.get('value', '')
+                answer = str(std.get('value') or '')
                 if '/' in answer:
                     answer = answer.split('/')[0].strip()
                 key = "collector.fill_%s_%s" % (stid, qid)
@@ -415,7 +429,7 @@ class ETSStrategy:
             # collector.fill_* entry (real fill section wins) — C6.
             for std in info.get('std', []):
                 qid = str(std.get('xth', std.get('th', '')))
-                answer = std.get('value', '')
+                answer = str(std.get('value') or '')
                 if '/' in answer:
                     answer = answer.split('/')[0].strip()
                 if answer:

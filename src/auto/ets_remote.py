@@ -33,22 +33,31 @@ Usage:
       print(reason)
 """
 import json
+import math
 import os
-import shutil
-import tempfile
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from ets_pk_store import (
+    PKExtraCorruptError,
+    PKExtraStoreError,
+    atomic_write_json as _store_atomic_write_json,
+    filter_pk_extra_schema as _store_filter_pk_extra_schema,
+    load_pk_extra as _store_load_pk_extra,
+    merge_write_pk_extra,
+)
 
 
 # ── Mirror sources (ordered by priority for Chinese users) ──
 # Each entry: (name, url_template)
 # {owner}/{repo} will be substituted at runtime
 _MIRROR_TEMPLATES = [
-    ("ghproxy",  "https://ghfast.top/https://raw.githubusercontent.com/{owner}/{repo}/main/info.json"),
-    ("gitee",    "https://gitee.com/{owner}/{repo}/raw/main/info.json"),
-    ("github",   "https://raw.githubusercontent.com/{owner}/{repo}/main/info.json"),
+    ("ghproxy",  "https://ghfast.top/https://raw.githubusercontent.com/{owner}/{repo}/master/info.json"),
+    ("gitee",    "https://gitee.com/{owner}/{repo}/raw/master/info.json"),
+    ("github",   "https://raw.githubusercontent.com/{owner}/{repo}/master/info.json"),
 ]
 
 # H18/H19: only these hosts may be contacted for info.json / pkExtraUrl.
@@ -60,8 +69,22 @@ _ALLOWED_URL_HOSTS = frozenset({
     'github.com',  # downloadUrl display / release pages
 })
 
+# Remote bodies are always bounded before JSON decoding.
+_INFO_MAX_BYTES = 256 * 1024
 # Max body size for pk_extra.json download (bytes)
 _PK_EXTRA_MAX_BYTES = 2 * 1024 * 1024
+
+_CACHE_MAX_AGE = 24 * 60 * 60
+_CACHE_FUTURE_SKEW = 5 * 60
+_VERSION_MAX_CHARS = 128
+_ANNOUNCEMENT_MAX_CHARS = 4096
+_URL_MAX_CHARS = 2048
+_SOURCE_MAX_CHARS = 64
+_VERSION_RE = re.compile(
+    r'(?P<core>\d+(?:\.\d+)*)'
+    r'(?:-(?P<pre>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?'
+    r'(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?')
+
 
 # Default GitHub repo for ETS_Auto
 DEFAULT_OWNER = "yigenhuobah"
@@ -99,6 +122,95 @@ def is_url_allowed(url):
     if parsed.username or parsed.password:
         return False
     return True
+
+
+class _AllowlistedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject non-allowlisted redirect targets before urllib follows them."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            redirect_url = urllib.parse.urljoin(req.full_url, newurl)
+        except (TypeError, ValueError) as exc:
+            raise urllib.error.URLError(
+                'invalid redirect target: %s' % exc) from exc
+        if not is_url_allowed(redirect_url):
+            raise urllib.error.URLError(
+                'redirect target is not allowlisted: %s' % redirect_url)
+        return super().redirect_request(
+            req, fp, code, msg, headers, redirect_url)
+
+
+def _open_remote_url(request, timeout):
+    """Open a remote request with per-hop redirect allowlist enforcement."""
+    opener = urllib.request.build_opener(_AllowlistedRedirectHandler())
+    return opener.open(request, timeout=timeout)
+
+
+def _response_url_allowed(response, requested_url):
+    """Validate the final URL after redirects.
+
+    urllib responses return a string from geturl(). Lightweight test doubles
+    often omit it (or expose a generic mock), so those fall back to the already
+    validated request URL.
+    """
+    getter = getattr(response, 'geturl', None)
+    if not callable(getter):
+        return is_url_allowed(requested_url)
+    try:
+        final_url = getter()
+    except Exception:
+        return False
+    if not isinstance(final_url, str):
+        final_url = requested_url
+    return is_url_allowed(final_url)
+
+
+def _read_bounded_body(response, max_bytes):
+    """Read at most ``max_bytes + 1`` while supporting no-arg test doubles."""
+    try:
+        raw = response.read(max_bytes + 1)
+    except TypeError:
+        raw = response.read()
+    if not isinstance(raw, (bytes, bytearray)):
+        raise TypeError('HTTP response body must be bytes')
+    raw = bytes(raw)
+    if len(raw) > max_bytes:
+        raise ValueError('HTTP response body exceeds size limit')
+    return raw
+
+
+def _valid_cache_timestamp(value, now=None):
+    """Return a trusted finite timestamp, otherwise ``None``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        fetched = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(fetched):
+        return None
+    if now is None:
+        now = time.time()
+    if fetched > now + _CACHE_FUTURE_SKEW:
+        return None
+    if now - fetched > _CACHE_MAX_AGE:
+        return None
+    return fetched
+
+
+def _text_field(value, default='', max_chars=None, truncate=False):
+    if not isinstance(value, str):
+        return default
+    if max_chars is not None and len(value) > max_chars:
+        return value[:max_chars] if truncate else default
+    return value
+
+
+def _version_field(value, default='0.0.0'):
+    value = _text_field(value, default, max_chars=_VERSION_MAX_CHARS).strip()
+    if not value or _VERSION_RE.fullmatch(value) is None:
+        return default
+    return value
 
 
 def verify_remote_payload_integrity(data, signature_hex=None, public_key_pem=None):
@@ -196,24 +308,14 @@ def _verify_remote_dict(data):
 
 
 def resolve_pk_extra_path(filename='pk_extra.json'):
-    """User-writable pk_extra path — delegates to ets_common.user_data_path."""
-    from ets_common import user_data_path
-    return user_data_path(filename, anchor_file=__file__)
+    """Resolve and migrate frozen ``pk_extra`` plus its backup."""
+    from ets_common import migrate_legacy_user_data_family
+    return migrate_legacy_user_data_family(filename, anchor_file=__file__)
 
 
 def _filter_pk_extra_schema(data):
-    """Validate/normalize pk_extra payload: must be dict[str, str].
-
-    Returns a new dict with only string keys and string values, or None if
-    the top-level value is not a dict (reject lists/scalars entirely).
-    """
-    if not isinstance(data, dict):
-        return None
-    out = {}
-    for k, v in data.items():
-        if isinstance(k, str) and isinstance(v, str):
-            out[k] = v
-    return out
+    """Compatibility wrapper around the shared pk_extra schema filter."""
+    return _store_filter_pk_extra_schema(data)
 
 
 def _load_local_pk_extra(path):
@@ -227,24 +329,11 @@ def _load_local_pk_extra(path):
 
 
 def _load_local_pk_extra_status(path):
-    """Load local pk_extra.json.
-
-    Returns (data: dict, status: 'ok'|'missing'|'invalid').
-    - missing: no file → empty dict is safe to merge onto
-    - invalid: file exists but unreadable/schema-bad → do not overwrite blindly
-    - ok: valid filtered dict (may be empty object)
-    """
-    if not path or not os.path.exists(path):
-        return {}, 'missing'
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        filtered = _filter_pk_extra_schema(data)
-        if filtered is None:
-            return {}, 'invalid'
-        return filtered, 'ok'
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError):
-        return {}, 'invalid'
+    """Load through the shared lock, including healthy ``.bak`` recovery."""
+    data, status = _store_load_pk_extra(path)
+    if status in ('restored', 'backup'):
+        status = 'ok'
+    return data, status
 
 
 def _merge_pk_extra(local_data, remote_data):
@@ -263,23 +352,8 @@ def _merge_pk_extra(local_data, remote_data):
 
 
 def _atomic_write_json(path, data):
-    """Write JSON via temp file + os.replace (crash-safe; matches learn_miss)."""
-    dir_name = os.path.dirname(path) or '.'
-    os.makedirs(dir_name, exist_ok=True)
-    tmp_path = ''
-    try:
-        fd, tmp_path = tempfile.mkstemp(suffix='.json', dir=dir_name)
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.write('\n')
-        os.replace(tmp_path, path)
-        tmp_path = ''
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    """Compatibility wrapper for cache writes and older callers."""
+    return _store_atomic_write_json(path, data)
 
 
 class RemoteInfo:
@@ -319,22 +393,30 @@ def compare_versions(v1, v2):
         compare_versions("0.5.1", "0.5.1-beta")    →  1
         compare_versions("0.5.1-beta", "0.5.0")    →  1
     """
-    import re as _re
-
     def _parse(v):
-        if not v or not v.strip():
-            return ([0], False)
-        # Split numeric version from pre-release suffix
-        m = _re.match(r'^(\d+(?:\.\d+)*)', v.strip())
-        if not m:
-            return ([0], False)
-        numeric_str = m.group(1)
-        suffix = v.strip()[len(m.group(0)):].strip()
-        is_prerelease = bool(suffix)
-        parts = []
-        for p in numeric_str.split('.'):
-            parts.append(int(p) if p.isdigit() else 0)
-        return (parts if parts else [0], is_prerelease)
+        if not isinstance(v, str):
+            return ([0], None)
+        text = v.strip()
+        if not text or len(text) > _VERSION_MAX_CHARS:
+            return ([0], None)
+        match = _VERSION_RE.fullmatch(text)
+        if match is None:
+            return ([0], None)
+        try:
+            parts = [int(component) for component in match.group('core').split('.')]
+        except (OverflowError, ValueError):
+            return ([0], None)
+        prerelease = match.group('pre')
+        if prerelease is None:
+            return (parts, None)
+        identifiers = []
+        for identifier in prerelease.split('.'):
+            if identifier.isdigit():
+                identifiers.append((0, int(identifier)))
+            else:
+                identifiers.append((1, identifier))
+        return (parts, tuple(identifiers))
+
 
     a, a_pre = _parse(v1)
     b, b_pre = _parse(v2)
@@ -347,10 +429,22 @@ def compare_versions(v1, v2):
             return -1
         if x > y:
             return 1
-    # Numeric parts equal — prerelease < release
-    if a_pre and not b_pre:
+    # Numeric core equal: a release outranks any prerelease.
+    if a_pre is None and b_pre is None:
+        return 0
+    if a_pre is not None and b_pre is None:
         return -1
-    if not a_pre and b_pre:
+    if a_pre is None and b_pre is not None:
+        return 1
+
+    for left, right in zip(a_pre, b_pre):
+        if left < right:
+            return -1
+        if left > right:
+            return 1
+    if len(a_pre) < len(b_pre):
+        return -1
+    if len(a_pre) > len(b_pre):
         return 1
     return 0
 
@@ -413,28 +507,15 @@ class ETSRemote:
         self._last_info = None  # Cache last check result for download_pk_extra
 
     def _resolve_cache_path(self):
-        """Resolve cache path via user_data_path (project root / exe side).
-
-        If a legacy cache still sits beside ets_remote.py (pre-user_data_path)
-        and the new path is missing, prefer the legacy file so offline 24h
-        cache is not silently orphaned after the path move.
+        """Resolve the cache and migrate a frozen executable sidecar.
 
         Absolute _CACHE_FILENAME (used by unit tests) is honored as-is.
         """
         name = _CACHE_FILENAME
         if os.path.isabs(name):
             return name  # unit tests may override with an absolute path
-        from ets_common import user_data_path
-        primary = user_data_path(name, anchor_file=__file__)
-        if os.path.isfile(primary):
-            return primary
-        legacy = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              os.path.basename(name))
-        if (os.path.isfile(legacy)
-                and os.path.normcase(os.path.abspath(legacy))
-                != os.path.normcase(os.path.abspath(primary))):
-            return legacy
-        return primary
+        from ets_common import migrate_legacy_user_data_file
+        return migrate_legacy_user_data_file(name, anchor_file=__file__)
 
     def _build_urls(self):
         """Build ordered list of mirror URLs to try."""
@@ -457,13 +538,17 @@ class ETSRemote:
                 'User-Agent': 'ETS_Auto/%s' % self.current_version,
                 'Accept': 'application/json',
             })
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with _open_remote_url(req, timeout=self.timeout) as resp:
+                if not _response_url_allowed(resp, url):
+                    return None
                 if resp.status != 200:
                     return None
-                raw = resp.read()
-                return json.loads(raw.decode('utf-8'))
+                raw = _read_bounded_body(resp, _INFO_MAX_BYTES)
+            parsed = json.loads(raw.decode('utf-8'))
+            return parsed if isinstance(parsed, dict) else None
         except (urllib.error.URLError, urllib.error.HTTPError,
-                json.JSONDecodeError, OSError, TimeoutError, ValueError):
+                json.JSONDecodeError, OSError, TimeoutError, TypeError,
+                UnicodeDecodeError, ValueError, RecursionError):
             return None
 
     def _save_cache(self, data):
@@ -474,7 +559,7 @@ class ETSRemote:
         """
         try:
             _atomic_write_json(self._cache_path, data)
-        except (OSError, TypeError, ValueError):
+        except (OSError, TypeError, ValueError, RecursionError):
             # Cache is best-effort: never abort remote check() for write/serialize
             pass
 
@@ -494,17 +579,20 @@ class ETSRemote:
             if not isinstance(raw, dict):
                 return None
 
+            now = time.time()
             # New wrapper format: {"data": {...}, "_fetched_at": ..., "_source": ...}
             if 'data' in raw and isinstance(raw.get('data'), dict):
-                fetched = raw.get('_fetched_at', 0)
-                if time.time() - fetched > 86400:
+                fetched = _valid_cache_timestamp(
+                    raw.get('_fetched_at'), now=now)
+                if fetched is None:
                     return None
                 # Return in wrapper format so _parse_remote_info can extract
+                raw['_fetched_at'] = fetched
                 return raw
 
             # Legacy flat format (migrate on read)
-            fetched = raw.get('_fetched_at', 0)
-            if time.time() - fetched > 86400:
+            fetched = _valid_cache_timestamp(raw.get('_fetched_at'), now=now)
+            if fetched is None:
                 return None
             # Convert to wrapper format
             data = {k: v for k, v in raw.items() if not k.startswith('_')}
@@ -513,7 +601,7 @@ class ETSRemote:
                 '_fetched_at': fetched,
                 '_source': raw.get('_source', 'cache'),
             }
-        except (OSError, json.JSONDecodeError, ValueError):
+        except (OSError, json.JSONDecodeError, ValueError, RecursionError):
             return None
 
     def check(self, use_cache=True):
@@ -593,12 +681,14 @@ class ETSRemote:
         H18/H19: pkExtraUrl / downloadUrl that fail the host allowlist are
         cleared (empty string) so callers never act on disallowed hosts.
         """
-        latest = data.get('version', '0.0.0')
-        min_ver = data.get('minVer', '0.0.0')
-        allow_start = data.get('allowStart', True)
-        announcement = data.get('announcement', '')
-        pk_extra_url = data.get('pkExtraUrl', '') or ''
-        download_url = data.get('downloadUrl', '') or ''
+        latest = _version_field(data.get('version'))
+        min_ver = _version_field(data.get('minVer'))
+        raw_allow_start = data.get('allowStart', True)
+        allow_start = raw_allow_start if isinstance(raw_allow_start, bool) else True
+        announcement = _text_field(
+            data.get('announcement'), max_chars=_ANNOUNCEMENT_MAX_CHARS, truncate=True)
+        pk_extra_url = _text_field(data.get('pkExtraUrl'), max_chars=_URL_MAX_CHARS)
+        download_url = _text_field(data.get('downloadUrl'), max_chars=_URL_MAX_CHARS)
 
         # H19: drop non-allowlisted pkExtraUrl (supply-chain write path)
         if pk_extra_url and not is_url_allowed(pk_extra_url):
@@ -620,7 +710,7 @@ class ETSRemote:
             announcement=announcement,
             pk_extra_url=pk_extra_url,
             download_url=download_url,
-            source=source,
+            source=_text_field(source, 'unknown', max_chars=_SOURCE_MAX_CHARS),
             fetched_at=fetched_at,
         )
 
@@ -660,30 +750,13 @@ class ETSRemote:
         if target_path is None:
             target_path = resolve_pk_extra_path('pk_extra.json')
 
-        backup_path = target_path + '.bak'
-
-        # Status FIRST — never clobber a good .bak with a corrupt target
-        local_data, local_status = _load_local_pk_extra_status(target_path)
+        # Validate/recover before network I/O. The final commit re-reads again
+        # under the same process-wide path lock, so this is not a stale snapshot.
+        _local_data, local_status = _load_local_pk_extra_status(target_path)
         if local_status == 'invalid':
-            bak_data, bak_status = _load_local_pk_extra_status(backup_path)
-            if bak_status == 'ok':
-                try:
-                    _atomic_write_json(target_path, bak_data)
-                    local_data, local_status = bak_data, 'ok'
-                except OSError:
-                    return False, (
-                        "本地 pk_extra.json 损坏，且无法从 .bak 恢复；"
-                        "已拒绝远程覆盖以免丢失学习记录")
-            else:
-                return False, (
-                    "本地 pk_extra.json 损坏/格式无效；"
-                    "已拒绝远程覆盖以免丢失学习记录（可手动删除后重试）")
-        elif local_status == 'ok':
-            # Only snapshot healthy local before remote merge write
-            try:
-                shutil.copy2(target_path, backup_path)
-            except OSError:
-                pass  # Backup failure is non-critical
+            return False, (
+                "本地 pk_extra.json 损坏/格式无效，且没有健康备份；"
+                "已拒绝远程覆盖以免丢失学习记录（可手动删除后重试）")
 
         # Build download URL list with mirror fallback (all must pass allowlist)
         download_urls = [url]
@@ -692,8 +765,10 @@ class ETSRemote:
                 'https://raw.githubusercontent.com',
                 'https://ghfast.top/https://raw.githubusercontent.com')
             gitee_url = url.replace(
-                'https://raw.githubusercontent.com',
-                'https://gitee.com').replace('/main/', '/raw/main/')
+                'https://raw.githubusercontent.com', 'https://gitee.com')
+            gitee_url = gitee_url.replace(
+                '/main/', '/raw/main/').replace(
+                '/master/', '/raw/master/')
             # Prefer Chinese mirror first
             download_urls = [ghfast_url, url, gitee_url]
 
@@ -715,13 +790,13 @@ class ETSRemote:
                     'User-Agent': 'ETS_Auto/%s' % self.current_version,
                     'Accept': 'application/json',
                 })
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with _open_remote_url(req, timeout=self.timeout) as resp:
+                    if not _response_url_allowed(resp, dl_url):
+                        continue
                     if resp.status != 200:
                         continue
                     # Bound body size (supply-chain / DoS)
-                    raw = resp.read(_PK_EXTRA_MAX_BYTES + 1)
-                if len(raw) > _PK_EXTRA_MAX_BYTES:
-                    continue
+                    raw = _read_bounded_body(resp, _PK_EXTRA_MAX_BYTES)
                 remote_obj = json.loads(raw.decode('utf-8'))
                 # OPEN-H4: verify signed pk_extra the same way as check()
                 # when ETS_REMOTE_HMAC / ETS_REMOTE_PUBKEY is set; allowlist
@@ -734,9 +809,17 @@ class ETSRemote:
                     # Invalid top-level schema — try next mirror
                     continue
                 # H16: merge — remote updates; preserve local-only learn keys
-                merged = _merge_pk_extra(local_data, remote_data)
-                _atomic_write_json(target_path, merged)
-                local_only = sum(1 for k in (local_data or {}) if k not in remote_data)
+                try:
+                    merged = merge_write_pk_extra(
+                        target_path, remote_data, backup_existing=True)
+                except PKExtraCorruptError:
+                    return False, (
+                        "本地 pk_extra.json 在下载期间损坏，且没有健康备份；"
+                        "已拒绝远程覆盖以免丢失学习记录")
+                except (PKExtraStoreError, OSError) as exc:
+                    return False, (
+                        "pk_extra.json 已下载，但保存失败：%s" % exc)
+                local_only = sum(1 for key in merged if key not in remote_data)
                 return True, "pk_extra.json 已更新（merge %d remote + %d local-only → %d keys）" % (
                     len(remote_data),
                     local_only,
@@ -744,7 +827,7 @@ class ETSRemote:
                 )
             except (urllib.error.URLError, urllib.error.HTTPError,
                     json.JSONDecodeError, OSError, TimeoutError, ValueError,
-                    UnicodeDecodeError, TypeError):
+                    UnicodeDecodeError, TypeError, RecursionError):
                 continue
 
         # Download failed: leave existing local file intact (offline cache safe).

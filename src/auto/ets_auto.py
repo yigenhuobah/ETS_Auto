@@ -32,6 +32,42 @@ from ets_strategy import (
 from ets_selftest import add_runtime_check_arguments, run_self_test
 
 
+_OWNED_LOG_PREFIX = 'ets_auto_'
+
+
+def _cleanup_owned_logs(log_path, keep_days, now=None):
+    """Delete only old ETS-owned logs, never arbitrary sibling ``.log`` files.
+
+    A user-selected log directory is not an ownership boundary. Retention is
+    enabled only when the requested filename follows the ``ets_auto_*.log``
+    convention, and it only considers siblings with that same prefix.
+    """
+    if not log_path or keep_days <= 0:
+        return []
+    current_name = os.path.basename(os.path.abspath(log_path))
+    if not (current_name.startswith(_OWNED_LOG_PREFIX)
+            and current_name.endswith('.log')):
+        return []
+    directory = os.path.dirname(os.path.abspath(log_path)) or '.'
+    cutoff = (time.time() if now is None else float(now)) - keep_days * 86400
+    removed = []
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return removed
+    for name in names:
+        if not (name.startswith(_OWNED_LOG_PREFIX) and name.endswith('.log')):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed.append(name)
+        except OSError:
+            continue
+    return removed
+
+
 class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
     def __init__(self, port=10086, debug_mode=False, stop_event=None):
         super().__init__(port=port, debug_mode=debug_mode, stop_event=stop_event)
@@ -930,8 +966,8 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
         # #7: Adaptive timeout — larger exams tend to have heavier pages
         adaptive_timeout = min(10 + max(self.total_questions, 1) // 3, 30)
         timeout = max(timeout, adaptive_timeout)
-        start = time.time()
-        while time.time() - start < timeout:
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
             state = self.get_page_state()
             if self.is_cdp_parse_error(state):
                 raise ConnectionError("page state: %s" % state.get('error'))
@@ -994,13 +1030,21 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
 
         # Register global hotkeys (Windows only)
         hotkey = None
+        hotkey_candidate = None
         try:
             from ets_hotkey import ETSHotkey
-            hotkey = ETSHotkey(on_stop=self._signal_stop)
-            hotkey.register()
+            hotkey_candidate = ETSHotkey(on_stop=self._signal_stop)
+            if hotkey_candidate.register():
+                hotkey = hotkey_candidate
+            else:
+                self.debug("Hotkey registration unavailable; continuing without hotkeys")
         except Exception as e:
             self.debug("Hotkey init failed (non-Windows?): %s" % e)
-            hotkey = None
+        if hotkey is None and hotkey_candidate is not None:
+            try:
+                hotkey_candidate.unregister()
+            except Exception:
+                pass
 
         try:
             return self._run_loop_body(max_steps, hotkey)
@@ -1406,8 +1450,8 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
 
         # #2: Save statistics report to file for later analysis
         try:
-                        # OPEN-M11: do not pollute APPDATA ETS — write beside project/exe
-            from ets_common import user_data_path
+            # Keep generated state out of the ETS client's own APPDATA tree.
+            from ets_common import ensure_parent_dir, user_data_path
             stats_path = user_data_path('ets_stats.json', anchor_file=__file__)
             report = {
                 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -1418,6 +1462,7 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
                 'stats': dict(self.stats),
                 'result': result
             }
+            ensure_parent_dir(stats_path)
             with open(stats_path, 'w', encoding='utf-8') as sf:
                 json.dump(report, sf, ensure_ascii=False, indent=2)
             self.debug("Stats report saved: %s" % stats_path)
@@ -1436,6 +1481,7 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
         try:
             self.connect()
         except URLError as e:
+            self._drop_connection()
             print("\n❌ 连接失败: %s" % e)
             print("诊断：")
             print("  1. e听说PC端是否已启动？")
@@ -1443,14 +1489,25 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
             print("  3. Chrome --remote-debugging-port=%d 是否开启？" % self.port)
             return
         except ConnectionRefusedError:
+            self._drop_connection()
             print("\n❌ 连接被拒绝 (端口 %d)" % self.port)
             print("诊断：e听说PC端可能未启动，或端口不匹配")
             return
         except Exception as e:
+            self._drop_connection()
             print("\n❌ 连接失败: %s" % e)
             print("诊断：请确认 e听说PC端已启动且调试端口 %d 正确" % self.port)
             return
 
+        try:
+            return self._run_connected(max_steps)
+        finally:
+            # Covers result/load early returns and all connected-mode failures.
+            # Inner loops may already drop the socket; _drop_connection is idempotent.
+            self._drop_connection()
+
+    def _run_connected(self, max_steps):
+        """Run after CDP attachment; ``run`` owns final connection cleanup."""
         if 'Result' in self._tab_url():
             print("Already on a result page — open a mock exam to auto-answer")
             return
@@ -1600,7 +1657,8 @@ if __name__ == "__main__":
     parser.add_argument("--show-answers", action="store_true", help="Show all answers without auto-answering")
     parser.add_argument("--log", type=str, default=None, metavar="FILE", help="Save all output to a log file")
     parser.add_argument("--log-keep", type=int, default=7, metavar="DAYS",
-                        help="Auto-delete log files older than N days in the log directory (default: 7, 0=disable)")
+                        help="Delete old ets_auto_*.log siblings only when FILE uses that prefix "
+                             "(default: 7, 0=disable)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Load answers and simulate without actually answering (safety check)")
     add_runtime_check_arguments(parser)
@@ -1609,26 +1667,8 @@ if __name__ == "__main__":
     if args.self_test:
         sys.exit(run_self_test('exam', ETSAutoAnswer))
 
-    # #8: Auto-clean old log files
-    if args.log and args.log_keep > 0:
-        try:
-            log_dir = os.path.dirname(os.path.abspath(args.log)) or '.'
-            cutoff = time.time() - args.log_keep * 86400
-            for fname in os.listdir(log_dir):
-                fpath = os.path.join(log_dir, fname)
-                if not os.path.isfile(fpath):
-                    continue
-                # Only clean .log files to avoid accidents
-                if not fname.endswith('.log'):
-                    continue
-                if os.path.getmtime(fpath) < cutoff:
-                    try:
-                        os.remove(fpath)
-                        print("[Cleanup] Removed old log: %s" % fname)
-                    except Exception:
-                        pass
-        except Exception:
-            pass  # cleanup is non-critical
+    for removed_log in _cleanup_owned_logs(args.log, args.log_keep):
+        print("[Cleanup] Removed old ETS log: %s" % removed_log)
 
     # Setup log file (tee stdout AND stderr to file)
     tee = None

@@ -67,16 +67,55 @@ class ETSHotkey:
     Main thread checks state via is_paused / should_skip / should_stop.
     """
 
+    _PUMP_READY_TIMEOUT = 1.0
+    _REGISTER_TIMEOUT = 1.0
+    _STOP_TIMEOUT = 2.0
+    _UNRESOLVED_PUMPS = set()
+    _UNRESOLVED_PUMPS_GUARD = threading.Lock()
+
     def __init__(self, on_stop=None):
         self._paused = False
         self._skip = False
         self._stop = False
         self._thread = None
         self._registered = False
+        self._stopping = False
         self._lock = threading.Lock()
         self._thread_id = None
+        self._pump_ready = threading.Event()
+        self._pump_error = None
+        self._reg_done = threading.Event()
+        self._reg_result = None
+        self._bindings = {'F9': False, 'F10': False, 'F12': False}
         # Optional callback invoked immediately on F12 (thread-safe set stop_event)
+        self._configured_on_stop = on_stop
         self._on_stop = on_stop
+
+    @classmethod
+    def _unresolved_pumps(cls):
+        with cls._UNRESOLVED_PUMPS_GUARD:
+            return tuple(cls._UNRESOLVED_PUMPS)
+
+    def _retain_unresolved_pump(self):
+        """Keep a timed-out pump reachable and detach its stop callback."""
+        with self._lock:
+            self._on_stop = None
+        with self._UNRESOLVED_PUMPS_GUARD:
+            self._UNRESOLVED_PUMPS.add(self)
+
+    def _release_unresolved_pump(self):
+        with self._UNRESOLVED_PUMPS_GUARD:
+            self._UNRESOLVED_PUMPS.discard(self)
+
+    @classmethod
+    def _stop_prior_unresolved_pumps(cls, current):
+        """Retry old cleanup and refuse a second process-wide listener."""
+        for owner in cls._unresolved_pumps():
+            if owner is current:
+                continue
+            if not owner._stop_pump():
+                return False
+        return True
 
     # ── Public state queries ──────────────────────────────────
 
@@ -111,104 +150,191 @@ class ETSHotkey:
     # ── Register / Unregister ─────────────────────────────────
 
     def register(self):
-        """Register F9/F10/F12 global hotkeys and start listener thread."""
-        if self._registered:
-            return
+        """Start the pump and return True when at least one key is bound."""
+        if not self._stop_prior_unresolved_pumps(self):
+            print(
+                "Hotkeys: WARNING — an earlier listener is still stopping")
+            return False
 
-        # Tear down any orphaned pump from a previous failed/timeout register
-        # so a second register() never starts a second pump.
+        if self._stopping:
+            if (self._thread is not None and self._thread.is_alive()
+                    and not self._stop_pump()):
+                print("Hotkeys: WARNING — previous listener is still stopping")
+                return False
+            self._stopping = False
+
+        if (self._registered and self._thread is not None
+                and self._thread.is_alive()):
+            return True
+        if self._registered:
+            self._registered = False
+            self._bindings = {'F9': False, 'F10': False, 'F12': False}
+
         if self._thread is not None and self._thread.is_alive():
-            self._stop_pump()
+            if not self._stop_pump():
+                print("Hotkeys: WARNING — previous listener is still stopping")
+                return False
         else:
             self._thread = None
             self._thread_id = None
 
+        self._pump_ready = threading.Event()
+        self._pump_error = None
+        self._reg_done = threading.Event()
+        self._reg_result = None
+        self._bindings = {'F9': False, 'F10': False, 'F12': False}
+        with self._lock:
+            self._on_stop = self._configured_on_stop
+        self._stopping = False
         self._thread = threading.Thread(target=self._message_pump, daemon=True)
-        self._thread.start()
+        try:
+            self._thread.start()
+        except Exception as e:
+            self._thread = None
+            self._thread_id = None
+            self._stopping = False
+            print("Hotkeys: WARNING — listener failed to start (%s)" % e)
+            return False
 
-        # Wait for thread to be ready
-        while self._thread_id is None:
-            threading.Event().wait(0.01)
+        ready = self._pump_ready.wait(timeout=self._PUMP_READY_TIMEOUT)
+        if (not ready or self._thread_id is None
+                or self._thread is None or not self._thread.is_alive()):
+            self._stop_pump()
+            detail = " (%s)" % self._pump_error if self._pump_error else ""
+            print("Hotkeys: WARNING — listener did not become ready%s" % detail)
+            return False
 
         # Register hotkeys on the listener thread's message queue
         # (RegisterHotKey is thread-bound: messages go to registering thread)
-        self._reg_result = None  # set by _do_register in pump thread
-        self._reg_done = threading.Event()
-        PostThreadMessage(self._thread_id, 0x0401, 0, 0)  # custom: do register
-        # Single wait instead of polling with fresh Events each tick
-        self._reg_done.wait(timeout=1.0)
-        ok_any = bool(self._reg_result) if self._reg_result is not None else False
-        # OPEN-H7: only mark registered when at least one hotkey bound
+        if not PostThreadMessage(self._thread_id, 0x0401, 0, 0):
+            self._stop_pump()
+            print("Hotkeys: WARNING — could not signal listener thread")
+            return False
+        if not self._reg_done.wait(timeout=self._REGISTER_TIMEOUT):
+            self._stop_pump()
+            print("Hotkeys: WARNING — registration timed out")
+            return False
+        if self._thread is None or not self._thread.is_alive():
+            self._stop_pump()
+            print("Hotkeys: WARNING — listener stopped during registration")
+            return False
+
+
+        bindings = self._reg_result or {}
+        self._bindings = {
+            name: bool(bindings.get(name))
+            for name in ('F9', 'F10', 'F12')
+        }
+        ok_any = any(self._bindings.values())
         if ok_any:
             self._registered = True
-            print("Hotkeys: F9=Pause  F10=Skip  F12=Stop")
-        else:
-            # Failure or timeout: stop pump so no orphan thread / late bindings
-            # (RegisterHotKey may still complete after wait timeout)
-            self._stop_pump()
-            self._registered = False
-            print("Hotkeys: WARNING — failed to register F9/F10/F12 (and Alt variants)")
+            self._print_binding_status()
+            return True
+
+        self._stop_pump()
+        self._registered = False
+        self._print_binding_status()
+        return False
 
     def unregister(self):
-        """Unregister all hotkeys and stop listener thread."""
-        # Always stop pump if alive — even when _registered is False
-        # (timeout/failure path may leave thread running with late bindings).
-        # Pump exit path calls _do_unregister() (thread-bound UnregisterHotKey).
+        """Unregister keys; return False if the listener remains alive."""
+        # Publish loss of capability before waiting for the native pump. A
+        # timed-out join must never leave callers believing hotkeys still work.
+        self._registered = False
+        self._bindings = {'F9': False, 'F10': False, 'F12': False}
         if self._thread is not None and self._thread.is_alive():
-            self._stop_pump()
+            if not self._stop_pump():
+                return False
         else:
             self._thread = None
             self._thread_id = None
 
-        self._registered = False
+        return True
 
     # ── Internal ──────────────────────────────────────────────
 
+    def _print_binding_status(self):
+        labels = (
+            ('F9', 'F9=Pause'),
+            ('F10', 'F10=Skip'),
+            ('F12', 'F12=Stop'),
+        )
+        active = [label for name, label in labels if self._bindings.get(name)]
+        missing = [name for name, _label in labels if not self._bindings.get(name)]
+        if active:
+            print("Hotkeys: " + "  ".join(active))
+        if missing:
+            print("Hotkeys: WARNING — unavailable: " + ", ".join(missing))
+
     def _stop_pump(self):
-        """Post WM_QUIT, join pump thread, clear thread handles.
+        """Post WM_QUIT and return True only after the pump has exited.
 
         Pump thread calls _do_unregister() on exit (RegisterHotKey is
         thread-bound, so UnregisterHotKey must run on the same thread).
         """
+        thr = self._thread
+        if thr is None or not thr.is_alive():
+            self._thread = None
+            self._thread_id = None
+            self._stopping = False
+            self._release_unresolved_pump()
+            return True
+
+        self._registered = False
+        self._bindings = {'F9': False, 'F10': False, 'F12': False}
+        self._stopping = True
         tid = self._thread_id
         if tid:
             PostThreadMessage(tid, WM_QUIT, 0, 0)
-        thr = self._thread
+        if (thr is not None and thr.is_alive()
+                and thr is not threading.current_thread()):
+            thr.join(timeout=self._STOP_TIMEOUT)
         if thr is not None and thr.is_alive():
-            thr.join(timeout=2)
+            # Preserve the handle process-wide even if a caller discards this
+            # object after register()/unregister() reports failure.
+            self._retain_unresolved_pump()
+            return False
         self._thread = None
         self._thread_id = None
+        self._stopping = False
+        self._release_unresolved_pump()
+        return True
 
     def _do_register(self):
         """Called inside the listener thread to register hotkeys."""
-        ok1 = RegisterHotKey(None, HOTKEY_PAUSE, 0, VK_F9)
-        ok2 = RegisterHotKey(None, HOTKEY_SKIP, 0, VK_F10)
-        ok3 = RegisterHotKey(None, HOTKEY_STOP, 0, VK_F12)
+        ok1 = ok2 = ok3 = False
+        try:
+            base_flags = MOD_NOREPEAT
+            alt_flags = MOD_ALT | MOD_NOREPEAT
+            ok1 = bool(RegisterHotKey(None, HOTKEY_PAUSE, base_flags, VK_F9))
+            ok2 = bool(RegisterHotKey(None, HOTKEY_SKIP, base_flags, VK_F10))
+            ok3 = bool(RegisterHotKey(None, HOTKEY_STOP, base_flags, VK_F12))
 
-        if not ok1:
-            # F9 might be taken; try Alt+F9
-            ok1 = RegisterHotKey(None, HOTKEY_PAUSE, MOD_ALT, VK_F9)
-            if ok1:
-                print("  F9 taken, using Alt+F9 for Pause")
-        if not ok2:
-            ok2 = RegisterHotKey(None, HOTKEY_SKIP, MOD_ALT, VK_F10)
-            if ok2:
-                print("  F10 taken, using Alt+F10 for Skip")
-        if not ok3:
-            ok3 = RegisterHotKey(None, HOTKEY_STOP, MOD_ALT, VK_F12)
-            if ok3:
-                print("  F12 taken, using Alt+F12 for Stop")
-        # Signal outer register() whether anything bound (OPEN-H7)
-        self._reg_result = bool(ok1 or ok2 or ok3)
-        if not self._reg_result:
+            if not ok1:
+                ok1 = bool(RegisterHotKey(None, HOTKEY_PAUSE, alt_flags, VK_F9))
+                if ok1:
+                    print("  F9 taken, using Alt+F9 for Pause")
+            if not ok2:
+                ok2 = bool(RegisterHotKey(None, HOTKEY_SKIP, alt_flags, VK_F10))
+                if ok2:
+                    print("  F10 taken, using Alt+F10 for Skip")
+            if not ok3:
+                ok3 = bool(RegisterHotKey(None, HOTKEY_STOP, alt_flags, VK_F12))
+                if ok3:
+                    print("  F12 taken, using Alt+F12 for Stop")
+        except Exception as e:
+            self._pump_error = e
+        finally:
+            self._reg_result = {'F9': ok1, 'F10': ok2, 'F12': ok3}
+            self._bindings = dict(self._reg_result)
+            self._reg_done.set()
+
+        if not any(self._reg_result.values()):
             try:
                 err = ctypes.windll.kernel32.GetLastError()
                 print("  Hotkey register failed (GetLastError=%s)" % err)
             except Exception:
                 print("  Hotkey register failed (no binding succeeded)")
-        done = getattr(self, '_reg_done', None)
-        if done is not None:
-            done.set()
 
     def _do_unregister(self):
         """Called inside the listener thread to unregister hotkeys."""
@@ -217,6 +343,23 @@ class ETSHotkey:
         UnregisterHotKey(None, HOTKEY_STOP)
 
     def _message_pump(self):
+        """Run the native message loop and always publish terminal state."""
+        try:
+            self._run_message_pump()
+        except Exception as e:
+            self._pump_error = e
+        finally:
+            self._pump_ready.set()
+            try:
+                self._do_unregister()
+            except Exception:
+                pass
+            self._registered = False
+            self._bindings = {'F9': False, 'F10': False, 'F12': False}
+            self._stopping = False
+            self._release_unresolved_pump()
+
+    def _run_message_pump(self):
         """Background thread: message pump for WM_HOTKEY."""
         self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
 
@@ -224,6 +367,7 @@ class ETSHotkey:
         # Without this, the queue may not exist when PostThreadMessage arrives
         peek_msg = ctypes.wintypes.MSG()
         ctypes.windll.user32.PeekMessageW(ctypes.byref(peek_msg), 0, 0, 0, 0)
+        self._pump_ready.set()
 
         # Wait for signal to register
         msg = ctypes.wintypes.MSG()
@@ -263,8 +407,6 @@ class ETSHotkey:
                         pass
             if msg.message == WM_QUIT:
                 break
-
-        self._do_unregister()
 
 
 # ── Standalone test ──────────────────────────────────────────

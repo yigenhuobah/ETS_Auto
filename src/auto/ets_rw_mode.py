@@ -28,7 +28,7 @@ class ETSReadWriteMixin:
     def get_rw_show_data(self):
         """Get showData from read-write iframe. Contains all questions + answers.
         Cached with 30s TTL to avoid stale data on AJAX page updates."""
-        if self.rw_show_data and (time.time() - self._rw_cache_time < self._RW_CACHE_TTL):
+        if self.rw_show_data and (time.monotonic() - self._rw_cache_time < self._RW_CACHE_TTL):
             return self.rw_show_data
         js = '(function(){\n        try {\n        %s;\n            if (!iframe) return JSON.stringify({error: "no read-write iframe"});\n            var data = iframe.contentWindow.showData;\n            if (!data) return JSON.stringify({error: "no showData"});\n            return JSON.stringify(data);\n        } catch(e) { return JSON.stringify({error: e.message}); }\n        })()' % self._RW_IFRAME_FINDER
         parsed = self.parse_eval_json(self.eval_js(js))
@@ -36,7 +36,7 @@ class ETSReadWriteMixin:
         if not parsed or parsed.get('error'):
             return None
         self.rw_show_data = parsed
-        self._rw_cache_time = time.time()
+        self._rw_cache_time = time.monotonic()
         return self.rw_show_data
 
     def get_rw_page_state(self):
