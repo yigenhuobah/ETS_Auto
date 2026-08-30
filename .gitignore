@@ -1,10 +1,12 @@
-# Python __pycache__/
+# Python
+__pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
 env/
 venv/
+.venv/
 ENV/
 build/
 develop-eggs/
@@ -22,7 +24,8 @@ wheels/
 .installed.cfg
 *.egg
 
-# IDE .idea/
+# IDE
+.idea/
 .vscode/
 *.swp
 *.swo
@@ -30,7 +33,8 @@ wheels/
 .DS_Store
 Thumbs.db
 
-# Project specific logs/
+# Project specific
+logs/
 *.log
 screenshots/*.png
 screenshots/*.jpg
@@ -40,11 +44,13 @@ screenshots/*.jpg
 gui_*.png
 ets_gui_*.png
 
-# Test artifacts tests/__pycache__/
+# Test artifacts
+tests/__pycache__/
 tools/__pycache__/
 versions/__pycache__/
 
-# CDP temp files cdp_*/
+# CDP temp files
+cdp_*/
 temp/
 tmp/
 
