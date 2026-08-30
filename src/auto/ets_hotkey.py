@@ -27,6 +27,7 @@ Usage:
   hk.unregister()  # cleanup
 """
 import threading
+import time
 import ctypes
 import ctypes.wintypes
 
@@ -43,8 +44,11 @@ VK_F12 = 0x7B  # Windows VK_F12 (0x87 is not F12)
 
 WM_HOTKEY = 0x0312
 
-# RegisterHotKey / UnregisterHotKey
-user32 = ctypes.windll.user32
+# RegisterHotKey / UnregisterHotKey.
+# use_last_error=True snapshots the thread's last error after each call, so
+# ctypes.get_last_error() (not kernel32.GetLastError) must be used to read it.
+user32 = ctypes.WinDLL('user32', use_last_error=True)
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
 RegisterHotKey = user32.RegisterHotKey
 UnregisterHotKey = user32.UnregisterHotKey
 GetMessage = user32.GetMessageW
@@ -285,7 +289,13 @@ class ETSHotkey:
         self._stopping = True
         tid = self._thread_id
         if tid:
-            PostThreadMessage(tid, WM_QUIT, 0, 0)
+            # The pump may not have force-created its message queue yet
+            # (PeekMessageW init); in that window PostThreadMessage fails
+            # silently and WM_QUIT would never arrive — retry briefly.
+            for _ in range(5):
+                if PostThreadMessage(tid, WM_QUIT, 0, 0):
+                    break
+                time.sleep(0.02)
         if (thr is not None and thr.is_alive()
                 and thr is not threading.current_thread()):
             thr.join(timeout=self._STOP_TIMEOUT)
@@ -331,7 +341,9 @@ class ETSHotkey:
 
         if not any(self._reg_result.values()):
             try:
-                err = ctypes.windll.kernel32.GetLastError()
+                # use_last_error DLLs snapshot the error of the last ctypes
+                # call (the final RegisterHotKey attempt above).
+                err = ctypes.get_last_error()
                 print("  Hotkey register failed (GetLastError=%s)" % err)
             except Exception:
                 print("  Hotkey register failed (no binding succeeded)")
@@ -361,12 +373,12 @@ class ETSHotkey:
 
     def _run_message_pump(self):
         """Background thread: message pump for WM_HOTKEY."""
-        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+        self._thread_id = kernel32.GetCurrentThreadId()
 
         # Cold-start: force-initialize message queue before RegisterHotKey
         # Without this, the queue may not exist when PostThreadMessage arrives
         peek_msg = ctypes.wintypes.MSG()
-        ctypes.windll.user32.PeekMessageW(ctypes.byref(peek_msg), 0, 0, 0, 0)
+        user32.PeekMessageW(ctypes.byref(peek_msg), 0, 0, 0, 0)
         self._pump_ready.set()
 
         # Wait for signal to register

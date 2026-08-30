@@ -262,8 +262,16 @@ class ETSReadWriteMixin:
         hotkey = None
         try:
             from ets_hotkey import ETSHotkey
-            hotkey = ETSHotkey(on_stop=self._signal_stop)
-            hotkey.register()
+            hotkey_candidate = ETSHotkey(on_stop=self._signal_stop)
+            if hotkey_candidate.register():
+                hotkey = hotkey_candidate
+            else:
+                # A dead hotkey object would silently ignore F9/F10/F12.
+                print("[WARN] RW hotkey registration failed; continuing without hotkeys")
+                try:
+                    hotkey_candidate.unregister()
+                except Exception:
+                    pass
         except Exception as e:
             self.debug("RW hotkey init failed: %s" % e)
             hotkey = None

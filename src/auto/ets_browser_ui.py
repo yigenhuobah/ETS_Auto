@@ -9,19 +9,24 @@ Usage:
   Integrated as Tab 2 in ets_gui.py via create_browser_tab()
   Standalone: python ets_browser_ui.py
 """
-import sys
 import os
+import sys
+import threading
 
 try:
     import customtkinter as ctk
 except ImportError:
     ctk = None
 
-# ── Path setup ───────────────────────────────────────────────
-if getattr(sys, 'frozen', False):
-    _BASE = sys._MEIPASS
-else:
-    _BASE = os.path.dirname(os.path.abspath(__file__))
+from ets_parser import (
+    scan_sets,
+    render_section,
+    _render_full_markdown,
+    _render_full_html,
+    _dedup_consecutive,
+    TYPE_LABELS,
+    TYPE_ICONS,
+)
 
 # ── Force UTF-8 on Windows ──────────────────────────────────
 if sys.platform == 'win32':
@@ -33,271 +38,274 @@ if sys.platform == 'win32':
         pass
 
 
-def create_browser_tab(tab_frame):
-    """Build the offline paper browser UI inside a CTkTabview tab.
+class BrowserTab:
+    """Offline paper browser tab: set cards + search + section viewer.
 
-    Layout:
-      Left panel  (260px): set list with real-time search
-      Right panel (flex):  header + section dropdown + content + nav
+    Replaces the former 420-line create_browser_tab closure so state is
+    instance data and every handler is a testable method.
     """
-    from ets_parser import scan_sets, render_section, _render_full_markdown, _render_full_html
-    from ets_parser import TYPE_LABELS, TYPE_ICONS
-
-    # ── State ────────────────────────────────────────────
-    _current_set = [None]
-    _selected_card = [None]  # track highlighted card frame
 
     # ── Color palette (works for both light & dark) ─────
-    _CARD_FG = ('#f0f0f0', '#2b2b2b')
-    _CARD_HOVER = ('#dce6f0', '#354050')
-    _CARD_ACTIVE_FG = ('#cde0f0', '#2a4a6a')
-    _CARD_ACTIVE_TEXT = ('#1a5276', '#7ec8e3')
-    _CARD_TEXT = ('#333333', '#eeeeee')
-    _CARD_SUBTEXT = ('#666666', '#aaaaaa')
+    CARD_FG = ('#f0f0f0', '#2b2b2b')
+    CARD_HOVER = ('#dce6f0', '#354050')
+    CARD_ACTIVE_FG = ('#cde0f0', '#2a4a6a')
+    CARD_ACTIVE_TEXT = ('#1a5276', '#7ec8e3')
+    CARD_TEXT = ('#333333', '#eeeeee')
+    CARD_SUBTEXT = ('#666666', '#aaaaaa')
 
-    # ── Main grid ───────────────────────────────────────
-    tab_frame.grid_columnconfigure(1, weight=1)
-    tab_frame.grid_rowconfigure(0, weight=1)
+    SEARCH_DEBOUNCE_MS = 250
 
-    # ── Left panel ──────────────────────────────────────
-    left = ctk.CTkFrame(tab_frame, width=260, corner_radius=8)
-    left.grid(row=0, column=0, sticky='ns', padx=(8, 4), pady=8)
-    left.grid_propagate(False)
+    def __init__(self, tab_frame):
+        self.tab_frame = tab_frame
+        self._current_set = None
+        self._selected_card = None
+        self._section_idx = 0
+        self._sets = []
+        self._scan_error = None
+        self._scan_done = False
+        self._search_job = None
 
-    # Left header
-    ctk.CTkLabel(
-        left, text="📚 试卷列表",
-        font=ctk.CTkFont(size=15, weight='bold')
-    ).pack(pady=(10, 6), padx=12, anchor='w')
+        self._build_layout()
+        # D-3: scan in a background thread — the synchronous scan used to run
+        # on the Tk main thread during __init__ and froze startup.
+        self._start_scan()
 
-    # Search with real-time filter
-    search_var = ctk.StringVar(value='')
-    search_entry = ctk.CTkEntry(
-        left, placeholder_text="搜索ID / 题型 / 名称...",
-        textvariable=search_var, width=236, height=32,
-        corner_radius=6)
-    search_entry.pack(padx=12, pady=(0, 6))
+    # ── Layout ───────────────────────────────────────────
 
-    # Scrollable set list
-    set_list = ctk.CTkScrollableFrame(left, width=236, label_text='')
-    set_list.pack(fill='both', expand=True, padx=12, pady=(0, 10))
+    def _build_layout(self):
+        tab_frame = self.tab_frame
+        tab_frame.grid_columnconfigure(1, weight=1)
+        tab_frame.grid_rowconfigure(0, weight=1)
 
-    # ── Right panel ─────────────────────────────────────
-    right = ctk.CTkFrame(tab_frame, corner_radius=8)
-    right.grid(row=0, column=1, sticky='nsew', padx=(4, 8), pady=8)
-    right.grid_columnconfigure(0, weight=1)
-    right.grid_rowconfigure(1, weight=1)
+        # ── Left panel ──────────────────────────────────
+        left = ctk.CTkFrame(tab_frame, width=260, corner_radius=8)
+        left.grid(row=0, column=0, sticky='ns', padx=(8, 4), pady=8)
+        left.grid_propagate(False)
 
-    # Header bar: title + section dropdown
-    header_bar = ctk.CTkFrame(right, fg_color='transparent', height=40)
-    header_bar.grid(row=0, column=0, sticky='ew', padx=12, pady=(10, 0))
-    header_bar.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            left, text="📚 试卷列表",
+            font=ctk.CTkFont(size=15, weight='bold')
+        ).pack(pady=(10, 6), padx=12, anchor='w')
 
-    set_title_label = ctk.CTkLabel(
-        header_bar, text="← 选择一份试卷",
-        font=ctk.CTkFont(size=15, weight='bold'), anchor='w')
-    set_title_label.grid(row=0, column=0, sticky='w')
+        self.search_var = ctk.StringVar(value='')
+        search_entry = ctk.CTkEntry(
+            left, placeholder_text="搜索ID / 题型 / 名称...",
+            textvariable=self.search_var, width=236, height=32,
+            corner_radius=6)
+        search_entry.pack(padx=12, pady=(0, 6))
 
-    section_var = ctk.StringVar(value='')
-    section_menu = ctk.CTkOptionMenu(
-        header_bar, variable=section_var,
-        values=[], width=260, height=30,
-        font=ctk.CTkFont(size=12),
-        command=lambda v: None)  # placeholder
-    section_menu.grid(row=0, column=1, sticky='e', padx=(8, 0))
+        set_list = ctk.CTkScrollableFrame(left, width=236, label_text='')
+        set_list.pack(fill='both', expand=True, padx=12, pady=(0, 10))
+        self.set_list = set_list
 
-    # Content area
-    content_box = ctk.CTkTextbox(
-        right, wrap='word', state='disabled',
-        font=ctk.CTkFont(family='Microsoft YaHei UI', size=13),
-        activate_scrollbars=True,
-        corner_radius=6)
-    content_box.grid(row=1, column=0, sticky='nsew', padx=12, pady=8)
+        # ── Right panel ─────────────────────────────────
+        right = ctk.CTkFrame(tab_frame, corner_radius=8)
+        right.grid(row=0, column=1, sticky='nsew', padx=(4, 8), pady=8)
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(1, weight=1)
 
-    # Configure text tags via internal tkinter Text widget
-    _t = content_box._textbox
-    _t.configure(spacing1=2, spacing3=4, padx=8, pady=4)
+        header_bar = ctk.CTkFrame(right, fg_color='transparent', height=40)
+        header_bar.grid(row=0, column=0, sticky='ew', padx=12, pady=(10, 0))
+        header_bar.grid_columnconfigure(1, weight=1)
 
-    _t.tag_configure(
-        'answer', foreground='#2ecc71',
-        font=ctk.CTkFont(family='Microsoft YaHei UI', size=13, weight='bold'),
-        lmargin1=20, lmargin2=20)
-    _t.tag_configure(
-        'section_title', foreground='#3498db',
-        font=ctk.CTkFont(family='Microsoft YaHei UI', size=15, weight='bold'),
-        spacing1=8, spacing3=4)
-    _t.tag_configure(
-        'q_num', foreground='#e67e22',
-        font=ctk.CTkFont(family='Microsoft YaHei UI', size=13, weight='bold'),
-        lmargin1=8)
-    _t.tag_configure(
-        'header', foreground='#3498db',
-        font=ctk.CTkFont(family='Microsoft YaHei UI', size=14, weight='bold'))
-    _t.tag_configure(
-        'muted', foreground='#7f8c8d',
-        font=ctk.CTkFont(family='Microsoft YaHei UI', size=12),
-        lmargin1=20, lmargin2=20)
-    _t.tag_configure(
-        'option', foreground='#95a5a6',
-        font=ctk.CTkFont(family='Microsoft YaHei UI', size=13),
-        lmargin1=30, lmargin2=30)
+        self.set_title_label = ctk.CTkLabel(
+            header_bar, text="← 选择一份试卷",
+            font=ctk.CTkFont(size=15, weight='bold'), anchor='w')
+        self.set_title_label.grid(row=0, column=0, sticky='w')
 
-    # ── Bottom navigation ───────────────────────────────
-    nav_frame = ctk.CTkFrame(right, fg_color='transparent', height=36)
-    nav_frame.grid(row=2, column=0, sticky='ew', padx=12, pady=(0, 10))
+        self.section_var = ctk.StringVar(value='')
+        self.section_menu = ctk.CTkOptionMenu(
+            header_bar, variable=self.section_var,
+            values=[], width=260, height=30,
+            font=ctk.CTkFont(size=12),
+            command=lambda v: None)  # placeholder, wired in _wire_handlers
+        self.section_menu.grid(row=0, column=1, sticky='e', padx=(8, 0))
 
-    prev_btn = ctk.CTkButton(
-        nav_frame, text="◀ 上一节", width=110, height=32,
-        state='disabled', corner_radius=6)
-    prev_btn.pack(side='left', padx=(0, 6))
+        self.content_box = ctk.CTkTextbox(
+            right, wrap='word', state='disabled',
+            font=ctk.CTkFont(family='Microsoft YaHei UI', size=13),
+            activate_scrollbars=True,
+            corner_radius=6)
+        self.content_box.grid(row=1, column=0, sticky='nsew', padx=12, pady=8)
 
-    section_label = ctk.CTkLabel(
-        nav_frame, textvariable=section_var,
-        font=ctk.CTkFont(size=12), anchor='center')
-    section_label.pack(side='left', padx=12)
+        self._configure_text_tags()
 
-    next_btn = ctk.CTkButton(
-        nav_frame, text="下一节 ▶", width=110, height=32,
-        state='disabled', corner_radius=6)
-    next_btn.pack(side='left')
+        # ── Bottom navigation ───────────────────────────
+        nav_frame = ctk.CTkFrame(right, fg_color='transparent', height=36)
+        nav_frame.grid(row=2, column=0, sticky='ew', padx=12, pady=(0, 10))
 
-    # Spacer
-    ctk.CTkLabel(nav_frame, text="").pack(side='left', expand=True)
+        self.prev_btn = ctk.CTkButton(
+            nav_frame, text="◀ 上一节", width=110, height=32,
+            state='disabled', corner_radius=6)
+        self.prev_btn.pack(side='left', padx=(0, 6))
 
-    # Export buttons (right side)
-    def _on_export_md():
-        if not _current_set[0]:
+        ctk.CTkLabel(
+            nav_frame, textvariable=self.section_var,
+            font=ctk.CTkFont(size=12), anchor='center').pack(side='left', padx=12)
+
+        self.next_btn = ctk.CTkButton(
+            nav_frame, text="下一节 ▶", width=110, height=32,
+            state='disabled', corner_radius=6)
+        self.next_btn.pack(side='left')
+
+        ctk.CTkLabel(nav_frame, text="").pack(side='left', expand=True)
+
+        export_md_btn = ctk.CTkButton(
+            nav_frame, text="📋 导出MD", width=90, height=32,
+            corner_radius=6, command=self._on_export_md)
+        export_md_btn.pack(side='right', padx=(0, 4))
+
+        print_btn = ctk.CTkButton(
+            nav_frame, text="🖨 打印/预览", width=100, height=32,
+            corner_radius=6, command=self._on_print)
+        print_btn.pack(side='right', padx=(0, 4))
+
+        self._wire_handlers()
+
+    def _configure_text_tags(self):
+        """Style the underlying tkinter Text of a CTkTextbox.
+
+        `_textbox` is a private CustomTkinter detail; if it disappears in a
+        future CTk version the browser degrades to unstyled text instead of
+        crashing (inserts go through the public CTkTextbox API).
+        """
+        self._t = getattr(self.content_box, '_textbox', None)
+        if self._t is None:
             return
-        from tkinter import messagebox
-        md_text = _render_full_markdown(_current_set[0])
-        sid = _current_set[0]['id']
-        # Save to Desktop
-        desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
-        out_path = os.path.join(desktop, 'ETS_%s.md' % sid)
-        if os.path.exists(out_path):
-            if not messagebox.askyesno('文件已存在',
-                    '桌面已存在 ETS_%s.md\n是否覆盖？' % sid):
-                return
-        with open(out_path, 'w', encoding='utf-8') as f:
-            f.write(md_text)
-        messagebox.showinfo('导出成功', '已保存到:\n%s' % out_path)
+        try:
+            self._t.configure(spacing1=2, spacing3=4, padx=8, pady=4)
+            self._t.tag_configure(
+                'answer', foreground='#2ecc71',
+                font=ctk.CTkFont(family='Microsoft YaHei UI', size=13, weight='bold'),
+                lmargin1=20, lmargin2=20)
+            self._t.tag_configure(
+                'section_title', foreground='#3498db',
+                font=ctk.CTkFont(family='Microsoft YaHei UI', size=15, weight='bold'),
+                spacing1=8, spacing3=4)
+            self._t.tag_configure(
+                'q_num', foreground='#e67e22',
+                font=ctk.CTkFont(family='Microsoft YaHei UI', size=13, weight='bold'),
+                lmargin1=8)
+            self._t.tag_configure(
+                'header', foreground='#3498db',
+                font=ctk.CTkFont(family='Microsoft YaHei UI', size=14, weight='bold'))
+            self._t.tag_configure(
+                'muted', foreground='#7f8c8d',
+                font=ctk.CTkFont(family='Microsoft YaHei UI', size=12),
+                lmargin1=20, lmargin2=20)
+            self._t.tag_configure(
+                'option', foreground='#95a5a6',
+                font=ctk.CTkFont(family='Microsoft YaHei UI', size=13),
+                lmargin1=30, lmargin2=30)
+        except Exception:
+            self._t = None
 
-    def _on_print():
-        if not _current_set[0]:
-            return
-        html_text = _render_full_html(_current_set[0])
-        sid = _current_set[0]['id']
-        # Write temp HTML
-        tmp_dir = os.path.join(os.environ.get('TEMP', os.path.expanduser('~')), 'ets_preview')
-        os.makedirs(tmp_dir, exist_ok=True)
-        tmp_path = os.path.join(tmp_dir, 'ETS_%s.html' % sid)
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            f.write(html_text)
-        import subprocess
-        subprocess.Popen(['cmd', '/c', 'start', '', tmp_path], shell=False)
+    def _wire_handlers(self):
+        self.prev_btn.configure(command=self._on_prev)
+        self.next_btn.configure(command=self._on_next)
+        self.section_menu.configure(command=self._on_section_menu_select)
+        self.search_var.trace_add('write', self._on_search_changed)
 
-    export_md_btn = ctk.CTkButton(
-        nav_frame, text="📋 导出MD", width=90, height=32,
-        corner_radius=6,
-        command=_on_export_md)
-    export_md_btn.pack(side='right', padx=(0, 4))
+    # ── Background scan (D-3) ───────────────────────────
 
-    print_btn = ctk.CTkButton(
-        nav_frame, text="🖨 打印/预览", width=100, height=32,
-        corner_radius=6,
-        command=_on_print)
-    print_btn.pack(side='right', padx=(0, 4))
+    def _start_scan(self):
+        self._show_info("⏳ 正在扫描 ETS 缓存…")
+        threading.Thread(target=self._scan_worker, daemon=True).start()
 
-    _section_idx = [0]
+    def _scan_worker(self):
+        try:
+            sets, err = scan_sets()
+        except Exception as e:
+            sets, err = [], str(e)
+        try:
+            self.tab_frame.after(0, self._on_scan_done, sets, err)
+        except Exception:
+            pass  # window destroyed mid-scan
 
-    # ── Section display logic ───────────────────────────
-    def _show_section(idx):
-        if not _current_set[0] or idx < 0 or idx >= len(_current_set[0]['sections']):
-            return
-        _section_idx[0] = idx
-        sec = _current_set[0]['sections'][idx]
-        parts = render_section(sec)
+    def _on_scan_done(self, sets, err):
+        self._sets = sets or []
+        self._scan_error = err
+        self._scan_done = True
+        self._render_sets()
+        if not self._sets:
+            msg = self._scan_error or "未找到 ETS 缓存数据"
+            self._show_info(
+                "⚠ 未找到 ETS 缓存数据\n\n"
+                "%s\n\n"
+                "请先在 ETS 客户端中开始一次作业，\n"
+                "系统会自动缓存试卷数据。" % msg)
 
-        content_box.configure(state='normal')
-        _t.delete('1.0', 'end')
-        for text, tag in parts:
-            if tag:
-                _t.insert('end', text, tag)
-            else:
-                _t.insert('end', text)
-        content_box.configure(state='disabled')
-        _t.see('1.0')
+    def _show_info(self, message):
+        self.content_box.configure(state='normal')
+        self.content_box.delete('1.0', 'end')
+        self.content_box.insert('1.0', message)
+        self.content_box.configure(state='disabled')
 
-        total = len(_current_set[0]['sections'])
-        section_var.set("%d / %d" % (idx + 1, total))
-        prev_btn.configure(state='normal' if idx > 0 else 'disabled')
-        next_btn.configure(state='normal' if idx < total - 1 else 'disabled')
-        # Sync dropdown — include index for disambiguation
+    # ── Section display ─────────────────────────────────
+
+    @staticmethod
+    def _stid_suffix(stid):
+        return (' ' + stid[-4:]) if len(stid) > 4 else (' ' + stid if stid else '')
+
+    def _section_label(self, idx, sec):
         icon = TYPE_ICONS.get(sec['type'], '📋')
         lbl = TYPE_LABELS.get(sec['type'], sec['type'])
-        stid = sec.get('stid', '')
-        stid_short = (' ' + stid[-4:]) if len(stid) > 4 else (' ' + stid if stid else '')
-        section_menu.set("%d. %s %s%s" % (idx + 1, icon, lbl, stid_short))
+        return "%d. %s %s%s" % (idx + 1, icon, lbl, self._stid_suffix(sec.get('stid', '')))
 
-    def _on_prev():
-        _show_section(_section_idx[0] - 1)
+    def _show_section(self, idx):
+        if not self._current_set or idx < 0 or idx >= len(self._current_set['sections']):
+            return
+        self._section_idx = idx
+        sec = self._current_set['sections'][idx]
+        parts = render_section(sec)
 
-    def _on_next():
-        _show_section(_section_idx[0] + 1)
+        self.content_box.configure(state='normal')
+        self.content_box.delete('1.0', 'end')
+        for text, tag in parts:
+            self.content_box.insert('end', text, tag or None)
+        self.content_box.configure(state='disabled')
+        self.content_box.see('1.0')
 
-    prev_btn.configure(command=_on_prev)
-    next_btn.configure(command=_on_next)
+        total = len(self._current_set['sections'])
+        self.section_var.set("%d / %d" % (idx + 1, total))
+        self.prev_btn.configure(state='normal' if idx > 0 else 'disabled')
+        self.next_btn.configure(state='normal' if idx < total - 1 else 'disabled')
+        # Sync dropdown — include index for disambiguation
+        self.section_menu.set(self._section_label(idx, sec))
 
-    # ── Section dropdown handler ────────────────────────
-    def _on_section_menu_select(value):
-        if not _current_set[0]:
+    def _on_prev(self):
+        self._show_section(self._section_idx - 1)
+
+    def _on_next(self):
+        self._show_section(self._section_idx + 1)
+
+    def _on_section_menu_select(self, value):
+        if not self._current_set:
             return
         # Value format: "N. icon label stid" — extract index N
         try:
             idx = int(value.split('.')[0]) - 1
-            _show_section(idx)
+            self._show_section(idx)
         except (ValueError, IndexError):
             pass
 
-    section_menu.configure(command=_on_section_menu_select)
+    # ── Set selection ───────────────────────────────────
 
-    # ── Card click & highlight helpers ──────────────────
-    def _highlight_card(card_frame, id_label, sub_label, score_label):
-        """Apply active highlight to a card."""
-        card_frame.configure(fg_color=_CARD_ACTIVE_FG)
-        id_label.configure(text_color=_CARD_ACTIVE_TEXT)
-        sub_label.configure(text_color=_CARD_ACTIVE_TEXT)
-        score_label.configure(text_color=_CARD_ACTIVE_TEXT)
-
-    def _unhighlight_card(card_frame, id_label, sub_label, score_label):
-        """Remove active highlight from a card."""
-        card_frame.configure(fg_color=_CARD_FG)
-        id_label.configure(text_color=_CARD_TEXT)
-        sub_label.configure(text_color=_CARD_SUBTEXT)
-        score_label.configure(text_color=_CARD_SUBTEXT)
-
-    def _on_set_click(set_data, card_frame, id_label, sub_label, score_label):
+    def _on_set_click(self, set_data, card_frame, id_label, sub_label, score_label):
         # Reset previous card highlight
-        if _selected_card[0] and _selected_card[0] != card_frame:
-            prev = _selected_card[0]
-            _unhighlight_card(
-                prev, prev._id_label, prev._sub_label, prev._score_label)
+        if self._selected_card and self._selected_card != card_frame:
+            prev = self._selected_card
+            self._unhighlight_card(prev, prev._id_label, prev._sub_label, prev._score_label)
 
-        # Highlight current card
-        _highlight_card(card_frame, id_label, sub_label, score_label)
-        _selected_card[0] = card_frame
+        self._highlight_card(card_frame, id_label, sub_label, score_label)
+        self._selected_card = card_frame
 
-        _current_set[0] = set_data
+        self._current_set = set_data
         # Build rich title from res.json metadata
         score = set_data.get('score', 0)
         exam_names = set_data.get('exam_type_names', [])
         if exam_names:
-            # Deduplicate consecutive identical names
-            deduped = []
-            for n in exam_names:
-                if not deduped or deduped[-1] != n:
-                    deduped.append(n)
-            types_summary = ' · '.join(deduped)
+            types_summary = ' · '.join(_dedup_consecutive(exam_names))
         else:
             types_summary = ' · '.join(TYPE_LABELS.get(t, t) for t in sorted(set_data['types']))
         score_text = "%d分" % score if score else ""
@@ -305,152 +313,201 @@ def create_browser_tab(tab_frame):
         if score_text:
             header_parts.append(score_text)
         header_parts.append("%d题" % set_data['total_questions'])
-        set_title_label.configure(
+        self.set_title_label.configure(
             text="  ·  ".join(header_parts) + "  ·  " + types_summary)
 
         # Populate section dropdown — include index + stid for disambiguation
-        sec_labels = []
-        for i, sec in enumerate(set_data['sections']):
-            icon = TYPE_ICONS.get(sec['type'], '📋')
-            lbl = TYPE_LABELS.get(sec['type'], sec['type'])
-            stid = sec.get('stid', '')
-            stid_short = (' ' + stid[-4:]) if len(stid) > 4 else (' ' + stid if stid else '')
-            sec_labels.append("%d. %s %s%s" % (i + 1, icon, lbl, stid_short))
-        section_menu.configure(values=sec_labels)
+        sec_labels = [self._section_label(i, sec)
+                      for i, sec in enumerate(set_data['sections'])]
+        self.section_menu.configure(values=sec_labels)
 
-        _show_section(0)
+        self._show_section(0)
 
-    # ── Render set list ─────────────────────────────────
-    def _render_sets(filter_text=''):
-        for w in set_list.winfo_children():
+    # ── Card rendering ──────────────────────────────────
+
+    def _highlight_card(self, card_frame, id_label, sub_label, score_label):
+        """Apply active highlight to a card."""
+        card_frame.configure(fg_color=self.CARD_ACTIVE_FG)
+        id_label.configure(text_color=self.CARD_ACTIVE_TEXT)
+        sub_label.configure(text_color=self.CARD_ACTIVE_TEXT)
+        score_label.configure(text_color=self.CARD_ACTIVE_TEXT)
+
+    def _unhighlight_card(self, card_frame, id_label, sub_label, score_label):
+        """Remove active highlight from a card."""
+        card_frame.configure(fg_color=self.CARD_FG)
+        id_label.configure(text_color=self.CARD_TEXT)
+        sub_label.configure(text_color=self.CARD_SUBTEXT)
+        score_label.configure(text_color=self.CARD_SUBTEXT)
+
+    @staticmethod
+    def _matches(s, ft):
+        """Search filter: ID, exam_type_names, section type labels."""
+        if not ft:
+            return True
+        ft_lower = ft.lower()
+        if ft_lower in s['id'].lower():
+            return True
+        for n in s.get('exam_type_names', []):
+            if ft_lower in n.lower():
+                return True
+        for t in s['types']:
+            lbl = TYPE_LABELS.get(t, t)
+            if ft_lower in lbl.lower():
+                return True
+        return False
+
+    def _render_sets(self, filter_text=''):
+        for w in self.set_list.winfo_children():
             w.destroy()
+        self._selected_card = None
 
-        _selected_card[0] = None
-
-        # Build search index: combine ID + exam type names + section type labels
-        def _matches(s, ft):
-            if not ft:
-                return True
-            ft_lower = ft.lower()
-            if ft_lower in s['id'].lower():
-                return True
-            # Match exam_type_names from res.json
-            for n in s.get('exam_type_names', []):
-                if ft_lower in n.lower():
-                    return True
-            # Match section type labels
-            for t in s['types']:
-                lbl = TYPE_LABELS.get(t, t)
-                if ft_lower in lbl.lower():
-                    return True
-            return False
-
-        for s in _sets:
-            if not _matches(s, filter_text):
+        for s in self._sets:
+            if not self._matches(s, filter_text):
                 continue
+            self._build_card(s)
 
-            score = s.get('score', 0)
-            exam_names = s.get('exam_type_names', [])
+    def _build_card(self, s):
+        score = s.get('score', 0)
+        exam_names = s.get('exam_type_names', [])
 
-            # Card container frame
-            card = ctk.CTkFrame(
-                set_list, fg_color=_CARD_FG,
-                corner_radius=6, height=60,
-                cursor='hand2')
-            card.pack(fill='x', pady=2, padx=2)
-            card.pack_propagate(False)
+        card = ctk.CTkFrame(
+            self.set_list, fg_color=self.CARD_FG,
+            corner_radius=6, height=60,
+            cursor='hand2')
+        card.pack(fill='x', pady=2, padx=2)
+        card.pack_propagate(False)
 
-            # Card line 1: ID (left) + Score badge (right)
-            line1 = ctk.CTkFrame(card, fg_color='transparent', height=22)
-            line1.pack(fill='x', padx=(8, 8), pady=(6, 0))
-            line1.pack_propagate(False)
+        # Card line 1: ID (left) + Score badge (right)
+        line1 = ctk.CTkFrame(card, fg_color='transparent', height=22)
+        line1.pack(fill='x', padx=(8, 8), pady=(6, 0))
+        line1.pack_propagate(False)
 
-            id_label = ctk.CTkLabel(
-                line1, text="📄 %s" % s['id'],
-                font=ctk.CTkFont(size=13, weight='bold'),
-                text_color=_CARD_TEXT, anchor='w')
-            id_label.pack(side='left')
+        id_label = ctk.CTkLabel(
+            line1, text="📄 %s" % s['id'],
+            font=ctk.CTkFont(size=13, weight='bold'),
+            text_color=self.CARD_TEXT, anchor='w')
+        id_label.pack(side='left')
 
-            # Score badge on the right
-            score_text = "%d分" % score if score else "—"
-            score_label = ctk.CTkLabel(
-                line1, text=score_text,
-                font=ctk.CTkFont(size=11, weight='bold'),
-                text_color=_CARD_SUBTEXT, anchor='e')
-            score_label.pack(side='right')
+        score_text = "%d分" % score if score else "—"
+        score_label = ctk.CTkLabel(
+            line1, text=score_text,
+            font=ctk.CTkFont(size=11, weight='bold'),
+            text_color=self.CARD_SUBTEXT, anchor='e')
+        score_label.pack(side='right')
 
-            # Card line 2: exam type names (from res.json) or fallback to section types
-            if exam_names:
-                # Deduplicate consecutive identical names for compact display
-                deduped = []
-                for n in exam_names:
-                    if not deduped or deduped[-1] != n:
-                        deduped.append(n)
-                # Limit to first 4 names, add "..." if more
-                display_names = deduped[:4]
-                if len(deduped) > 4:
-                    display_names.append('...')
-                type_tags = ' · '.join(display_names)
-            else:
-                type_tags = '  '.join(TYPE_LABELS.get(t, t) for t in sorted(s['types']))
-            sub_label = ctk.CTkLabel(
-                card, text="%d题 · %s" % (s['total_questions'], type_tags),
-                font=ctk.CTkFont(size=11),
-                text_color=_CARD_SUBTEXT, anchor='w')
-            sub_label.pack(fill='x', padx=(8, 8), pady=(0, 4))
+        # Card line 2: exam type names (from res.json) or fallback to section types
+        if exam_names:
+            display_names = _dedup_consecutive(exam_names)[:4]
+            if len(_dedup_consecutive(exam_names)) > 4:
+                display_names.append('...')
+            type_tags = ' · '.join(display_names)
+        else:
+            type_tags = '  '.join(TYPE_LABELS.get(t, t) for t in sorted(s['types']))
+        sub_label = ctk.CTkLabel(
+            card, text="%d题 · %s" % (s['total_questions'], type_tags),
+            font=ctk.CTkFont(size=11),
+            text_color=self.CARD_SUBTEXT, anchor='w')
+        sub_label.pack(fill='x', padx=(8, 8), pady=(0, 4))
 
-            # Store label refs on card frame for highlight access
-            card._id_label = id_label
-            card._sub_label = sub_label
-            card._score_label = score_label
+        # Store label refs on card frame for highlight access
+        card._id_label = id_label
+        card._sub_label = sub_label
+        card._score_label = score_label
 
-            # Hover effects
-            def _on_enter(event, cf=card, il=id_label, sl=sub_label, scl=score_label):
-                if _selected_card[0] != cf:
-                    cf.configure(fg_color=_CARD_HOVER)
+        self._bind_card_events(s, card, id_label, sub_label, score_label)
 
-            def _on_leave(event, cf=card, il=id_label, sl=sub_label, scl=score_label):
-                if _selected_card[0] != cf:
-                    cf.configure(fg_color=_CARD_FG)
+    def _bind_card_events(self, s, card, id_label, sub_label, score_label):
+        def _on_enter(event, cf=card):
+            if self._selected_card != cf:
+                cf.configure(fg_color=self.CARD_HOVER)
 
-            card.bind('<Enter>', _on_enter)
-            card.bind('<Leave>', _on_leave)
-            id_label.bind('<Enter>', _on_enter)
-            id_label.bind('<Leave>', _on_leave)
-            sub_label.bind('<Enter>', _on_enter)
-            sub_label.bind('<Leave>', _on_leave)
-            score_label.bind('<Enter>', _on_enter)
-            score_label.bind('<Leave>', _on_leave)
+        def _on_leave(event, cf=card):
+            if self._selected_card != cf:
+                cf.configure(fg_color=self.CARD_FG)
 
-            # Click handlers (on card + labels so clicking text also works)
-            def _on_click(event, sd=s, cf=card, il=id_label, sl=sub_label, scl=score_label):
-                _on_set_click(sd, cf, il, sl, scl)
+        def _on_click(event, sd=s, cf=card, il=id_label, sl=sub_label, scl=score_label):
+            self._on_set_click(sd, cf, il, sl, scl)
 
-            card.bind('<Button-1>', _on_click)
-            id_label.bind('<Button-1>', _on_click)
-            sub_label.bind('<Button-1>', _on_click)
-            score_label.bind('<Button-1>', _on_click)
+        card.bind('<Enter>', _on_enter)
+        card.bind('<Leave>', _on_leave)
+        id_label.bind('<Enter>', _on_enter)
+        id_label.bind('<Leave>', _on_leave)
+        sub_label.bind('<Enter>', _on_enter)
+        sub_label.bind('<Leave>', _on_leave)
+        score_label.bind('<Enter>', _on_enter)
+        score_label.bind('<Leave>', _on_leave)
 
-    # ── Real-time search ────────────────────────────────
-    def _on_search_change(*_):
-        _render_sets(search_var.get().strip())
+        # Click handlers (on card + labels so clicking text also works)
+        card.bind('<Button-1>', _on_click)
+        id_label.bind('<Button-1>', _on_click)
+        sub_label.bind('<Button-1>', _on_click)
+        score_label.bind('<Button-1>', _on_click)
 
-    search_var.trace_add('write', _on_search_change)
+    # ── Real-time search (debounced) ────────────────────
 
-    # ── Load data ───────────────────────────────────────
-    _sets, _scan_error = scan_sets()
-    _render_sets()
+    def _on_search_changed(self, *_):
+        # Debounce: destroying/rebuilding all cards per keystroke jitters on
+        # large caches; merge keystrokes within SEARCH_DEBOUNCE_MS.
+        if self._search_job is not None:
+            try:
+                self.tab_frame.after_cancel(self._search_job)
+            except Exception:
+                pass
+        self._search_job = self.tab_frame.after(
+            self.SEARCH_DEBOUNCE_MS,
+            lambda: self._render_sets(self.search_var.get().strip()))
 
-    if not _sets:
-        msg = _scan_error or "未找到 ETS 缓存数据"
-        content_box.configure(state='normal')
-        _t.insert('1.0',
-            "⚠ 未找到 ETS 缓存数据\n\n"
-            "%s\n\n"
-            "请先在 ETS 客户端中开始一次作业，\n"
-            "系统会自动缓存试卷数据。" % msg)
-        content_box.configure(state='disabled')
+    # ── Export ──────────────────────────────────────────
 
+    def _on_export_md(self):
+        if not self._current_set:
+            return
+        from tkinter import messagebox
+        set_data = self._current_set
+        sid = set_data['id']
+        # Save to Desktop
+        desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+        out_path = os.path.join(desktop, 'ETS_%s.md' % sid)
+        try:
+            if os.path.exists(out_path):
+                if not messagebox.askyesno('文件已存在',
+                        '桌面已存在 ETS_%s.md\n是否覆盖？' % sid):
+                    return
+            with open(out_path, 'w', encoding='utf-8') as f:
+                f.write(_render_full_markdown(set_data))
+        except OSError as e:
+            # OneDrive redirection / permissions must not die silently.
+            messagebox.showerror('导出失败', '写入失败：%s\n%s' % (out_path, e))
+            return
+        messagebox.showinfo('导出成功', '已保存到:\n%s' % out_path)
+
+    def _on_print(self):
+        if not self._current_set:
+            return
+        import subprocess
+        from tkinter import messagebox
+        html_text = _render_full_html(self._current_set)
+        sid = self._current_set['id']
+        # Write temp HTML
+        tmp_dir = os.path.join(os.environ.get('TEMP', os.path.expanduser('~')), 'ets_preview')
+        tmp_path = os.path.join(tmp_dir, 'ETS_%s.html' % sid)
+        try:
+            os.makedirs(tmp_dir, exist_ok=True)
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write(html_text)
+            subprocess.Popen(['cmd', '/c', 'start', '', tmp_path], shell=False)
+        except OSError as e:
+            messagebox.showerror('预览失败', '写入临时文件失败：\n%s' % e)
+
+
+def create_browser_tab(tab_frame):
+    """Build the offline paper browser UI inside a CTkTabview tab.
+
+    Layout:
+      Left panel  (260px): set list with real-time search
+      Right panel (flex):  header + section dropdown + content + nav
+    """
+    BrowserTab(tab_frame)
     return tab_frame
 
 

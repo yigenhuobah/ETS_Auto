@@ -398,6 +398,11 @@ class ETSStrategy:
                 answer = str(std.get('value') or '')
                 if '/' in answer:
                     answer = answer.split('/')[0].strip()
+                answer = answer.strip()
+                if not answer:
+                    # Empty/whitespace placeholder must not enter the index —
+                    # answer_fill would write '' and count it as answered (C6).
+                    continue
                 key = "collector.fill_%s_%s" % (stid, qid)
                 self.answer_index[key] = {
                     'type': 'fill',
@@ -432,6 +437,7 @@ class ETSStrategy:
                 answer = str(std.get('value') or '')
                 if '/' in answer:
                     answer = answer.split('/')[0].strip()
+                answer = answer.strip()
                 if answer:
                     key = "collector.fill_%s_%s" % (stid, qid)
                     if key in self.answer_index:

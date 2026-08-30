@@ -25,7 +25,9 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt pyinstaller
+        # pyinstaller is pinned exactly: it is not in requirements.txt and a
+        # floating build tool is a supply-chain write path into user-facing exes.
+        run: python -m pip install -r requirements.txt pyinstaller==6.22.2
 
       - name: Verify dependency graph
         run: python -m pip check
@@ -128,6 +130,12 @@ jobs:
           path: release
           merge-multiple: true
 
+      - name: Generate SHA256 checksums
+        run: >
+          Get-ChildItem release/ets_*.exe | Get-FileHash -Algorithm SHA256 |
+          ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+          Set-Content release/SHA256SUMS.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
@@ -135,4 +143,5 @@ jobs:
             release/ets_gui.exe
             release/ets_auto.exe
             release/ets_pk.exe
+            release/SHA256SUMS.txt
           generate_release_notes: true

@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import re
 from urllib.parse import urlsplit
 
 from ets_common import (
@@ -18,6 +19,18 @@ from ets_common import (
 
 SCHEMA_VERSION = 1
 SUPPORTED_MODES = ('exam', 'pk')
+
+
+def _mask_user_root(path):
+    """Mask the user-name segment of a local path for log/JSON output.
+
+    Users paste `run.py check --json` output into public issues; the ETS data
+    root contains the Windows account name (C:\\Users\\<name>\\...).
+    """
+    if not path:
+        return path
+    return re.sub(
+        r'(?i)([\\/])users([\\/])[^\\/]+([\\/])', r'\1Users\2*\3', path, count=1)
 
 _CHECK_ORDER = (
     'input.parameters',
@@ -232,7 +245,7 @@ def _probe_data_root(report, snapshot, appdata):
         root = constrain_ets_data_root(appdata_root, appdata=appdata_root)
 
     observations = report['observations']
-    observations['data_root'] = root or ''
+    observations['data_root'] = _mask_user_root(root) or ''
     observations['data_root_source'] = source if root else 'unavailable'
     if not root:
         _add_check(

@@ -30,6 +30,12 @@ class PKExtraLockTimeoutError(TimeoutError, PKExtraStoreError):
     """Another process held the path lock beyond the bounded wait."""
 
 
+# A user-writable state file beyond this size is treated as invalid (and .bak
+# recovery applies) instead of being loaded wholesale into memory.
+_PK_EXTRA_MAX_BYTES = 8 * 1024 * 1024
+_PK_EXTRA_MAX_ENTRIES = 200000
+
+
 _PATH_LOCKS = {}
 _PATH_LOCKS_GUARD = threading.Lock()
 _LOCK_TIMEOUT_SECONDS = 10.0
@@ -164,8 +170,15 @@ def interprocess_path_lock(path, timeout=_LOCK_TIMEOUT_SECONDS, create_parent=Fa
 
 
 def filter_pk_extra_schema(data):
-    """Normalize a ``dict[str, str]`` payload, rejecting other top levels."""
+    """Normalize a ``dict[str, str]`` payload, rejecting other top levels.
+
+    Entry count is capped: pk_extra is a learned-question map, and a runaway
+    or hostile file must be treated as invalid (triggering .bak recovery)
+    instead of being merged wholesale into the matching index.
+    """
     if not isinstance(data, dict):
+        return None
+    if len(data) > _PK_EXTRA_MAX_ENTRIES:
         return None
     return {
         key: value for key, value in data.items() if isinstance(key, str) and isinstance(value, str)
@@ -206,6 +219,8 @@ def _read_status_unlocked(path):
     if not path or not os.path.exists(path):
         return {}, 'missing'
     try:
+        if os.path.getsize(path) > _PK_EXTRA_MAX_BYTES:
+            return {}, 'invalid'
         with open(path, 'r', encoding='utf-8') as stream:
             filtered = filter_pk_extra_schema(json.load(stream))
         if filtered is None:

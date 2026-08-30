@@ -29,12 +29,6 @@ try:
 except ImportError:
     ctk = None
 
-# ── Path setup ───────────────────────────────────────────────
-if getattr(sys, 'frozen', False):
-    _BASE = sys._MEIPASS
-else:
-    _BASE = os.path.dirname(os.path.abspath(__file__))
-
 # ── Force UTF-8 on Windows (shared helper) ──────────────────
 try:
     from ets_common import force_utf8_stdio
@@ -210,11 +204,24 @@ def scan_sets():
     return sets, None
 
 
-def render_section(section_data):
-    """Render a content section into rich text for display.
+def _dedup_consecutive(names):
+    """Drop consecutive duplicate names (e.g. 听后选择1 appearing twice)."""
+    deduped = []
+    for n in names:
+        if not deduped or deduped[-1] != n:
+            deduped.append(n)
+    return deduped
 
-    Returns a list of (text, tag) tuples where tag is '' for normal
-    or 'answer'/'header'/'muted'/'q_num'/'option'/'section_title' for styled text.
+
+def build_section_view(section_data):
+    """Normalize one section into a typed view model (single field pass).
+
+    Every renderer (browser rich text, Markdown export, HTML export) formats
+    this view instead of navigating ETS fields itself — adding a question
+    type or a field name changes one place, not three.
+
+    Returns a dict with 'stype'/'icon'/'label' plus type-specific keys, or
+    'unknown': True with a bounded 'raw_dump' for unrecognized types.
     """
     raw_data = section_data.get('data', {}) if isinstance(section_data, dict) else {}
     data = normalize_ets_content(raw_data)
@@ -222,141 +229,178 @@ def render_section(section_data):
         data = {'structure_type': 'unknown', 'info': {}}
     stype = data.get('structure_type', '')
     info = data.get('info', {})
-    parts = []
+    view = {
+        'stype': stype,
+        'icon': TYPE_ICONS.get(stype, '📋'),
+        'label': TYPE_LABELS.get(stype, stype),
+        'unknown': False,
+    }
 
-    # Section type header
-    icon = TYPE_ICONS.get(stype, '📋')
-    label = TYPE_LABELS.get(stype, stype)
-    parts.append(("%s %s\n\n" % (icon, label), 'section_title'))
-
-    # ── Choose ──────────────────────────────────────────
     if stype == 'collector.choose':
+        questions = []
         for xt in info.get('xtlist', []):
-            q_num = xt.get('xt_xh', '')
-            q_raw = _html_to_text(xt.get('xt_nr', ''))
-            q_text = _strip_template_prefix(q_raw)
-            q_value = _html_to_text(xt.get('xt_value', ''))
-            answer = xt.get('answer', '')
+            questions.append({
+                'q_num': xt.get('xt_xh', ''),
+                'q_text': _strip_template_prefix(_html_to_text(xt.get('xt_nr', ''))),
+                'q_value': _html_to_text(xt.get('xt_value', '')),
+                'answer': xt.get('answer', ''),
+                'options': [(xx.get('xx_mc', ''), _html_to_text(xx.get('xx_nr', '')))
+                            for xx in xt.get('xxlist', [])],
+            })
+        view['questions'] = questions
 
-            parts.append(("题 %s" % q_num, 'q_num'))
-            parts.append(("  %s\n" % q_text, ''))
+    elif stype == 'collector.fill':
+        view['passage'] = _html_to_text(info.get('value', ''))
+        view['blanks'] = [{
+            'q_num': std.get('xth', std.get('th', '')),
+            'answer': _html_to_text(std.get('value', '')),
+            'ai': std.get('ai', ''),
+        } for std in info.get('std', [])]
 
-            if q_value:
+    elif stype in ('collector.role', 'collector.dialogue'):
+        questions = []
+        for qi, q in enumerate(info.get('question', []), 1):
+            stds = q.get('std', [])
+            variants = []
+            for s in stds[:8]:
+                val = _html_to_text(s.get('value', ''))
+                if val not in variants:
+                    variants.append(val)
+            questions.append({
+                'qi': qi,
+                'ask': _strip_template_prefix(_html_to_text(q.get('ask', ''))),
+                'keywords': q.get('keywords', ''),
+                'variants': variants,
+                'total_variants': len(stds),
+            })
+        view['passage'] = _html_to_text(info.get('value', ''))
+        view['questions'] = questions
+
+    elif stype == 'collector.picture':
+        view['topic'] = info.get('topic', '')
+        view['passage'] = _html_to_text(info.get('value', ''))
+        view['keypoint'] = _html_to_text(info.get('keypoint', ''))
+        view['image_name'] = info.get('image', '')
+        view['answers'] = [_html_to_text(std.get('value', ''))
+                           for std in info.get('std', [])]
+
+    elif stype == 'collector.read':
+        view['passage'] = _html_to_text(info.get('value', ''))
+
+    else:
+        view['unknown'] = True
+        raw = json.dumps(info, ensure_ascii=False, indent=2)
+        if len(raw) > 2000:
+            raw = raw[:2000] + '\n...(truncated)'
+        view['raw_dump'] = "%s\n" % raw
+
+    return view
+
+
+def render_section(section_data):
+    """Render a content section into rich text for display.
+
+    Returns a list of (text, tag) tuples where tag is '' for normal
+    or 'answer'/'header'/'muted'/'q_num'/'option'/'section_title' for styled text.
+    """
+    try:
+        view = build_section_view(section_data)
+        return _format_section_richtext(view)
+    except Exception:
+        # One malformed section must not break the whole browser.
+        return [("(本节无法解析)\n", 'muted')]
+
+
+def _format_section_richtext(view):
+    """Format a section view model as (text, tag) rich-text parts."""
+    stype = view['stype']
+    parts = [("%s %s\n\n" % (view['icon'], view['label']), 'section_title')]
+
+    if view['unknown']:
+        parts.append(("(未识别题型: %s)\n" % stype, 'muted'))
+        parts.append((view['raw_dump'], 'muted'))
+        return parts
+
+    if stype == 'collector.choose':
+        for q in view['questions']:
+            parts.append(("题 %s" % q['q_num'], 'q_num'))
+            parts.append(("  %s\n" % q['q_text'], ''))
+            if q['q_value']:
                 parts.append(("  听力原文：\n", 'muted'))
-                for line in q_value.split('\n'):
+                for line in q['q_value'].split('\n'):
                     parts.append(("    %s\n" % line, 'muted'))
                 parts.append(("\n", ''))
-
-            for xx in xt.get('xxlist', []):
-                opt = xx.get('xx_mc', '')
-                opt_text = _html_to_text(xx.get('xx_nr', ''))
-                is_correct = (opt == answer)
-                if is_correct:
+            for opt, opt_text in q['options']:
+                if opt == q['answer']:
                     parts.append(("  ✓ %s. " % opt, 'answer'))
                     parts.append(("%s\n" % opt_text, 'answer'))
                 else:
                     parts.append(("    %s. %s\n" % (opt, opt_text), 'option'))
-
             parts.append(("\n", ''))
 
-    # ── Fill ────────────────────────────────────────────
     elif stype == 'collector.fill':
-        passage = _html_to_text(info.get('value', ''))
+        passage = view['passage']
         if passage:
             parts.append(("短文/对话：\n", 'muted'))
             for line in passage.split('\n'):
                 parts.append(("  %s\n" % line, ''))
             parts.append(("\n", ''))
-
-        for std in info.get('std', []):
-            q_num = std.get('xth', std.get('th', ''))
-            answer = _html_to_text(std.get('value', ''))
-            ai = std.get('ai', '')
-            parts.append(("第%s空 → " % q_num, 'q_num'))
-            parts.append(("%s\n" % answer, 'answer'))
-            if ai and ai != answer:
-                parts.append(("  (AI识别: %s)\n" % ai, 'muted'))
-
+        for b in view['blanks']:
+            parts.append(("第%s空 → " % b['q_num'], 'q_num'))
+            parts.append(("%s\n" % b['answer'], 'answer'))
+            if b['ai'] and b['ai'] != b['answer']:
+                parts.append(("  (AI识别: %s)\n" % b['ai'], 'muted'))
         parts.append(("\n", ''))
 
-    # ── Role / Dialogue ────────────────────────────────
     elif stype in ('collector.role', 'collector.dialogue'):
-        passage = _html_to_text(info.get('value', ''))
+        passage = view['passage']
         if passage:
             parts.append(("对话/材料：\n", 'muted'))
             for line in passage.split('\n'):
                 parts.append(("  %s\n" % line, ''))
             parts.append(("\n", ''))
-
-        for qi, q in enumerate(info.get('question', []), 1):
-            ask_raw = _html_to_text(q.get('ask', ''))
-            ask = _strip_template_prefix(ask_raw)
-            keywords = q.get('keywords', '')
-            parts.append(("问 %d" % qi, 'q_num'))
-            parts.append(("  %s\n" % ask, ''))
-            if keywords:
-                parts.append(("  关键词：%s\n" % keywords, 'muted'))
-
-            stds = q.get('std', [])
-            if stds:
+        for q in view['questions']:
+            parts.append(("问 %d" % q['qi'], 'q_num'))
+            parts.append(("  %s\n" % q['ask'], ''))
+            if q['keywords']:
+                parts.append(("  关键词：%s\n" % q['keywords'], 'muted'))
+            if q['variants']:
                 parts.append(("  可接受答案：\n", ''))
-                shown = set()
-                for s in stds[:8]:
-                    val = _html_to_text(s.get('value', ''))
-                    if val not in shown:
-                        shown.add(val)
-                        parts.append(("    • %s\n" % val, 'answer'))
-                if len(stds) > 8:
-                    parts.append(("    ... 共%d个变体\n" % len(stds), 'muted'))
+                for val in q['variants']:
+                    parts.append(("    • %s\n" % val, 'answer'))
+                if q['total_variants'] > 8:
+                    parts.append(("    ... 共%d个变体\n" % q['total_variants'], 'muted'))
             parts.append(("\n", ''))
 
-    # ── Picture ─────────────────────────────────────────
     elif stype == 'collector.picture':
-        topic = info.get('topic', '')
+        topic = view['topic']
         if topic:
             parts.append(("话题：%s\n\n" % topic, ''))
-
-        passage = _html_to_text(info.get('value', ''))
+        passage = view['passage']
         if passage:
             parts.append(("原文：\n", 'muted'))
             for line in passage.split('\n'):
                 parts.append(("  %s\n" % line, ''))
             parts.append(("\n", ''))
-
-        keypoint = _html_to_text(info.get('keypoint', ''))
+        keypoint = view['keypoint']
         if keypoint:
             parts.append(("要点：\n", 'muted'))
             for line in keypoint.split('\n'):
                 parts.append(("  %s\n" % line, ''))
             parts.append(("\n", ''))
-
-        for i, std in enumerate(info.get('std', []), 1):
-            answer = _html_to_text(std.get('value', ''))
+        for i, answer in enumerate(view['answers'], 1):
             parts.append(("参考答案 %d\n" % i, 'q_num'))
             parts.append(("  %s\n\n" % answer, 'answer'))
 
-    # ── Read ────────────────────────────────────────────
     elif stype == 'collector.read':
-        passage = _html_to_text(info.get('value', ''))
+        passage = view['passage']
         if passage:
             parts.append(("朗读文本：\n", 'muted'))
             for line in passage.split('\n'):
                 parts.append(("  %s\n" % line, ''))
 
-    # ── Unknown fallback ────────────────────────────────
-    else:
-        parts.append(("(未识别题型: %s)\n" % stype, 'muted'))
-        raw = json.dumps(info, ensure_ascii=False, indent=2)
-        if len(raw) > 2000:
-            raw = raw[:2000] + '\n...(truncated)'
-        parts.append(("%s\n" % raw, 'muted'))
-
     return parts
 
-
-# ═══════════════════════════════════════════════════════════
-#  Export helpers (used by the browser tab)
-# ═══════════════════════════════════════════════════════════
 
 def _safe_material_image_path(set_path, sec_dir, img_name):
     """Resolve picture material path; reject traversal outside material/.
@@ -388,7 +432,7 @@ def _safe_material_image_path(set_path, sec_dir, img_name):
 
 
 def _render_full_markdown(set_data):
-    """"Render a full exam set as plain Markdown text (for export)."""
+    """Render a full exam set as plain Markdown text (for export)."""
     import datetime
     lines = []
     title_parts = ["📄 %s" % set_data['id']]
@@ -398,11 +442,7 @@ def _render_full_markdown(set_data):
     title_parts.append("%d题" % set_data['total_questions'])
     exam_names = set_data.get('exam_type_names', [])
     if exam_names:
-        deduped = []
-        for n in exam_names:
-            if not deduped or deduped[-1] != n:
-                deduped.append(n)
-        title_parts.append(' · '.join(deduped))
+        title_parts.append(' · '.join(_dedup_consecutive(exam_names)))
     else:
         title_parts.append(' · '.join(TYPE_LABELS.get(t, t) for t in sorted(set_data['types'])))
     lines.append("# " + ' · '.join(title_parts))
@@ -413,105 +453,89 @@ def _render_full_markdown(set_data):
     for sec in set_data['sections']:
         if not isinstance(sec, dict):
             continue
-        data = normalize_ets_content(sec.get('data', {}))
-        if data is None:
+        try:
+            view = build_section_view(sec)
+        except Exception:
+            lines.append("## (本节无法解析)")
+            lines.append("")
             continue
-        stype = data.get('structure_type', 'unknown')
-        icon = TYPE_ICONS.get(stype, '📋')
-        label = TYPE_LABELS.get(stype, stype)
-        lines.append("## %s %s" % (icon, label))
+        stype = view['stype']
+        lines.append("## %s %s" % (view['icon'], view['label']))
         lines.append("")
-
-        info = data.get('info', {})
+        if view['unknown']:
+            lines.append("_（未识别题型: %s）_" % stype)
+            lines.append("")
+            continue
 
         if stype == 'collector.choose':
-            for xt in info.get('xtlist', []):
-                q_num = xt.get('xt_xh', '')
-                q_raw = _html_to_text(xt.get('xt_nr', ''))
-                q_text = _strip_template_prefix(q_raw)
-                answer = xt.get('answer', '')
-                lines.append("### 题 %s" % q_num)
-                lines.append(q_text)
+            for q in view['questions']:
+                lines.append("### 题 %s" % q['q_num'])
+                lines.append(q['q_text'])
                 lines.append("")
-                for xx in xt.get('xxlist', []):
-                    opt = xx.get('xx_mc', '')
-                    opt_text = _html_to_text(xx.get('xx_nr', ''))
-                    marker = '**[✓]**' if opt == answer else '    '
+                if q['q_value']:
+                    lines.append("**听力原文：**")
+                    for line in q['q_value'].split('\n'):
+                        lines.append(line)
+                    lines.append("")
+                for opt, opt_text in q['options']:
+                    marker = '**[✓]**' if opt == q['answer'] else '    '
                     lines.append("%s %s. %s" % (marker, opt, opt_text))
                 lines.append("")
 
         elif stype == 'collector.fill':
-            passage = _html_to_text(info.get('value', ''))
+            passage = view['passage']
             if passage:
                 lines.append("**短文/对话：**")
                 for line in passage.split('\n'):
                     lines.append(line)
                 lines.append("")
-            for std in info.get('std', []):
-                q_num = std.get('xth', std.get('th', ''))
-                answer = _html_to_text(std.get('value', ''))
-                lines.append("- **第%s空 →** %s" % (q_num, answer))
+            for b in view['blanks']:
+                lines.append("- **第%s空 →** %s" % (b['q_num'], b['answer']))
             lines.append("")
 
         elif stype in ('collector.role', 'collector.dialogue'):
-            passage = _html_to_text(info.get('value', ''))
+            passage = view['passage']
             if passage:
                 lines.append("**材料：**")
                 for line in passage.split('\n'):
                     lines.append("> " + line)
                 lines.append("")
-            for qi, q in enumerate(info.get('question', []), 1):
-                ask_raw = _html_to_text(q.get('ask', ''))
-                ask = _strip_template_prefix(ask_raw)
-                keywords = q.get('keywords', '')
-                lines.append("**问 %d：** %s" % (qi, ask))
-                if keywords:
-                    lines.append("_关键词：%s_" % keywords)
-                stds = q.get('std', [])
-                if stds:
-                    shown = []
-                    for s in stds[:8]:
-                        val = _html_to_text(s.get('value', ''))
-                        if val not in shown:
-                            shown.append(val)
-                    lines.append("_可接受答案：%s_" % ' | '.join(shown))
+            for q in view['questions']:
+                lines.append("**问 %d：** %s" % (q['qi'], q['ask']))
+                if q['keywords']:
+                    lines.append("_关键词：%s_" % q['keywords'])
+                if q['variants']:
+                    lines.append("_可接受答案：%s_" % ' | '.join(q['variants']))
                 lines.append("")
 
         elif stype == 'collector.picture':
-            topic = info.get('topic', '')
+            topic = view['topic']
             if topic:
                 lines.append("**话题：** %s" % topic)
             # Reference picture image (basename only; no path traversal)
-            img_name = info.get('image', '')
+            img_name = view['image_name']
             if img_name:
-                sec_dir = sec.get('dir', '')
                 img_path = _safe_material_image_path(
-                    set_data.get('path', ''), sec_dir, img_name)
+                    set_data.get('path', ''), sec.get('dir', ''), img_name)
                 if img_path:
                     lines.append('![图片](%s)' % img_path.replace('\\', '/'))
-            keypoint = _html_to_text(info.get('keypoint', ''))
+            keypoint = view['keypoint']
             if keypoint:
                 lines.append("**要点：**")
                 for line in keypoint.split('\n'):
                     lines.append("- " + line)
-            for i, std in enumerate(info.get('std', []), 1):
-                answer = _html_to_text(std.get('value', ''))
+            for i, answer in enumerate(view['answers'], 1):
                 lines.append("**参考答案 %d：** %s" % (i, answer))
             lines.append("")
 
         elif stype == 'collector.read':
-            passage = _html_to_text(info.get('value', ''))
+            passage = view['passage']
             if passage:
                 lines.append("**朗读文本：**")
                 lines.append(passage)
             lines.append("")
 
-        else:
-            lines.append("_（未识别题型: %s）_" % stype)
-            lines.append("")
-
     return '\n'.join(lines)
-
 
 
 def _render_full_html(set_data):
@@ -520,11 +544,7 @@ def _render_full_html(set_data):
     score = set_data.get('score', 0)
     exam_names = set_data.get('exam_type_names', [])
     if exam_names:
-        deduped = []
-        for n in exam_names:
-            if not deduped or deduped[-1] != n:
-                deduped.append(n)
-        types_text = ' · '.join(deduped)
+        types_text = ' · '.join(_dedup_consecutive(exam_names))
     else:
         types_text = ' · '.join(TYPE_LABELS.get(t, t) for t in sorted(set_data['types']))
 
@@ -570,81 +590,63 @@ def _render_full_html(set_data):
     for sec in set_data['sections']:
         if not isinstance(sec, dict):
             continue
-        data = normalize_ets_content(sec.get('data', {}))
-        if data is None:
+        try:
+            view = build_section_view(sec)
+        except Exception:
+            html_lines.append('<p class="muted">（本节无法解析）</p>')
             continue
-        stype = data.get('structure_type', 'unknown')
-        icon = TYPE_ICONS.get(stype, '📋')
-        label = TYPE_LABELS.get(stype, stype)
-        html_lines.append('<h2>%s %s</h2>' % (icon, _esc_html(str(label))))
-
-        info = data.get('info', {})
+        stype = view['stype']
+        html_lines.append('<h2>%s %s</h2>' % (view['icon'], _esc_html(str(view['label']))))
+        if view['unknown']:
+            html_lines.append('<p class="muted">（未识别题型: %s）</p>' % _esc_html(stype))
+            continue
 
         if stype == 'collector.choose':
-            for xt in info.get('xtlist', []):
-                q_num = xt.get('xt_xh', '')
-                q_raw = _html_to_text(xt.get('xt_nr', ''))
-                q_text = _strip_template_prefix(q_raw)
-                answer = xt.get('answer', '')
-                q_value = _html_to_text(xt.get('xt_value', ''))
-                html_lines.append('<h3>题 %s</h3>' % _esc_html(str(q_num)))
-                html_lines.append('<p class="q-text">%s</p>' % _esc_html(q_text))
-                if q_value:
+            for q in view['questions']:
+                html_lines.append('<h3>题 %s</h3>' % _esc_html(str(q['q_num'])))
+                html_lines.append('<p class="q-text">%s</p>' % _esc_html(q['q_text']))
+                if q['q_value']:
                     html_lines.append('<p class="muted">📢 听力原文：</p>')
-                    html_lines.append('<div class="passage">%s</div>' % _esc_html(q_value))
-                for xx in xt.get('xxlist', []):
-                    opt = xx.get('xx_mc', '')
-                    opt_text = _html_to_text(xx.get('xx_nr', ''))
-                    cls = 'correct' if opt == answer else ''
-                    mark = '✓ ' if opt == answer else ''
+                    html_lines.append('<div class="passage">%s</div>' % _esc_html(q['q_value']))
+                for opt, opt_text in q['options']:
+                    cls = 'correct' if opt == q['answer'] else ''
+                    mark = '✓ ' if opt == q['answer'] else ''
                     html_lines.append(
                         '<p class="option %s">%s%s. %s</p>' % (
                             cls, mark, _esc_html(str(opt)), _esc_html(opt_text)))
 
         elif stype == 'collector.fill':
-            passage = _html_to_text(info.get('value', ''))
+            passage = view['passage']
             if passage:
                 html_lines.append('<p class="muted">短文/对话：</p>')
                 html_lines.append('<div class="passage">%s</div>' % _esc_html(passage))
-            for std in info.get('std', []):
-                q_num = std.get('xth', std.get('th', ''))
-                answer = _html_to_text(std.get('value', ''))
+            for b in view['blanks']:
                 html_lines.append(
                     '<p class="blank">第%s空 → %s</p>' % (
-                        _esc_html(str(q_num)), _esc_html(answer)))
+                        _esc_html(str(b['q_num'])), _esc_html(b['answer'])))
 
         elif stype in ('collector.role', 'collector.dialogue'):
-            passage = _html_to_text(info.get('value', ''))
+            passage = view['passage']
             if passage:
                 html_lines.append('<p class="muted">材料：</p>')
                 html_lines.append('<blockquote>%s</blockquote>' % _esc_html(passage))
-            for qi, q in enumerate(info.get('question', []), 1):
-                ask_raw = _html_to_text(q.get('ask', ''))
-                ask = _strip_template_prefix(ask_raw)
-                keywords = q.get('keywords', '')
-                html_lines.append('<p><b>问 %d：</b> %s</p>' % (qi, _esc_html(ask)))
-                if keywords:
-                    html_lines.append('<p class="muted">关键词：%s</p>' % _esc_html(keywords))
-                stds = q.get('std', [])
-                if stds:
-                    shown = []
-                    for s in stds[:8]:
-                        val = _html_to_text(s.get('value', ''))
-                        if val not in shown:
-                            shown.append(val)
+            for q in view['questions']:
+                html_lines.append('<p><b>问 %d：</b> %s</p>' % (q['qi'], _esc_html(q['ask'])))
+                if q['keywords']:
+                    html_lines.append('<p class="muted">关键词：%s</p>' % _esc_html(q['keywords']))
+                if q['variants']:
                     html_lines.append(
-                        '<p class="muted">可接受答案：%s</p>' % ' | '.join(_esc_html(v) for v in shown))
+                        '<p class="muted">可接受答案：%s</p>' % ' | '.join(_esc_html(v) for v in q['variants']))
 
         elif stype == 'collector.picture':
-            topic = info.get('topic', '')
+            topic = view['topic']
             if topic:
                 html_lines.append('<p><b>话题：</b>%s</p>' % _esc_html(topic))
             # Embed picture image as base64 (basename only; no path traversal)
-            img_name = info.get('image', '')
+            img_name = view['image_name']
             if img_name:
-                sec_dir = sec.get('dir', '')
                 img_path = _safe_material_image_path(
-                    set_data.get('path', ''), sec_dir, img_name)
+                    set_data.get('path', ''), sec.get('dir', ''), img_name)
                 if img_path:
                     import base64
                     try:
@@ -660,23 +662,19 @@ def _render_full_html(set_data):
                     except Exception:
                         html_lines.append(
                             '<p class="muted">[图片: %s]</p>' % _esc_html(os.path.basename(str(img_name))))
-            keypoint = _html_to_text(info.get('keypoint', ''))
+            keypoint = view['keypoint']
             if keypoint:
                 html_lines.append('<p class="muted">要点：</p>')
                 for line in keypoint.split('\n'):
                     html_lines.append('<p class="muted">• %s</p>' % _esc_html(line))
-            for i, std in enumerate(info.get('std', []), 1):
-                answer = _html_to_text(std.get('value', ''))
+            for i, answer in enumerate(view['answers'], 1):
                 html_lines.append('<p class="blank">参考答案 %d：%s</p>' % (i, _esc_html(answer)))
 
         elif stype == 'collector.read':
-            passage = _html_to_text(info.get('value', ''))
+            passage = view['passage']
             if passage:
                 html_lines.append('<p class="muted">朗读文本：</p>')
                 html_lines.append('<div class="passage">%s</div>' % _esc_html(passage))
-
-        else:
-            html_lines.append('<p class="muted">（未识别题型: %s）</p>' % _esc_html(stype))
 
     html_lines += ['</body>', '</html>']
     return '\n'.join(html_lines)

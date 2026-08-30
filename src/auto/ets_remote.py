@@ -52,6 +52,16 @@ from ets_pk_store import (
 
 
 # ── Mirror sources (ordered by priority for Chinese users) ──
+# ── 网络功能总开关 ────────────────────────────────────────────────
+# 2026-08-30 安全审查后决定：暂时停用全部远程功能（info.json 版本/公告/杀开
+# 关检查、pk_extra.json 下载）。审查发现：未签名模式下"主机白名单"只挡陌生
+# 域，白名单域（ghfast.top 可代理任意 GitHub 路径）上任意第三方内容仍被接受，
+# 且镜像顺序把第三方代理排在发布者自控源之前、投毒响应可缓存 24h。
+# 在白名单升级为 origin 级（固定 owner/repo 路径）并启用 Ed25519 签名之前，
+# 保持 False。答案读取始终纯本地，此开关不影响任何答题功能。
+# 恢复方法：改回 True，并逐个检查 REMOTE_NETWORK_ENABLED 标记的调用点。
+REMOTE_NETWORK_ENABLED = False
+
 # Each entry: (name, url_template)
 # {owner}/{repo} will be substituted at runtime
 _MIRROR_TEMPLATES = [
@@ -246,6 +256,11 @@ def verify_remote_payload_integrity(data, signature_hex=None, public_key_pem=Non
         return False, 'cannot serialize payload: %s' % e
 
     if hmac_secret:
+        # ⚠️ HMAC 是对称密钥：验签密钥 == 签名密钥。切勿把 ETS_REMOTE_HMAC
+        # 随安装包/文档分发给用户——任何持有者都能伪造合法签名（伪造
+        # allowStart:false 硬阻断他人，或给 pk_extra 投毒后签名通过）。
+        # 分发场景只用 ETS_REMOTE_PUBKEY（Ed25519 公钥验签，无私钥不可伪造）；
+        # HMAC 仅限发布方本机自测。
         if not signature_hex:
             return False, 'missing remote signature'
         import hmac as _hmac
@@ -616,6 +631,11 @@ class ETSRemote:
         Returns:
             RemoteInfo instance, or None if all sources failed and no cache.
         """
+        if not REMOTE_NETWORK_ENABLED:
+            # 网络功能已停用（见模块顶部 REMOTE_NETWORK_ENABLED 注释）。
+            # 返回 None：GUI 侧 _on_remote_checked(None) 会清空远程信息并
+            # 保持 fail-open 的本地启动策略，等价于"无远程配置可用"。
+            return None
         urls = self._build_urls()
         data = None
         source = None
@@ -736,6 +756,9 @@ class ETSRemote:
         Returns:
             (success: bool, message: str)
         """
+        if not REMOTE_NETWORK_ENABLED:
+            # 网络功能已停用：pk_extra 自学习词典只使用本地文件。
+            return False, "远程 pk_extra 更新已停用（REMOTE_NETWORK_ENABLED=False）"
         if url is None:
             # Use cached info from last check (no extra network call)
             if self._last_info is not None and self._last_info.pk_extra_url:

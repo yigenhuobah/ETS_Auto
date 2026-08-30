@@ -916,7 +916,10 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
         })()'''
         result = self.parse_eval_json(self.eval_js(js_iframe_next_icon))
         if result.get('error') and 'success' not in result:
-            result = {'success': False, 'reason': result.get('error')}
+            # Carry 'error' so callers can classify CDP failures (reconnect)
+            # instead of misreading them as "exam completed".
+            result = {'success': False, 'reason': result.get('error'),
+                      'error': result.get('error')}
         if result.get('success'):
             self.stats['next_click'] += 1
             self.debug("Next: iframe .next_icon")
@@ -951,21 +954,25 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
         })()'''
         result = self.parse_eval_json(self.eval_js(js))
         if result.get('error') and 'success' not in result:
-            return {'success': False, 'reason': result.get('error')}
+            return {'success': False, 'reason': result.get('error'),
+                    'error': result.get('error')}
         if result.get('success'):
             self.stats['next_click'] += 1
             self.debug("Next: button")
         return result
 
-    def wait_iframe_ready(self, timeout=15):
+    def wait_iframe_ready(self, timeout=15, adaptive=True):
         """Wait for iframe to contain choices or inputs.
 
-        Adaptive timeout: scales with total_questions (more questions → more
-        tolerance for slow page loads), capped at 30s.
+        adaptive=True scales the deadline with total_questions (more questions
+        → more tolerance for slow page loads), capped at 30s, never below the
+        caller's timeout. Poll callers that need a hard short ceiling pass
+        adaptive=False and wait exactly `timeout`.
         """
         # #7: Adaptive timeout — larger exams tend to have heavier pages
-        adaptive_timeout = min(10 + max(self.total_questions, 1) // 3, 30)
-        timeout = max(timeout, adaptive_timeout)
+        if adaptive:
+            adaptive_timeout = min(10 + max(self.total_questions, 1) // 3, 30)
+            timeout = max(timeout, adaptive_timeout)
         start = time.monotonic()
         while time.monotonic() - start < timeout:
             state = self.get_page_state()
@@ -1015,6 +1022,10 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
                 self.interruptible_sleep(0.6)
                 return True
             reason = nr2.get('reason') or ''
+            if self.is_cdp_parse_error(nr2):
+                # CDP/JS hiccup — same classification as page state: raise so
+                # the caller's reconnect path runs; never "exam complete".
+                raise ConnectionError("click_next: %s" % reason)
             if reason == 'not found' or self._is_next_waiting(reason):
                 # Page may still be loading / audio/timer hiding next — keep waiting
                 continue
@@ -1203,7 +1214,7 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
                     # Wait for iframe to stabilize
                     for _wait_i in range(15):
                         self.interruptible_sleep(2)
-                        ready2, _ = self.wait_iframe_ready(timeout=5)
+                        ready2, _ = self.wait_iframe_ready(timeout=5, adaptive=False)
                         if ready2:
                             break
                     else:
@@ -1248,6 +1259,10 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
 
                 if state.get('hasChoice'):
                     any_new, likely_done = self.answer_choose()
+                    if any_new:
+                        # Progressing — clear stalled-page counters (mirrors fill branch)
+                        consecutive_choose_empty = 0
+                        consecutive_empty = 0
                     if likely_done and not any_new:
                         # Review mode or all choices already answered — check completion then advance
                         if self._all_sidebar_correct():
@@ -1277,6 +1292,8 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
                                 continue
                             print("Exam completed (next not found after choices)")
                             break
+                        elif self.is_cdp_parse_error(nr):
+                            raise ConnectionError("click_next: %s" % (nr.get('reason') or 'cdp error'))
                         else:
                             print("Exam completed")
                             break
@@ -1285,6 +1302,11 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
                         consecutive_empty += 1
                         if consecutive_choose_empty >= 3 and self._all_sidebar_correct():
                             print("All choices correct but next not advancing — exam may be complete")
+                            break
+                        if consecutive_choose_empty >= max_empty:
+                            # Answers missing/mismatched — flipping further would
+                            # walk the whole paper blank. Same guard as transition pages.
+                            print("Too many unanswerable choice pages (%d), stopping." % consecutive_choose_empty)
                             break
                         nr = self.click_next()
                         if nr.get('success'):
@@ -1307,11 +1329,13 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
                                 consecutive_choose_empty = 0
                                 consecutive_conn_errors = 0
                                 continue
-                            consecutive_empty = max_empty
-                            consecutive_choose_empty = max_empty
+                            print("Exam completed (next not found, no answer)")
+                            break
+                        elif self.is_cdp_parse_error(nr):
+                            raise ConnectionError("click_next: %s" % (nr.get('reason') or 'cdp error'))
                         else:
-                            consecutive_empty = max_empty
-                            consecutive_choose_empty = max_empty
+                            print("Exam completed (next unavailable, no answer)")
+                            break
                 elif state.get('hasInput'):
                     any_new, has_fills = self.answer_fill()
                     if any_new:
@@ -1399,6 +1423,8 @@ class ETSAutoAnswer(ETSRecordingMixin, ETSReadWriteMixin, ETSBase):
                         continue
                     print("Exam completed (next not found)")
                     break
+                elif self.is_cdp_parse_error(nr):
+                    raise ConnectionError("click_next: %s" % (nr.get('reason') or 'cdp error'))
                 else:
                     print("Exam completed")
                     break

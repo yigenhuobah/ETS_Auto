@@ -349,13 +349,11 @@ class ETSApp(ctk.CTk):
 
             # Exam callbacks report per-type counts; sum choose+fill so
             # fill after choose does not reset the bar (H22 UX).
+            # (PK callbacks carry no total_questions; the bar is index-driven.)
             q_kind = info.get('type')
             if q_kind in ('choose', 'fill') and total > 0:
                 self._type_answered[q_kind] = answered
                 answered = sum(self._type_answered.values())
-            elif q_kind == 'pk' and answered:
-                # PK has no total_questions in callback — count by index
-                pass
 
             # Update inline text (always visible)
             if qid and answer not in (None, ''):
@@ -555,7 +553,9 @@ class ETSApp(ctk.CTk):
         if msg:
             self._append_log("[远程] %s\n" % msg.replace('\n', '\n[远程] '))
 
-        # Auto-download pk_extra.json update if URL available
+        # Auto-download pk_extra.json update if URL available.
+        # NOTE: currently inert — ets_remote.REMOTE_NETWORK_ENABLED=False makes
+        # download_pk_extra() refuse without any network I/O.
         if info.pk_extra_url:
             self._try_update_pk_extra()
 
@@ -574,10 +574,9 @@ class ETSApp(ctk.CTk):
                     return  # no URL available, skip silently
                 remote = ETSRemote(current_version=APP_VERSION)
                 success, message = remote.download_pk_extra(url=pk_url)
-                # Bind message as default arg to avoid late-binding in after()
+                # download_pk_extra itself is a no-op while the network switch
+                # in ets_remote (REMOTE_NETWORK_ENABLED) is off.
                 prefix = "[远程] %s\n" if success else "[远程] ⚠️ %s\n"
-                if success:
-                    prefix = "[远程] %s\n"
                 self._safe_after(
                     0, self._append_log, prefix % message)
             except Exception as e:
@@ -770,7 +769,7 @@ class ETSApp(ctk.CTk):
         self._safe_after(100, self._poll_log)
 
     def _append_log(self, text):
-        """Append text to the log widget."""
+        """Append text to the log widget (line-bounded, see _LOG_MAX_LINES)."""
         if getattr(self, '_closed', False):
             return
         try:
@@ -778,6 +777,13 @@ class ETSApp(ctk.CTk):
                 return
             self._log_text.configure(state="normal")
             self._log_text.insert("end", text)
+            # Bound growth: long --debug sessions emit a line per CDP call and
+            # an unbounded Text widget slows the UI and leaks memory.
+            _LOG_MAX_LINES = 2000
+            line_count = int(self._log_text.index("end-1c").split('.')[0])
+            if line_count > _LOG_MAX_LINES:
+                self._log_text.delete(
+                    "1.0", "%d.0" % (line_count - _LOG_MAX_LINES))
             self._log_text.configure(state="disabled")
             # Auto-scroll to bottom
             self._log_text.see("end")

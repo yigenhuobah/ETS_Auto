@@ -1640,6 +1640,13 @@ class TestJsEscapeOpenM3(unittest.TestCase):
 
 class TestRemoteIntegrity(unittest.TestCase):
     def setUp(self):
+        from unittest.mock import patch
+        import ets_remote
+        # Integrity tests exercise check()/download_pk_extra() end to end;
+        # re-arm the network switch that production keeps off.
+        net_patcher = patch.object(ets_remote, 'REMOTE_NETWORK_ENABLED', True)
+        net_patcher.start()
+        self.addCleanup(net_patcher.stop)
         self._integrity_env = {
             name: _os.environ.get(name)
             for name in ('ETS_REMOTE_HMAC', 'ETS_REMOTE_PUBKEY')
@@ -3111,6 +3118,14 @@ class TestPageAndPkStateErrors(unittest.TestCase):
 
 
 class TestPkExtraCorruptGuard(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        import ets_remote
+        # Download-path guard tests need the network switch armed.
+        net_patcher = patch.object(ets_remote, 'REMOTE_NETWORK_ENABLED', True)
+        net_patcher.start()
+        self.addCleanup(net_patcher.stop)
+
     def test_status_missing_ok_invalid(self):
         import ets_remote
         import tempfile, os
@@ -3324,28 +3339,117 @@ class TestFireCallbackDebug(unittest.TestCase):
 
 class TestGuiClosedGuard(unittest.TestCase):
     def test_run_finished_noop_when_closed(self):
+        # Bind the REAL _run_finished (D-N1: a stub re-implementing the guard
+        # could never fail) and verify both no-UI paths route to cleanup
+        # without touching _restore_streams or any widget.
         import ets_gui
-        # Lightweight stub of the guard logic (avoid real CTk)
-        class Stub:
-            def __init__(self):
-                self._closed = True
-                self._running = True
-                self._restored = False
-            def _restore_streams(self):
-                self._restored = True
-            def _run_finished(self):
-                if getattr(self, '_closed', False):
-                    try:
-                        self._restore_streams()
-                    except Exception:
-                        pass
-                    self._running = False
-                    return
-                raise AssertionError('should not reach')
-        s = Stub()
-        s._run_finished()
-        self.assertFalse(s._running)
-        self.assertTrue(s._restored)
+        for closed, exists in ((True, None), (False, False)):
+            app = object.__new__(ets_gui.ETSApp)
+            app._closed = closed
+            app._running = True
+            calls = []
+            app._worker_cleanup_without_ui = lambda: calls.append('cleanup')
+            app._restore_streams = lambda: calls.append('restore')
+            if exists is not None:
+                app.winfo_exists = lambda: exists
+            ets_gui.ETSApp._run_finished(app)
+            self.assertEqual(calls, ['cleanup'],
+                             'closed=%r must use cleanup-only path' % closed)
+
+
+class TestRemoteNetworkSwitch(unittest.TestCase):
+    """REMOTE_NETWORK_ENABLED=False must short-circuit every network API."""
+
+    def test_check_returns_none_without_network_io(self):
+        from unittest.mock import patch
+        import ets_remote
+        self.assertFalse(ets_remote.REMOTE_NETWORK_ENABLED)
+        remote = ets_remote.ETSRemote(current_version='0.7.1')
+        with patch.object(ets_remote.ETSRemote, '_fetch_json',
+                          side_effect=AssertionError('network I/O attempted')):
+            self.assertIsNone(remote.check(use_cache=True))
+            self.assertIsNone(remote.check(use_cache=False))
+
+    def test_download_pk_extra_refuses_without_network_io(self):
+        from unittest.mock import patch
+        import ets_remote
+        remote = ets_remote.ETSRemote(current_version='0.7.1')
+        with patch.object(ets_remote, 'is_url_allowed',
+                          side_effect=AssertionError('should not validate')), \
+                patch.object(ets_remote, '_open_remote_url',
+                             side_effect=AssertionError('network I/O attempted')):
+            ok, message = remote.download_pk_extra(
+                url='https://gitee.com/x/y/raw/master/pk_extra.json')
+        self.assertFalse(ok)
+        self.assertIn('停用', message)
+
+
+class TestCompatDataRootMasking(unittest.TestCase):
+    def test_mask_user_root_hides_account_name(self):
+        from ets_compat import _mask_user_root
+        self.assertEqual(
+            _mask_user_root(r'C:\Users\SmartBoy\AppData\Roaming\ETS'),
+            r'C:\Users\*\AppData\Roaming\ETS')
+        self.assertEqual(
+            _mask_user_root('C:/Users/Alice/ets'),
+            'C:/Users/*/ets')
+        # Non-user paths pass through untouched; empty stays empty.
+        self.assertEqual(_mask_user_root(r'D:\ETS\data'), r'D:\ETS\data')
+        self.assertEqual(_mask_user_root(''), '')
+
+
+class TestPkMalformedStateGuard(unittest.TestCase):
+    """B-F1: PK loop must normalize page-controlled state types."""
+
+    def test_malformed_state_types_do_not_crash_hash(self):
+        import hashlib as _hl
+        # Mirror the normalization now in the PK main loop on hostile input.
+        state = {'title': None, 'options': ['', 3, None, 'ok'], 'progress': 7}
+        title = str(state.get('title') or '')
+        options = [str(opt) for opt in state.get('options', [])
+                   if isinstance(opt, str) and opt.strip()]
+        progress = str(state.get('progress') or '')
+        question_hash = _hl.md5(
+            (title + '|' + '|'.join(sorted(options))).encode()).hexdigest()[:12]
+        self.assertEqual(title, '')
+        self.assertEqual(options, ['ok'])
+        self.assertEqual(progress, '7')
+        self.assertEqual(len(question_hash), 12)
+
+
+class TestPkDictCorruptionIsolation(unittest.TestCase):
+    """B-F3: a corrupted dict file degrades to load_dictionary()==False."""
+
+    def _make_pk(self, dict_path, tmp):
+        import ets_word_pk
+        pk = object.__new__(ets_word_pk.ETSWordPK)
+        pk.dict_path = dict_path
+        pk.ecdict_path = _os.path.join(tmp, 'no_ecdict.json')
+        pk.extra_path = _os.path.join(tmp, 'pk_extra.json')
+        pk.misses_path = _os.path.join(tmp, 'pk_misses.jsonl')
+        pk.word_trans = {}
+        pk.trans_index = {}
+        pk.pk_extra = {}
+        pk._migrate_user_state = lambda: None
+        pk._index_trans_senses = lambda word, trans: None
+        return pk
+
+    def test_truncated_new_format_dict_returns_false(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = _os.path.join(tmp, 'worddict_data.json')
+            with open(bad, 'w', encoding='utf-8') as f:
+                f.write('wordsTranslateArr = `[{word')  # truncated
+            pk = self._make_pk(bad, tmp)
+            self.assertFalse(pk.load_dictionary())
+
+    def test_oversized_dict_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            big = _os.path.join(tmp, 'worddict_data.json')
+            with open(big, 'wb') as f:
+                f.write(b'x' * 100)
+            pk = self._make_pk(big, tmp)
+            pk._DICT_MAX_BYTES = 64  # shrink the cap for the test
+            self.assertFalse(pk.load_dictionary())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4175,6 +4279,216 @@ class TestMonotonicRuntimeTimers(unittest.TestCase):
                     ets_rw_mode.time, 'monotonic', return_value=42.0):
             self.assertEqual(inst.get_rw_show_data(), {'question': []})
         self.assertEqual(inst._rw_cache_time, 42.0)
+
+
+class TestExamLoopCdpClassification(unittest.TestCase):
+    """click_next CDP failures must route to reconnect, never 'Exam completed'."""
+
+    def _make_inst(self):
+        import ets_auto
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.debug_mode = False
+        inst.total_questions = 1
+        inst.stop_event = None
+        inst._recording_window_closed = False
+        inst._on_question = None
+        inst._on_complete = None
+        inst.interruptible_sleep = lambda _s: None
+        inst._all_sidebar_correct = lambda: False
+        return inst
+
+    def test_wait_for_next_raises_connection_error_on_cdp_failure(self):
+        import ets_auto
+        inst = self._make_inst()
+        inst.click_next = lambda: {'success': False, 'reason': 'eval_js_failed',
+                                   'error': 'eval_js_failed'}
+        with self.assertRaises(ConnectionError):
+            inst._wait_for_next(max_wait_loops=3, wait_sec=0, label="t")
+
+    def test_wait_for_next_unexpected_reason_still_completes(self):
+        import ets_auto
+        inst = self._make_inst()
+        inst.click_next = lambda: {'success': False, 'reason': 'weird-page'}
+        self.assertFalse(inst._wait_for_next(max_wait_loops=2, wait_sec=0, label="t"))
+
+    def test_run_loop_body_stops_on_unanswerable_choice_pages(self):
+        from unittest.mock import patch
+        import ets_auto
+        import ets_common
+        inst = self._make_inst()
+        inst.stats = {'choose_answered': 0, 'choose_skip': 0,
+                      'fill_answered': 0, 'fill_skip': 0,
+                      'next_click': 0, 'errors': 0}
+        inst.set_id = '721920'
+        inst.homework_mode = False
+        inst.rw_mode = False
+        inst._tab_url = lambda: ''
+        clicks = []
+
+        def _click():
+            clicks.append(1)
+            return {'success': True}
+
+        inst.click_next = _click
+        inst.wait_iframe_ready = lambda timeout=15, adaptive=True: (True, True)
+        inst.inject_bridge = lambda: None
+        inst.get_page_state = lambda: {'hasChoice': True}
+        inst.answer_choose = lambda: (False, False)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(ets_common, 'user_data_path',
+                              return_value=_os.path.join(tmp, 'ets_stats.json')):
+                result = inst._run_loop_body(max_steps=999, hotkey=None)
+
+        self.assertEqual(result['total_answered'], 0)
+        self.assertEqual(result['errors'], 0)
+        # tq=1 → max_empty=5: 4 clicks, then the unanswerable-page guard stops
+        # the loop before the safety limit could ever flip the whole paper.
+        self.assertEqual(len(clicks), 4)
+
+
+class TestWaitIframeReadyTimeout(unittest.TestCase):
+    def _make_inst(self, total_questions):
+        import ets_auto
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.total_questions = total_questions
+        inst.get_page_state = lambda: {}
+        inst.is_cdp_parse_error = lambda _state: False
+        inst.interruptible_sleep = lambda _seconds: None
+        return inst
+
+    def test_adaptive_false_respects_short_timeout(self):
+        from unittest.mock import patch
+        import ets_auto
+        inst = self._make_inst(total_questions=60)  # adaptive would be 30s
+        with patch.object(ets_auto.time, 'monotonic', side_effect=[0.0, 0.0, 6.0]):
+            self.assertEqual(
+                inst.wait_iframe_ready(timeout=5, adaptive=False), (False, False))
+
+    def test_adaptive_true_floors_short_timeout(self):
+        from unittest.mock import patch
+        import ets_auto
+        inst = self._make_inst(total_questions=1)  # adaptive floor = 10s
+        with patch.object(ets_auto.time, 'monotonic',
+                          side_effect=[0.0, 0.0, 6.0, 16.0]):
+            self.assertEqual(
+                inst.wait_iframe_ready(timeout=5, adaptive=True), (False, False))
+
+
+class TestStrategyEmptyFillGuard(unittest.TestCase):
+    def test_empty_fill_values_not_indexed(self):
+        import ets_strategy
+        st = ets_strategy.ETSStrategy()
+        st._index_section({'data': {
+            'structure_type': 'collector.fill',
+            'info': {'stid': 123, 'std': [
+                {'xth': 1, 'value': ''},
+                {'xth': 2, 'value': 'Recycle'},
+                {'xth': 3, 'value': '/'},
+                {'xth': 4, 'value': '  '},
+            ]},
+        }})
+        self.assertNotIn('collector.fill_123_1', st.answer_index)
+        self.assertNotIn('collector.fill_123_3', st.answer_index)
+        self.assertNotIn('collector.fill_123_4', st.answer_index)
+        self.assertEqual(st.answer_index['collector.fill_123_2']['answer'], 'Recycle')
+
+
+class TestRwHotkeyRegistration(unittest.TestCase):
+    def test_rw_loop_disables_hotkey_when_register_fails(self):
+        from unittest.mock import patch
+        import ets_auto
+        import ets_hotkey
+
+        created = []
+
+        class _FakeHotkey:
+            def __init__(self, on_stop=None):
+                self.on_stop = on_stop
+                created.append(self)
+
+            def register(self):
+                return False
+
+            def unregister(self):
+                pass
+
+        inst = object.__new__(ets_auto.ETSAutoAnswer)
+        inst.debug_mode = False
+        inst.ws = None  # finally-cleanup in _run_rw_loop closes ws when set
+        inst.get_rw_show_data = lambda: None
+        with patch.object(ets_hotkey, 'ETSHotkey', _FakeHotkey):
+            result = inst._run_rw_loop(max_steps=1)
+
+        self.assertEqual(created[0].on_stop, inst._signal_stop)
+        self.assertEqual(
+            result, {'total_answered': 0, 'mode': 'read-write', 'errors': 1})
+
+
+class TestSectionViewModel(unittest.TestCase):
+    """build_section_view is the single field pass all renderers format."""
+
+    def test_view_shapes_per_type(self):
+        import ets_parser
+        choose = ets_parser.build_section_view({
+            'data': {'structure_type': 'collector.choose', 'info': {
+                'stid': 's1', 'xtlist': [{'xt_xh': '1', 'answer': 'B',
+                'xxlist': [{'xx_mc': 'B', 'xx_nr': 'x'}]}]}}})
+        self.assertEqual(choose['stype'], 'collector.choose')
+        self.assertEqual(choose['questions'][0]['options'], [('B', 'x')])
+
+        fill = ets_parser.build_section_view({
+            'data': {'structure_type': 'collector.fill', 'info': {
+                'value': '<p>text</p>', 'std': [{'xth': 1, 'value': 'a/'}]}}})
+        # Renderers show the raw value; '/' splitting is the strategy layer's job.
+        self.assertEqual(fill['blanks'][0]['answer'], 'a/')
+
+        unknown = ets_parser.build_section_view({
+            'data': {'structure_type': 'collector.weird', 'info': {}}})
+        self.assertTrue(unknown['unknown'])
+        self.assertIn('raw_dump', unknown)
+
+    def test_render_section_never_raises_on_hostile_section(self):
+        import ets_parser
+        for bad in ({}, None, {'data': {'info': {'xtlist': 'notalist'}}},
+                    {'data': {'structure_type': 'collector.choose',
+                              'info': {'xtlist': [1, 2, None]}}}):
+            parts = ets_parser.render_section(bad)
+            self.assertIsInstance(parts, list)
+            self.assertTrue(all(isinstance(t, str) and isinstance(g, str)
+                                for t, g in parts))
+
+    def test_dedup_consecutive(self):
+        import ets_parser
+        self.assertEqual(
+            ets_parser._dedup_consecutive(['a', 'a', 'b', 'a', 'b', 'b']),
+            ['a', 'b', 'a', 'b'])
+        self.assertEqual(ets_parser._dedup_consecutive([]), [])
+
+
+class TestBrowserTabLogic(unittest.TestCase):
+    """Pure logic of the browser tab (no CTk instantiation)."""
+
+    def _tab(self):
+        import ets_browser_ui
+        return object.__new__(ets_browser_ui.BrowserTab)
+
+    def test_matches_filter(self):
+        tab = self._tab()
+        s = {'id': '20409', 'exam_type_names': ['听后选择1'],
+             'types': {'collector.choose', 'collector.fill'}}
+        self.assertTrue(tab._matches(s, ''))
+        self.assertTrue(tab._matches(s, '20409'))
+        self.assertTrue(tab._matches(s, '听后选择'))
+        self.assertTrue(tab._matches(s, '填空'))
+        self.assertFalse(tab._matches(s, '朗读'))
+
+    def test_stid_suffix(self):
+        import ets_browser_ui
+        self.assertEqual(
+            ets_browser_ui.BrowserTab._stid_suffix('584722'), ' 4722')
+        self.assertEqual(ets_browser_ui.BrowserTab._stid_suffix('12'), ' 12')
+        self.assertEqual(ets_browser_ui.BrowserTab._stid_suffix(''), '')
 
 
 if __name__ == '__main__':

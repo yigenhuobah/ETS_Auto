@@ -231,43 +231,61 @@ class ETSWordPK(ETSBase):
             self._index_trans_senses(word, trans)
         return len(arr)
 
+    # %APPDATA% dict files are external input: a truncated/corrupted/oversized
+    # file must degrade to "PK cannot start" instead of a bare traceback (B-F3).
+    _DICT_MAX_BYTES = 64 * 1024 * 1024
+
     def load_dictionary(self):
         self._migrate_user_state()
         if not os.path.exists(self.dict_path):
             print("ERROR: Dictionary not found: " + self.dict_path)
             return False
+        try:
+            if os.path.getsize(self.dict_path) > self._DICT_MAX_BYTES:
+                print("ERROR: Dictionary too large (>64MB), refusing to load: " + self.dict_path)
+                return False
+        except OSError as e:
+            print("ERROR: Cannot read dictionary size: %s" % e)
+            return False
         t0 = time.time()
-        is_new_format = 'worddict_data' in os.path.basename(self.dict_path)
-        if is_new_format:
-            count = self._load_dict_new_format(self.dict_path)
-            base_count = len(self.word_trans)
-            print("  New-format dict loaded: %d entries" % count)
-        else:
-            with open(self.dict_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            for entry in data:
-                word = entry.get('Word', '').strip()
-                trans = entry.get('Trans', '').strip()
-                if not word or not trans:
-                    continue
-                self.word_trans[word.lower()] = trans
-                self._index_trans_senses(word, trans)
-            base_count = len(self.word_trans)
-        base_count = len(self.word_trans)
-
-        # ── Load ECDICT PK supplement ──
-        ecdict_count = 0
-        if os.path.exists(self.ecdict_path):
-            with open(self.ecdict_path, 'r', encoding='utf-8') as f:
-                ecdict = json.load(f)
-            for word, trans in ecdict.items():
-                if word not in self.word_trans:
-                    self.word_trans[word] = trans
+        try:
+            is_new_format = 'worddict_data' in os.path.basename(self.dict_path)
+            if is_new_format:
+                count = self._load_dict_new_format(self.dict_path)
+                print("  New-format dict loaded: %d entries" % count)
+            else:
+                with open(self.dict_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                for entry in data:
+                    word = entry.get('Word', '').strip()
+                    trans = entry.get('Trans', '').strip()
+                    if not word or not trans:
+                        continue
+                    self.word_trans[word.lower()] = trans
                     self._index_trans_senses(word, trans)
-                    ecdict_count += 1
-            print("  ECDICT supplement: +%d (%d total)" % (ecdict_count, len(self.word_trans)))
-        else:
-            print("  ECDICT not found: %s (skip)" % self.ecdict_path)
+            base_count = len(self.word_trans)
+
+            # ── Load ECDICT PK supplement ──
+            ecdict_count = 0
+            if os.path.exists(self.ecdict_path):
+                if os.path.getsize(self.ecdict_path) > self._DICT_MAX_BYTES:
+                    print("  ECDICT supplement too large (>64MB), skipping")
+                else:
+                    with open(self.ecdict_path, 'r', encoding='utf-8') as f:
+                        ecdict = json.load(f)
+                    for word, trans in ecdict.items():
+                        if word not in self.word_trans:
+                            self.word_trans[word] = trans
+                            self._index_trans_senses(word, trans)
+                            ecdict_count += 1
+                    print("  ECDICT supplement: +%d (%d total)" % (ecdict_count, len(self.word_trans)))
+            else:
+                print("  ECDICT not found: %s (skip)" % self.ecdict_path)
+        except (OSError, ValueError, TypeError, RecursionError, MemoryError) as e:
+            print("ERROR: Dictionary load failed (%s): %s" % (type(e).__name__, e))
+            print("  The ETS dictionary file may be corrupted; re-open the PK page in ETS to refresh it.")
+            return False
+        base_count = len(self.word_trans)
 
         # ── Generate derivative words ──
         deriv_rules = [
@@ -459,8 +477,6 @@ class ETSWordPK(ETSBase):
             candidates.append(w[:-2])           # mentally → mental
             if w[:-2].endswith('al'):            # musically → music → musical → music
                 candidates.append(w[:-4])  # strip 'ally' to get base
-            if w[:-2].endswith('ic'):            # artistically → artistic → artist
-                candidates.append(w[:-4])  # strip 'ically' to get base
             if w[:-2].endswith('le'):            # gently → gentle
                 candidates.append(w[:-2] + 'le')
         if w.endswith('ing') and len(w) > 5:
@@ -494,7 +510,9 @@ class ETSWordPK(ETSBase):
                     expanded.append(c[:-len(brit)] + us)
         candidates.extend(expanded)
 
-        return list(set(c for c in candidates if c))
+        # Ordered dedup — set() ordering is hash-random per run, and the
+        # combined-translation concatenation in get_opt_trans must be stable.
+        return list(dict.fromkeys(c for c in candidates if c))
 
     def get_opt_trans(self, opt):
         """Get translations for an option, including sub-phrase extraction.
@@ -1150,9 +1168,13 @@ class ETSWordPK(ETSBase):
                     continue
                 no_q_count = 0
 
-                title = state.get('title', '')
-                options = [opt for opt in state.get('options', []) if opt]
-                progress = state.get('progress', '')
+                # B-F1: parse_eval_json only guarantees a dict — normalize types
+                # here so a hostile/malformed page can't crash the session with
+                # TypeError/UnicodeEncodeError downstream (md5, joins, .strip()).
+                title = str(state.get('title') or '')
+                options = [str(opt) for opt in state.get('options', [])
+                           if isinstance(opt, str) and opt.strip()]
+                progress = str(state.get('progress') or '')
 
                 # Compound question hash: title + sorted options
                 # Prevents false "same question" detection when different questions share same title

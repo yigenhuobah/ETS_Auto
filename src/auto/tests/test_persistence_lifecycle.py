@@ -327,6 +327,13 @@ class TestPKExtraInterleaving(unittest.TestCase):
         'yigenhuobah/ETS_Auto/main/pk_extra.json'
     )
 
+    def setUp(self):
+        # Interleaving tests drive the real download/commit path; re-arm the
+        # production-disabled network switch for the duration of each test.
+        patcher = patch.object(ets_remote, 'REMOTE_NETWORK_ENABLED', True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_remote_commit_rereads_after_concurrent_learn(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = os.path.join(tmp, 'pk_extra.json')

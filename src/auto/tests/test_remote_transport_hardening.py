@@ -221,6 +221,13 @@ class TestInfoTransport(unittest.TestCase):
 
 
 class TestPKTransport(unittest.TestCase):
+    def setUp(self):
+        # These tests exercise the transport itself; re-arm the network switch
+        # that production keeps off (REMOTE_NETWORK_ENABLED=False).
+        patcher = patch.object(ets_remote, 'REMOTE_NETWORK_ENABLED', True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_deeply_nested_pk_payload_uses_failure_contract(self):
         response = Response(
             ('[' * 1500 + '0' + ']' * 1500).encode('ascii'),
