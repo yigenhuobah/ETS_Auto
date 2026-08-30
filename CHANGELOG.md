@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.2] - 2026-08-30
+
+### Added
+- **Offline mode switch** — `ets_remote.REMOTE_NETWORK_ENABLED = False` disables all remote info.json / pk_extra network I/O (`check()` returns None, `download_pk_extra()` refuses); answers stay fully local. Re-enable checklist documented in-module (origin-level allowlist + Ed25519 + mirror order).
+- **Release checksums** — CI pins `pyinstaller==6.22.2` and uploads `SHA256SUMS.txt` with release assets; requirements.txt gains upper version bounds.
+
+### Changed
+- **Renderer unification** — `ets_parser.build_section_view()` is now the single field pass; browser rich text / Markdown / HTML are thin formatters. Markdown export includes listening material (previously missing); all other output verified byte-identical via golden diff.
+- **Browser tab** — cache scan runs on a background thread (no startup freeze); 250 ms search debounce; export failures surface a dialog; GUI log bounded to 2000 lines.
+- **check --json privacy** — `data_root` masks the Windows user name.
+
+### Fixed
+- Exam loop: transient CDP failures in `click_next` reconnect instead of ending the exam as "completed"; unanswerable choice pages stop after `max_empty` (previously dead code that could flip a paper blank); `wait_iframe_ready(adaptive=False)` honors poll timeouts exactly; RW loop no longer ignores hotkey registration failure.
+- Word PK: page-controlled state types are normalized (hostile JSON cannot crash the session); corrupt/oversized dictionaries degrade with a clear message (64 MB cap); `pk_extra` reads are capped (8 MB / 200k entries) so `.bak` recovery applies; `get_stems` dedup order stabilized and the garbage 'ic' stem branch removed; WM_QUIT retry covers the queue-not-created window; TeeOutput log-write failures no longer break automation; strategy fill ignores empty cached values.
+
 ## [0.7.1] - 2026-07-17
 
 ### Added

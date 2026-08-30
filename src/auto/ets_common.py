@@ -16,7 +16,7 @@ import urllib.error
 from urllib.parse import urlparse
 
 # Single source of truth for app version (imported by exam/PK/GUI/remote)
-APP_VERSION = "0.7.1"
+APP_VERSION = "0.7.2"
 
 
 def is_loopback_ws_url(ws_url):
